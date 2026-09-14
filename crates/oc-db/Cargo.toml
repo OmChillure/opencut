@@ -1,0 +1,17 @@
+[package]
+name = "oc-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Project storage: Postgres and object store (R2)"
+
+[dependencies]
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+chrono.workspace = true
+oc-timeline.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

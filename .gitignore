@@ -1,0 +1,12 @@
+/target
+/dist
+**/*.rs.bk
+.idea
+.vscode
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+apps/web/dist
+apps/web/target

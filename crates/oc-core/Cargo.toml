@@ -1,0 +1,12 @@
+[package]
+name = "oc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Re-export of the OpenCut editor crates"
+
+[dependencies]
+oc-compositor.workspace = true
+oc-tools.workspace = true
+oc-time.workspace = true
+oc-timeline.workspace = true

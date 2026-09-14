@@ -1,0 +1,20 @@
+[package]
+name = "oc-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dioxus editor UI"
+
+[dependencies]
+dioxus = { workspace = true, features = ["web", "router"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+oc-core.workspace = true
+oc-tools.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+gloo-timers = { version = "0.3", features = ["futures"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "EventTarget", "HtmlVideoElement", "PointerEvent", "Storage", "Blob", "BlobPropertyBag", "Url", "DomRect"] }

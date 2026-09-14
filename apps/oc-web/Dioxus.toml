@@ -1,0 +1,9 @@
+[application]
+name = "oc-web"
+default_platform = "web"
+
+[web.app]
+title = "OpenCut"
+
+[web.watcher]
+watch_path = ["src"]

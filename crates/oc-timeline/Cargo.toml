@@ -1,0 +1,13 @@
+[package]
+name = "oc-timeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Multi-track timeline, clips, captions, undo"
+
+[dependencies]
+oc-time.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

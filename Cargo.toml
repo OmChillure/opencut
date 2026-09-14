@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oc-time",
+    "crates/oc-timeline",
+    "crates/oc-compositor",
+    "crates/oc-media",
+    "crates/oc-providers",
+    "crates/oc-voice",
+    "crates/oc-core",
+    "crates/oc-tools",
+    "crates/oc-db",
+    "apps/oc-api",
+    "apps/oc-worker",
+    "apps/oc-web",
+]
+default-members = [
+    "crates/oc-time",
+    "crates/oc-timeline",
+    "crates/oc-compositor",
+    "crates/oc-media",
+    "crates/oc-providers",
+    "crates/oc-voice",
+    "crates/oc-core",
+    "crates/oc-tools",
+    "crates/oc-db",
+    "apps/oc-api",
+    "apps/oc-worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/omchillure/opencut"
+rust-version = "1.94"
+
+[workspace.dependencies]
+oc-time = { path = "crates/oc-time" }
+oc-timeline = { path = "crates/oc-timeline" }
+oc-compositor = { path = "crates/oc-compositor" }
+oc-media = { path = "crates/oc-media" }
+oc-providers = { path = "crates/oc-providers" }
+oc-voice = { path = "crates/oc-voice" }
+oc-db = { path = "crates/oc-db" }
+oc-core = { path = "crates/oc-core" }
+oc-tools = { path = "crates/oc-tools" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+aws-config = "1.8"
+aws-sdk-s3 = "1.100"
+axum = { version = "0.8", features = ["json", "macros"] }
+bytes = "1.10"
+chrono = { version = "0.4", features = ["serde"] }
+dioxus = "=0.7.3"
+dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "process", "io-util", "fs", "time"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.16", features = ["v4", "v7", "serde", "js"] }

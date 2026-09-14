@@ -1,0 +1,11 @@
+[package]
+name = "oc-compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Turn a timeline + playhead into a frame plan"
+
+[dependencies]
+oc-time.workspace = true
+oc-timeline.workspace = true
+serde.workspace = true
