@@ -250,6 +250,48 @@ pub async fn insert_media(
     Ok(row)
 }
 
+/// Register a clip that lives in the editor even if R2 upload never ran.
+pub async fn upsert_workspace_media(
+    pool: &Db,
+    project_id: Uuid,
+    media_id: Uuid,
+    filename: &str,
+    content_type: &str,
+    duration_ticks: Option<i64>,
+) -> Result<(), DbError> {
+    let key = format!("workspace/{media_id}");
+    query(
+        "insert into media (id, project_id, r2_key, filename, content_type, duration_ticks, status)
+         values ($1, $2, $3, $4, $5, $6, 'ready')
+         on conflict (id) do update set
+            filename = excluded.filename,
+            content_type = excluded.content_type,
+            duration_ticks = coalesce(excluded.duration_ticks, media.duration_ticks)",
+    )
+    .bind(media_id)
+    .bind(project_id)
+    .bind(&key)
+    .bind(filename)
+    .bind(content_type)
+    .bind(duration_ticks)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_media_r2_key(pool: &Db, id: Uuid, r2_key: &str) -> Result<(), DbError> {
+    query("update media set r2_key = $2, status = 'ready' where id = $1")
+        .bind(id)
+        .bind(r2_key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub fn is_r2_object_key(key: &str) -> bool {
+    !key.is_empty() && !key.starts_with("workspace/")
+}
+
 pub async fn list_media(pool: &Db, project_id: Uuid) -> Result<Vec<MediaRow>, DbError> {
     let rows = query_as::<MediaRow>(
         "select id, project_id, r2_key, filename, content_type, byte_size, duration_ticks, width, height, status, created_at

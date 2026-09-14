@@ -4,7 +4,9 @@ Think in this order, then act.
 
 ## 1. Inventory
 
-From the bin (not filenames):
+Call `list_bin` and `list_timeline` first. Do not guess. Do not ask the user to paste clips.
+
+From those tools (not filenames):
 
 - who is speaking, and the first useful line
 - which clips have almost no speech (B-roll / stills)
@@ -21,7 +23,7 @@ From the bin (not filenames):
 
 ## 3. Execute
 
-If no timeline exists yet or the user asked to make a vlog/video/short:
+If the user asked to make a vlog/video/short, after list_bin:
 
 ```
 TOOL assemble {"style":"vlog"}

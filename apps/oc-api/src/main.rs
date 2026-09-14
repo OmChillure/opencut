@@ -12,7 +12,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::routes::{
     apply_ops, chat, complete_upload, create_project, delete_project, get_project, health,
-    list_ai_providers, list_media, list_projects, patch_media, request_upload, transcribe_media,
+    list_ai_providers, list_media, list_projects, patch_media, put_media_bytes, register_media,
+    request_upload, transcribe_media,
     update_project,
 };
 use crate::state::AppState;
@@ -39,11 +40,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/projects/{id}/ops", post(apply_ops))
         .route("/v1/ai/providers", get(list_ai_providers))
         .route("/v1/projects/{id}/chat", post(chat))
-        .route("/v1/projects/{id}/media", get(list_media))
+        .route("/v1/projects/{id}/media", get(list_media).post(register_media))
         .route("/v1/projects/{id}/media/upload", post(request_upload))
         .route(
             "/v1/projects/{id}/media/{media_id}",
             patch(patch_media),
+        )
+        .route(
+            "/v1/projects/{id}/media/{media_id}/bytes",
+            axum::routing::put(put_media_bytes),
         )
         .route(
             "/v1/projects/{id}/media/{media_id}/complete",

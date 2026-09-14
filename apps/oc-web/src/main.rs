@@ -636,7 +636,27 @@ fn MediaPanel() -> Element {
                                     {
                                         active.set(Some(item.url.clone()));
                                     }
+                                    let pid2 = pid.clone();
+                                    let sync = item.clone();
+                                    let file_bytes = bytes.to_vec();
                                     library.write().push(item);
+                                    spawn(async move {
+                                        let _ = crate::api::register_media(
+                                            &pid2,
+                                            &sync.id,
+                                            &sync.name,
+                                            &sync.content_type,
+                                            sync.duration,
+                                        )
+                                        .await;
+                                        let _ = crate::api::put_media_bytes(
+                                            &pid2,
+                                            &sync.id,
+                                            &sync.content_type,
+                                            file_bytes,
+                                        )
+                                        .await;
+                                    });
                                 }
                             });
                         },
@@ -1890,7 +1910,30 @@ fn send_prompt(
         .iter()
         .map(|m| (m.user, m.text.clone()))
         .collect();
+    let bin: Vec<(String, String, String, f64, String)> = use_context::<Signal<Vec<MediaItem>>>()
+        .peek()
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                item.name.clone(),
+                item.content_type.clone(),
+                item.duration,
+                item.url.clone(),
+            )
+        })
+        .collect();
     spawn(async move {
+        for (id, name, ctype, dur, url) in &bin {
+            let _ = api::register_media(&pid, id, name, ctype, *dur).await;
+            if url.starts_with("blob:") {
+                if let Ok(resp) = reqwest::Client::new().get(url).send().await {
+                    if let Ok(bytes) = resp.bytes().await {
+                        let _ = api::put_media_bytes(&pid, id, ctype, bytes.to_vec()).await;
+                    }
+                }
+            }
+        }
         let reply = api::chat(&pid, &provider, &model, &history).await;
         match reply {
             Ok(resp) => {

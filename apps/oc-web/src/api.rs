@@ -46,6 +46,47 @@ pub struct ChatReply {
     pub timeline: Timeline,
 }
 
+pub async fn register_media(
+    project_id: &str,
+    media_id: &str,
+    filename: &str,
+    content_type: &str,
+    duration: f64,
+) -> Result<(), String> {
+    reqwest::Client::new()
+        .post(format!("{API}/v1/projects/{project_id}/media"))
+        .json(&serde_json::json!({
+            "id": media_id,
+            "filename": filename,
+            "content_type": content_type,
+            "duration_seconds": duration,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub async fn put_media_bytes(
+    project_id: &str,
+    media_id: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    reqwest::Client::new()
+        .put(format!("{API}/v1/projects/{project_id}/media/{media_id}/bytes"))
+        .header("content-type", content_type)
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub async fn chat(
     project_id: &str,
     provider: &str,

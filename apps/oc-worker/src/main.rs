@@ -75,8 +75,18 @@ async fn transcribe(
     r2: Option<&R2>,
     p: TranscribePayload,
 ) -> anyhow::Result<()> {
+    if !oc_db::is_r2_object_key(&p.r2_key) {
+        oc_db::set_media_status(db, p.media_id, "ready").await?;
+        anyhow::bail!("clip not in R2 yet (workspace-only). Re-import or wait for upload.");
+    }
     let r2 = r2.context("R2 required")?;
-    let bytes = r2.get_bytes(&p.r2_key).await?;
+    let bytes = match r2.get_bytes(&p.r2_key).await {
+        Ok(b) => b,
+        Err(e) => {
+            oc_db::set_media_status(db, p.media_id, "ready").await?;
+            anyhow::bail!("R2 missing object {}: {e}", p.r2_key);
+        }
+    };
     let filename = p.r2_key.rsplit('/').next().unwrap_or("audio.bin");
 
     match oc_media::analyze_local(&bytes, filename).await {

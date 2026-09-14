@@ -3,9 +3,8 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use oc_core::{
-    AssembleItem, AssembleStyle, MediaId, Op, Project, ProjectId, Time, Timeline, TrackKind,
-    UndoStack,
-    apply, is_director_request, mcp_tools, op_from_mcp,
+    inspect_from_mcp, AssembleItem, AssembleStyle, Inspect, MediaId, Op, Project, ProjectId, Time,
+    Timeline, TrackKind, UndoStack, apply, is_director_request, mcp_tools, op_from_mcp,
 };
 use oc_core::time::TICKS_PER_SECOND;
 use oc_providers::{ChatTurn, LlmReply};
@@ -213,14 +212,7 @@ pub async fn chat(
         .find(|m| m.role == "user")
         .map(|m| m.content.as_str())
         .unwrap_or("");
-    if is_director_request(last_user) {
-        if media.is_empty() {
-            return Ok(Json(ChatResponse {
-                text: "Import some clips first, then ask me to make the video.".into(),
-                notes: Vec::new(),
-                timeline: project.timeline,
-            }));
-        }
+    if is_director_request(last_user) && !media.is_empty() {
         let understood = media.iter().any(|m| {
             speech.contains_key(&m.id) || looks.contains_key(&m.id)
         });
@@ -235,6 +227,9 @@ pub async fn chat(
                     continue;
                 }
                 if speech.contains_key(&row.id) || looks.contains_key(&row.id) {
+                    continue;
+                }
+                if !oc_db::is_r2_object_key(&row.r2_key) {
                     continue;
                 }
                 let _ = oc_db::enqueue_job(
@@ -282,19 +277,17 @@ pub async fn chat(
     let directed = !notes.is_empty();
     let system = if directed {
         format!(
-            "A short is already on the timeline. Follow the director brief above. \
-             Do not assemble again unless they ask for a redo.\n\
-             Project '{}'.\n\n{}\n\n{}",
-            project.name,
-            media_brief(&media, &speech, &looks),
-            timeline_brief(&project.timeline)
+            "A short is already on the timeline. Follow the director brief. \
+             Call list_timeline if you need the cut. Do not assemble again unless they ask.\n\
+             Project '{}'.",
+            project.name
         )
     } else {
         format!(
-            "Follow the director brief above. Project '{}'.\n\n{}\n\n{}",
-            project.name,
-            media_brief(&media, &speech, &looks),
-            timeline_brief(&project.timeline)
+            "Follow the director brief. Project '{}'. \
+             Tools are loaded. Call list_bin and list_timeline when you need the workspace — \
+             do not assume the bin is empty. Call get_media only for one id.",
+            project.name
         )
     };
     let mut turns = body.messages;
@@ -329,6 +322,17 @@ pub async fn chat(
                 let mut batch = String::new();
                 let mut undo = UndoStack::new();
                 for call in calls {
+                    if let Some(inspect) = inspect_from_mcp(&call) {
+                        batch.push_str(&run_inspect(
+                            inspect,
+                            &project.timeline,
+                            &media,
+                            &speech,
+                            &looks,
+                        ));
+                        batch.push('\n');
+                        continue;
+                    }
                     match op_from_mcp(&call) {
                         Ok(op) => match apply(&mut project.timeline, &mut undo, hydrate_op(op, &media, &speech, &looks)) {
                             Ok(applied) => {
@@ -393,6 +397,69 @@ fn speech_by_media(rows: &[oc_db::TranscriptCueRow]) -> std::collections::HashMa
         entry.speech_seconds += secs;
     }
     map
+}
+
+fn run_inspect(
+    inspect: Inspect,
+    timeline: &Timeline,
+    media: &[oc_db::MediaRow],
+    speech: &std::collections::HashMap<Uuid, Speech>,
+    looks: &std::collections::HashMap<Uuid, oc_db::AnalysisRow>,
+) -> String {
+    match inspect {
+        Inspect::ListBin => {
+            if media.is_empty() {
+                return "bin: empty (nothing registered for this project yet)".into();
+            }
+            let mut out = format!("bin: {} items\n", media.len());
+            for row in media {
+                let (kind, dur) = spec_from_row(row);
+                let words = speech.get(&row.id).map(|s| s.words).unwrap_or(0);
+                let look = looks
+                    .get(&row.id)
+                    .map(|l| l.look.as_str())
+                    .unwrap_or("-");
+                out.push_str(&format!(
+                    "{id}  {kind:?}  {dur:.1}s  words={words}  look={look}  {name}\n",
+                    id = row.id,
+                    dur = dur.as_seconds(),
+                    name = row.filename
+                ));
+            }
+            out
+        }
+        Inspect::ListTimeline => timeline_brief(timeline),
+        Inspect::GetMedia { media_id } => {
+            let id = media_id.as_uuid();
+            let Some(row) = media.iter().find(|m| m.id == id) else {
+                return format!("media {id} not in bin");
+            };
+            let (kind, dur) = spec_from_row(row);
+            let mut out = format!(
+                "{id}  {kind:?}  {dur:.1}s  {}\n",
+                row.filename,
+                dur = dur.as_seconds()
+            );
+            if let Some(s) = speech.get(&id) {
+                let excerpt: String = s.text.chars().take(240).collect();
+                out.push_str(&format!(
+                    "speech words={} hook@{:.1}s \"{}\"\n",
+                    s.words,
+                    s.hook_in.as_seconds(),
+                    excerpt.replace('\n', " ")
+                ));
+            } else {
+                out.push_str("speech: none yet\n");
+            }
+            if let Some(l) = looks.get(&id) {
+                out.push_str(&format!(
+                    "look {} motion={:.2} scenes={}\n",
+                    l.look, l.motion, l.scenes
+                ));
+            }
+            out
+        }
+    }
 }
 
 fn look_by_media(
@@ -614,6 +681,82 @@ pub struct UploadResponse {
     pub media_id: Uuid,
     pub key: String,
     pub upload_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct RegisterMediaBody {
+    pub id: Option<Uuid>,
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub duration_seconds: Option<f64>,
+}
+
+pub async fn put_media_bytes(
+    State(state): State<AppState>,
+    Path((id, media_id)): Path<(Uuid, Uuid)>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    let media = oc_db::get_media(&state.db, media_id).await?;
+    if media.project_id != id {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
+    }
+    let r2 = state
+        .r2
+        .as_ref()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "R2 not configured"))?;
+    let ctype = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&media.content_type)
+        .to_string();
+    let project_id = ProjectId::from_uuid(id);
+    let key = if oc_db::is_r2_object_key(&media.r2_key) {
+        media.r2_key.clone()
+    } else {
+        object_key(
+            ObjectKind::Raw,
+            project_id,
+            MediaId::from_uuid(media_id),
+            &media.filename,
+        )
+    };
+    r2.put_bytes(&key, body.to_vec(), &ctype)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    oc_db::set_media_r2_key(&state.db, media_id, &key).await?;
+    if !ctype.starts_with("image/") {
+        let _ = oc_db::enqueue_job(
+            &state.db,
+            "transcribe",
+            serde_json::json!({
+                "project_id": id,
+                "media_id": media_id,
+                "r2_key": key,
+            }),
+        )
+        .await;
+        oc_db::set_media_status(&state.db, media_id, "transcribing").await?;
+    }
+    Ok(Json(serde_json::json!({ "ok": true, "key": key })))
+}
+
+pub async fn register_media(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<RegisterMediaBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let _ = oc_db::get_project(&state.db, id).await?;
+    let media_id = body.id.unwrap_or_else(Uuid::now_v7);
+    let ctype = body
+        .content_type
+        .unwrap_or_else(|| "application/octet-stream".into());
+    let ticks = body
+        .duration_seconds
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map(|s| (s * TICKS_PER_SECOND as f64).round() as i64);
+    oc_db::upsert_workspace_media(&state.db, id, media_id, &body.filename, &ctype, ticks).await?;
+    Ok(Json(serde_json::json!({ "media_id": media_id })))
 }
 
 pub async fn request_upload(
