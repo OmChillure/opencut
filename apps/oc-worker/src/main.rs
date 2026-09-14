@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     if r2.is_none() {
         tracing::warn!("R2 not configured — transcribe jobs will fail");
     }
-    tracing::info!("transcribe uses local ffmpeg + Whisper (no Sarvam)");
+    tracing::info!("understand = local ffmpeg look + Whisper (no paid STT/vision)");
 
     tracing::info!("worker polling jobs");
     loop {
@@ -78,9 +78,47 @@ async fn transcribe(
     let r2 = r2.context("R2 required")?;
     let bytes = r2.get_bytes(&p.r2_key).await?;
     let filename = p.r2_key.rsplit('/').next().unwrap_or("audio.bin");
-    let transcript = transcribe_local(&bytes, filename)
-        .await
-        .context("local whisper")?;
+
+    match oc_media::analyze_local(&bytes, filename).await {
+        Ok(look) => {
+            let raw = serde_json::to_value(&look).unwrap_or(serde_json::json!({}));
+            if let Err(e) = oc_db::upsert_media_analysis(
+                db,
+                p.media_id,
+                &look.look,
+                f64::from(look.motion),
+                look.scenes as i32,
+                f64::from(look.brightness),
+                look.colorful,
+                look.has_video,
+                look.has_audio,
+                &raw,
+            )
+            .await
+            {
+                tracing::warn!("save look: {e}");
+            } else {
+                tracing::info!(look = %look.look, scenes = look.scenes, "looked at clip");
+            }
+        }
+        Err(e) => tracing::warn!("local look failed: {e}"),
+    }
+
+    let transcript = match transcribe_local(&bytes, filename).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::info!("no speech / whisper skipped: {e}");
+            oc_voice::Transcript {
+                language: None,
+                full_text: String::new(),
+                cues: Vec::new(),
+            }
+        }
+    };
+    if transcript.full_text.trim().is_empty() && transcript.cues.is_empty() {
+        oc_db::set_media_status(db, p.media_id, "ready").await?;
+        return Ok(());
+    }
 
     let raw = serde_json::to_value(&transcript)?;
     let cue_rows: Vec<(i64, i64, String, Option<String>)> = transcript

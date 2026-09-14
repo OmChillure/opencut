@@ -1,4 +1,5 @@
 mod local;
+mod punctuate;
 
 use oc_time::Time;
 use reqwest::multipart::{Form, Part};
@@ -6,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use local::{LocalSttError, transcribe_local};
+pub use punctuate::restore_punctuation;
 
 const DEFAULT_BASE: &str = "https://api.sarvam.ai";
 

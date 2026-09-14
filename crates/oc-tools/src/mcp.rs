@@ -23,6 +23,26 @@ pub struct McpCall {
     pub arguments: Value,
 }
 
+/// Read-only workspace queries. The host answers these; they are not timeline ops.
+#[derive(Clone, Debug)]
+pub enum Inspect {
+    ListBin,
+    ListTimeline,
+    GetMedia { media_id: MediaId },
+}
+
+#[must_use]
+pub fn inspect_from_mcp(call: &McpCall) -> Option<Inspect> {
+    match call.name.as_str() {
+        "list_bin" => Some(Inspect::ListBin),
+        "list_timeline" => Some(Inspect::ListTimeline),
+        "get_media" => media_id(&call.arguments, "media_id")
+            .ok()
+            .map(|media_id| Inspect::GetMedia { media_id }),
+        _ => None,
+    }
+}
+
 /// Tools an AI provider may call. Modes (select/razor/…) stay UI-only.
 #[must_use]
 pub fn mcp_tools() -> Vec<McpTool> {
@@ -36,6 +56,26 @@ pub fn mcp_tools() -> Vec<McpTool> {
         }
     }
     out.extend([
+        McpTool {
+            name: "list_bin".into(),
+            description:
+                "List imported media in this project (id, kind, duration, speech/look summary). \
+                 Call this when you need the bin. Do not assume it is empty."
+                    .into(),
+            input_schema: object(&[]),
+        },
+        McpTool {
+            name: "list_timeline".into(),
+            description: "List tracks and clips currently on the timeline. Call when you need the cut.".into(),
+            input_schema: object(&[]),
+        },
+        McpTool {
+            name: "get_media".into(),
+            description:
+                "Details for one media id: duration, speech excerpt, look. Use after list_bin."
+                    .into(),
+            input_schema: object(&[("media_id", str_prop("Media id from list_bin"), true)]),
+        },
         McpTool {
             name: "move".into(),
             description: "Move a clip to a track and start time.".into(),
@@ -392,6 +432,9 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
         "duck" => Ok(Op::Duck {
             amount: number(&call.arguments, "amount").unwrap_or(0.6) as f32,
         }),
+        "list_bin" | "list_timeline" | "get_media" => {
+            Err("inspect tools are handled by the host".into())
+        }
         "place" | "place_clip" => Ok(Op::PlaceMedia {
             media_id: media_id(&call.arguments, "media_id")?,
             track_id: optional_track(&call.arguments, "track_id"),

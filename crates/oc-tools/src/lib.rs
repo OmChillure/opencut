@@ -6,7 +6,7 @@ mod ops;
 mod registry;
 
 pub use intent::{Intent, is_director_request, parse_intent};
-pub use mcp::{McpCall, McpTool, mcp_tools, op_from_mcp};
+pub use mcp::{inspect_from_mcp, Inspect, McpCall, McpTool, mcp_tools, op_from_mcp};
 pub use ops::{
     AppliedOp, AssembleItem, AssembleStyle, ExportPreset, Op, OpError, TimeRange, TimelineEditMode,
     apply,

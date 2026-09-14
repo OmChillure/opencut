@@ -2,6 +2,7 @@
 //! No API key. ffmpeg is required; Whisper is any of:
 //! `whisper` (openai-whisper), `whisper-cli` / `whisper.cpp`.
 
+use crate::punctuate::restore_punctuation;
 use crate::{Cue, Transcript};
 use oc_time::Time;
 use serde::Deserialize;
@@ -45,9 +46,22 @@ pub async fn transcribe_local(bytes: &[u8], filename: &str) -> Result<Transcript
     tokio::fs::write(&input, bytes).await?;
 
     extract_wav(&input, &wav).await?;
-    let transcript = run_whisper(&wav, &dir).await?;
+    let transcript = punctuate_transcript(run_whisper(&wav, &dir).await?);
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(transcript)
+}
+
+fn punctuate_transcript(mut t: Transcript) -> Transcript {
+    t.cues = t
+        .cues
+        .into_iter()
+        .map(|mut c| {
+            c.text = restore_punctuation(&c.text);
+            c
+        })
+        .collect();
+    t.full_text = restore_punctuation(&t.full_text);
+    t
 }
 
 async fn extract_wav(input: &Path, wav: &Path) -> Result<(), LocalSttError> {
@@ -80,11 +94,71 @@ async fn extract_wav(input: &Path, wav: &Path) -> Result<(), LocalSttError> {
 }
 
 async fn run_whisper(wav: &Path, dir: &Path) -> Result<Transcript, LocalSttError> {
+    if let Ok(Some(t)) = whisper_faster(wav).await {
+        return Ok(t);
+    }
     if let Some(bin) = which("whisper") {
         return whisper_openai(&bin, wav, dir).await;
     }
     if let Some(bin) = which("whisper-cli").or_else(|| which("whisper.cpp")) {
         return whisper_cpp(&bin, wav, dir).await;
+    }
+    Err(LocalSttError::NoWhisper)
+}
+
+async fn whisper_faster(wav: &Path) -> Result<Option<Transcript>, LocalSttError> {
+    let Ok(script) = whisper_script() else {
+        return Ok(None);
+    };
+    let Ok(py) = whisper_python() else {
+        return Ok(None);
+    };
+    let out = Command::new(py).arg(&script).arg(wav).output().await?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_openai_whisper(&raw))
+}
+
+fn whisper_script() -> Result<PathBuf, LocalSttError> {
+    if let Ok(p) = std::env::var("WHISPER_SCRIPT") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    let candidates = [
+        PathBuf::from("scripts/faster_whisper_transcribe.py"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/faster_whisper_transcribe.py"),
+    ];
+    for p in candidates {
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err(LocalSttError::NoWhisper)
+}
+
+fn whisper_python() -> Result<PathBuf, LocalSttError> {
+    if let Ok(p) = std::env::var("WHISPER_PYTHON") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    for name in [
+        "/tmp/oc-whisper-venv/bin/python",
+        "python3",
+        "python",
+    ] {
+        if let Some(p) = which(name) {
+            return Ok(p);
+        }
+        let path = PathBuf::from(name);
+        if path.is_file() {
+            return Ok(path);
+        }
     }
     Err(LocalSttError::NoWhisper)
 }
@@ -285,5 +359,18 @@ mod tests {
         let t = parse_whisper_cpp(raw).unwrap();
         assert_eq!(t.cues[0].text, "hi there");
         assert!((t.cues[0].end.as_seconds() - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn punctuates_after_parse() {
+        let raw = r#"{
+            "text": "and so my fellow Americans, ask not what your country can do for you, ask what you can do for your country",
+            "language": "en",
+            "segments": []
+        }"#;
+        let t = punctuate_transcript(parse_openai_whisper(raw).unwrap());
+        assert!(t.full_text.contains("And so,"), "{}", t.full_text);
+        assert!(t.full_text.contains('—'), "{}", t.full_text);
+        assert!(t.full_text.ends_with('.'), "{}", t.full_text);
     }
 }

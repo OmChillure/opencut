@@ -29,23 +29,56 @@ pub enum DbError {
 
 pub async fn connect() -> Result<Db, DbError> {
     let url = std::env::var("DATABASE_URL").map_err(|_| DbError::MissingUrl)?;
-    // Neon/Supabase transaction poolers reuse backends between queries.
-    // sqlx 0.9 still emits named PREPARE (sqlx_s_1, …) unless each query
-    // sets persistent(false). Cache capacity 0 only skips the client cache.
+    let url = prefer_session_pooler(&url);
+    // Transaction-mode poolers (Supabase :6543) leave unnamed prepared
+    // statements on the backend. Next Bind then fails with
+    // "supplies 0 parameters, but statement requires 1".
     let opts = PgConnectOptions::from_str(&url)?.statement_cache_capacity(0);
     let pool = PgPoolOptions::new()
         .max_connections(3)
         .acquire_timeout(Duration::from_secs(15))
         .idle_timeout(Duration::from_secs(30))
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                let _ = sqlx::raw_sql("deallocate all").execute(&mut *conn).await;
+                Ok(())
+            })
+        })
+        .before_acquire(|conn, _| {
+            Box::pin(async move {
+                let _ = sqlx::raw_sql("deallocate all").execute(&mut *conn).await;
+                Ok(true)
+            })
+        })
         .connect_with(opts)
         .await?;
     Ok(pool)
+}
+
+/// Supabase/Neon :6543 is transaction PgBouncer. sqlx needs session mode (:5432).
+fn prefer_session_pooler(url: &str) -> String {
+    if url.contains("pooler.supabase.com:6543") || url.contains("pooler.supabase.com:5432") {
+        let next = url.replace(":6543", ":5432");
+        if next != url {
+            tracing::warn!("DATABASE_URL used port 6543 (transaction pooler); using 5432 (session) so sqlx binds work");
+        }
+        return next;
+    }
+    if let Some(rest) = url.split_once("-pooler.").map(|(_, rest)| rest) {
+        if rest.contains(".neon.tech") && url.contains(":6543") {
+            return url.replace(":6543", ":5432");
+        }
+    }
+    url.to_string()
 }
 
 pub async fn migrate(pool: &Db) -> Result<(), DbError> {
     // Simple-query protocol so this works on a transaction-mode pooler.
     // 0001_init.sql is idempotent (`if not exists`).
     sqlx::raw_sql(include_str!("../migrations/0001_init.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!("../migrations/0002_media_analysis.sql"))
         .execute(pool)
         .await?;
     Ok(())
@@ -360,6 +393,75 @@ pub async fn list_transcripts_for_project(
              select max(t2.created_at) from transcripts t2 where t2.media_id = t.media_id
            )
          order by t.media_id, c.idx",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AnalysisRow {
+    pub media_id: Uuid,
+    pub look: String,
+    pub motion: f64,
+    pub scenes: i32,
+    pub brightness: f64,
+    pub colorful: bool,
+    pub has_video: bool,
+    pub has_audio: bool,
+}
+
+pub async fn upsert_media_analysis(
+    pool: &Db,
+    media_id: Uuid,
+    look: &str,
+    motion: f64,
+    scenes: i32,
+    brightness: f64,
+    colorful: bool,
+    has_video: bool,
+    has_audio: bool,
+    raw: &serde_json::Value,
+) -> Result<(), DbError> {
+    query(
+        "insert into media_analysis
+            (media_id, look, motion, scenes, brightness, colorful, has_video, has_audio, raw, updated_at)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+         on conflict (media_id) do update set
+            look = excluded.look,
+            motion = excluded.motion,
+            scenes = excluded.scenes,
+            brightness = excluded.brightness,
+            colorful = excluded.colorful,
+            has_video = excluded.has_video,
+            has_audio = excluded.has_audio,
+            raw = excluded.raw,
+            updated_at = now()",
+    )
+    .bind(media_id)
+    .bind(look)
+    .bind(motion)
+    .bind(scenes)
+    .bind(brightness)
+    .bind(colorful)
+    .bind(has_video)
+    .bind(has_audio)
+    .bind(raw)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_analysis_for_project(
+    pool: &Db,
+    project_id: Uuid,
+) -> Result<Vec<AnalysisRow>, DbError> {
+    let rows = query_as::<AnalysisRow>(
+        "select a.media_id, a.look, a.motion, a.scenes, a.brightness, a.colorful, a.has_video, a.has_audio
+         from media_analysis a
+         join media m on m.id = a.media_id
+         where m.project_id = $1",
     )
     .bind(project_id)
     .fetch_all(pool)

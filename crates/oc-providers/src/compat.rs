@@ -11,7 +11,7 @@ pub async fn chat_completions(
 ) -> Result<LlmReply, LlmError> {
     let mut messages = vec![serde_json::json!({
         "role": "system",
-        "content": system,
+        "content": crate::prompts::with_shared_prompts(system),
     })];
     for turn in turns {
         messages.push(serde_json::json!({

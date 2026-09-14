@@ -10,3 +10,4 @@
 *.log
 apps/web/dist
 apps/web/target
+data/

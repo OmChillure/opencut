@@ -1,3 +1,7 @@
+mod vision;
+
+pub use vision::{VisualDigest, analyze_local};
+
 use oc_time::{Duration, FrameRate};
 use oc_timeline::{MediaId, ProjectId};
 use serde::{Deserialize, Serialize};

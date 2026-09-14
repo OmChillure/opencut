@@ -3110,6 +3110,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "thiserror 2.0.20",
+ "tracing",
  "uuid",
 ]
 
@@ -3120,7 +3121,9 @@ dependencies = [
  "oc-time",
  "oc-timeline",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -3207,6 +3210,7 @@ dependencies = [
  "dotenvy",
  "oc-core",
  "oc-db",
+ "oc-media",
  "oc-timeline",
  "oc-voice",
  "serde",

@@ -257,6 +257,13 @@ pub struct AssembleItem {
     pub text: String,
     #[serde(default)]
     pub still: bool,
+    /// Local look label: wide, close, dark, action, graphic, interior…
+    #[serde(default)]
+    pub look: String,
+    #[serde(default)]
+    pub motion: f32,
+    #[serde(default)]
+    pub scenes: u32,
 }
 
 impl Default for AssembleItem {
@@ -271,6 +278,9 @@ impl Default for AssembleItem {
             hook_in: Time::ZERO,
             text: String::new(),
             still: false,
+            look: String::new(),
+            motion: 0.0,
+            scenes: 0,
         }
     }
 }
@@ -602,9 +612,8 @@ fn assemble_linear(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<us
     Ok(n)
 }
 
-/// Cut a ~30s short: hook + A-roll spine, B-roll on V2, music ducked under.
+/// Cut a 30s–60s short: hook + A-roll spine, B-roll on V2, music ducked under.
 fn assemble_short(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<usize> {
-    const TARGET: f64 = 30.0;
     let mut a_roll = Vec::new();
     let mut b_roll = Vec::new();
     let mut music = Vec::new();
@@ -642,7 +651,8 @@ fn assemble_short(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<usi
     let a1 = resolve_track(timeline, None, TrackKind::Audio);
 
     let n_a = a_roll.len().max(1) as f64;
-    let per = (TARGET / n_a).clamp(2.4, 8.0);
+    let target = (n_a * 5.0).clamp(30.0, 60.0);
+    let per = (target / n_a).clamp(2.8, 10.0);
     let mut cursor = Time::ZERO;
     let mut n = 0;
     for (i, item) in a_roll.iter().enumerate() {
@@ -734,23 +744,39 @@ fn sort_aroll(items: &mut Vec<&AssembleItem>) {
         aroll_rank(a)
             .cmp(&aroll_rank(b))
             .then(b.words.cmp(&a.words))
-            .then(b.speech_seconds.partial_cmp(&a.speech_seconds).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                b.speech_seconds
+                    .partial_cmp(&a.speech_seconds)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(
+                b.motion
+                    .partial_cmp(&a.motion)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
 }
 
 fn aroll_rank(item: &AssembleItem) -> u8 {
     let t = item.text.to_ascii_lowercase();
     if t.contains('?') || t.contains('!') {
-        0
-    } else {
-        1
+        return 0;
+    }
+    if item.words >= 8 {
+        return 1;
+    }
+    match item.look.as_str() {
+        "wide" | "bright-wide" | "action" => 2,
+        "close" => 3,
+        "dark" => 5,
+        _ => 4,
     }
 }
 
 fn sort_broll(items: &mut Vec<&AssembleItem>) {
     items.sort_by(|a, b| {
-        a.speech_seconds
-            .partial_cmp(&b.speech_seconds)
+        b.motion
+            .partial_cmp(&a.motion)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 }

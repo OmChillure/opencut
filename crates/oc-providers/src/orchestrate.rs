@@ -17,6 +17,7 @@ pub async fn complete(
         return Err(LlmError::Message(id.login_hint().into()));
     }
     let prompt = build_prompt(system, turns, tools);
+    // New providers: add an arm here. Do not skip `build_prompt` — it injects prompts/*.md.
     let text = match id {
         ProviderId::Xai => grok_acp(model, &prompt).await?,
         ProviderId::Claude => claude_print(&prompt).await?,
@@ -27,7 +28,8 @@ pub async fn complete(
 
 fn build_prompt(system: &str, turns: &[ChatTurn], tools: &[McpTool]) -> String {
     let mut out = String::new();
-    out.push_str(system);
+    // Every provider goes through here — Grok, Claude, Codex, and any added later.
+    out.push_str(&crate::prompts::with_shared_prompts(system));
     if !tools.is_empty() {
         out.push_str(
             "\n\nYou can edit the timeline by emitting one or more lines of the form:\n\

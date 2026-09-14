@@ -153,10 +153,15 @@ pub async fn apply_ops(
     let media = oc_db::list_media(&state.db, id).await?;
     let transcripts = oc_db::list_transcripts_for_project(&state.db, id).await?;
     let speech = speech_by_media(&transcripts);
+    let looks = look_by_media(
+        &oc_db::list_analysis_for_project(&state.db, id)
+            .await
+            .unwrap_or_default(),
+    );
     let mut undo = UndoStack::new();
     let mut notes = Vec::new();
     for op in body.ops {
-        let op = hydrate_op(op, &media, &speech);
+        let op = hydrate_op(op, &media, &speech, &looks);
         match apply(&mut project.timeline, &mut undo, op) {
             Ok(applied) => notes.push(applied.note),
             Err(err) => return Err(ApiError::new(StatusCode::BAD_REQUEST, err.to_string())),
@@ -196,6 +201,10 @@ pub async fn chat(
     let media = oc_db::list_media(&state.db, id).await?;
     let transcripts = oc_db::list_transcripts_for_project(&state.db, id).await?;
     let speech = speech_by_media(&transcripts);
+    let looks = oc_db::list_analysis_for_project(&state.db, id)
+        .await
+        .unwrap_or_default();
+    let looks = look_by_media(&looks);
     let mut notes = Vec::new();
     let last_user = body
         .messages
@@ -212,18 +221,20 @@ pub async fn chat(
                 timeline: project.timeline,
             }));
         }
-        let heard = media.iter().any(|m| speech.contains_key(&m.id));
-        let needs_listen = media.iter().any(|m| {
-            !m.content_type.starts_with("image/")
-                && !m.content_type.starts_with("audio/")
-                && !speech.contains_key(&m.id)
+        let understood = media.iter().any(|m| {
+            speech.contains_key(&m.id) || looks.contains_key(&m.id)
         });
-        if needs_listen {
+        let needs_scan = media.iter().any(|m| {
+            !m.content_type.starts_with("image/")
+                && !speech.contains_key(&m.id)
+                && !looks.contains_key(&m.id)
+        });
+        if needs_scan {
             for row in &media {
                 if row.content_type.starts_with("image/") {
                     continue;
                 }
-                if speech.contains_key(&row.id) {
+                if speech.contains_key(&row.id) || looks.contains_key(&row.id) {
                     continue;
                 }
                 let _ = oc_db::enqueue_job(
@@ -237,10 +248,10 @@ pub async fn chat(
                 )
                 .await;
             }
-            if !heard {
+            if !understood {
                 oc_db::save_timeline(&state.db, id, &project.timeline).await?;
                 return Ok(Json(ChatResponse {
-                    text: "Listening to your clips (speech-to-text). Ask again in a few seconds and I’ll cut the short from what was said — not from the file names.".into(),
+                    text: "Watching and listening to your clips locally (ffmpeg + Whisper). Ask again in a few seconds — silent clips are fine.".into(),
                     notes: Vec::new(),
                     timeline: project.timeline,
                 }));
@@ -254,6 +265,7 @@ pub async fn chat(
             },
             &media,
             &speech,
+            &looks,
         );
         match apply(&mut project.timeline, &mut undo, op) {
             Ok(applied) => notes.push(applied.note),
@@ -270,24 +282,18 @@ pub async fn chat(
     let directed = !notes.is_empty();
     let system = if directed {
         format!(
-            "You are OpenCut, an AI video director. A short is already cut on the timeline \
-             from the imported bin. Do not assemble again unless the user asks for a redo.\n\
-             Explain the cut in 2-4 short sentences (hook, A-roll, B-roll, music). \
-             Only emit TOOL lines if they asked for a specific change.\n\
+            "A short is already on the timeline. Follow the director brief above. \
+             Do not assemble again unless they ask for a redo.\n\
              Project '{}'.\n\n{}\n\n{}",
             project.name,
-            media_brief(&media, &speech),
+            media_brief(&media, &speech, &looks),
             timeline_brief(&project.timeline)
         )
     } else {
         format!(
-            "You are OpenCut, an AI video director. You decide order from what is SAID and shown, \
-             never from filenames. Never ask the user to order clips. If they want a video/vlog/short, \
-             call assemble with style=vlog and omit media_ids.\n\
-             Times are seconds. Use media ids from the bin.\n\
-             Project '{}'.\n\n{}\n\n{}",
+            "Follow the director brief above. Project '{}'.\n\n{}\n\n{}",
             project.name,
-            media_brief(&media, &speech),
+            media_brief(&media, &speech, &looks),
             timeline_brief(&project.timeline)
         )
     };
@@ -324,7 +330,7 @@ pub async fn chat(
                 let mut undo = UndoStack::new();
                 for call in calls {
                     match op_from_mcp(&call) {
-                        Ok(op) => match apply(&mut project.timeline, &mut undo, hydrate_op(op, &media, &speech)) {
+                        Ok(op) => match apply(&mut project.timeline, &mut undo, hydrate_op(op, &media, &speech, &looks)) {
                             Ok(applied) => {
                                 notes.push(applied.note.clone());
                                 batch.push_str(&applied.note);
@@ -389,37 +395,55 @@ fn speech_by_media(rows: &[oc_db::TranscriptCueRow]) -> std::collections::HashMa
     map
 }
 
+fn look_by_media(
+    rows: &[oc_db::AnalysisRow],
+) -> std::collections::HashMap<Uuid, oc_db::AnalysisRow> {
+    rows.iter().cloned().map(|r| (r.media_id, r)).collect()
+}
+
 fn media_brief(
     rows: &[oc_db::MediaRow],
     speech: &std::collections::HashMap<Uuid, Speech>,
+    looks: &std::collections::HashMap<Uuid, oc_db::AnalysisRow>,
 ) -> String {
     if rows.is_empty() {
         return "Media bin: (empty — ask the user to import clips first)\n".into();
     }
     let mut out = String::from(
-        "Media bin (understand from SPEECH, not filenames):\n",
+        "Media bin (from SPEECH + local LOOK, not filenames):\n",
     );
     for row in rows {
         let (kind, dur) = spec_from_row(row);
+        let look = looks.get(&row.id);
+        let look_s = look
+            .map(|l| {
+                format!(
+                    "LOOK {} motion={:.2} scenes={}",
+                    l.look, l.motion, l.scenes
+                )
+            })
+            .unwrap_or_else(|| "LOOK pending".into());
         match speech.get(&row.id) {
             Some(s) if s.words > 0 => {
-                let excerpt: String = s.text.chars().take(180).collect();
+                let excerpt: String = s.text.chars().take(140).collect();
                 out.push_str(&format!(
-                    "- id={}  {:?}  {:.1}s  SPEECH words={}  hook@{:.1}s  \"{}\"\n",
+                    "- id={}  {:?}  {:.1}s  SPEECH words={} hook@{:.1}s  {}  \"{}\"\n",
                     row.id,
                     kind,
                     dur.as_seconds(),
                     s.words,
                     s.hook_in.as_seconds(),
+                    look_s,
                     excerpt.replace('\n', " ")
                 ));
             }
             _ => {
                 out.push_str(&format!(
-                    "- id={}  {:?}  {:.1}s  (no speech — treat as B-roll / music / still)\n",
+                    "- id={}  {:?}  {:.1}s  no speech  {}\n",
                     row.id,
                     kind,
-                    dur.as_seconds()
+                    dur.as_seconds(),
+                    look_s
                 ));
             }
         }
@@ -462,6 +486,7 @@ fn hydrate_op(
     op: Op,
     media: &[oc_db::MediaRow],
     speech: &std::collections::HashMap<Uuid, Speech>,
+    looks: &std::collections::HashMap<Uuid, oc_db::AnalysisRow>,
 ) -> Op {
     match op {
         Op::PlaceMedia {
@@ -506,14 +531,14 @@ fn hydrate_op(
                 media
                     .iter()
                     .rev()
-                    .map(|row| item_from_row(row, speech.get(&row.id)))
+                    .map(|row| item_from_row(row, speech.get(&row.id), looks.get(&row.id)))
                     .collect()
             } else {
                 items
                     .into_iter()
                     .map(|item| {
                         if let Some(row) = media.iter().find(|r| r.id == item.media_id.as_uuid()) {
-                            item_from_row(row, speech.get(&row.id))
+                            item_from_row(row, speech.get(&row.id), looks.get(&row.id))
                         } else {
                             item
                         }
@@ -526,7 +551,11 @@ fn hydrate_op(
     }
 }
 
-fn item_from_row(row: &oc_db::MediaRow, speech: Option<&Speech>) -> AssembleItem {
+fn item_from_row(
+    row: &oc_db::MediaRow,
+    speech: Option<&Speech>,
+    look: Option<&oc_db::AnalysisRow>,
+) -> AssembleItem {
     let (kind, duration) = spec_from_row(row);
     let still = row.content_type.starts_with("image/");
     let mut item = AssembleItem {
@@ -541,6 +570,11 @@ fn item_from_row(row: &oc_db::MediaRow, speech: Option<&Speech>) -> AssembleItem
         item.speech_seconds = s.speech_seconds;
         item.hook_in = s.hook_in;
         item.text = s.text.clone();
+    }
+    if let Some(l) = look {
+        item.look = l.look.clone();
+        item.motion = l.motion as f32;
+        item.scenes = l.scenes.max(0) as u32;
     }
     item
 }

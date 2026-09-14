@@ -11,6 +11,7 @@ dotenvy.workspace = true
 oc-core.workspace = true
 oc-db.workspace = true
 oc-voice.workspace = true
+oc-media.workspace = true
 oc-timeline.workspace = true
 serde.workspace = true
 serde_json.workspace = true
