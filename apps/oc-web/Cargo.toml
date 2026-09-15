@@ -17,4 +17,5 @@ uuid.workspace = true
 gloo-timers = { version = "0.3", features = ["futures"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "EventTarget", "HtmlVideoElement", "PointerEvent", "Storage", "Blob", "BlobPropertyBag", "Url", "DomRect"] }
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "EventTarget", "HtmlVideoElement", "PointerEvent", "Storage", "Blob", "BlobPropertyBag", "Url", "DomRect", "Headers", "Request", "RequestInit", "RequestMode", "Response", "ReadableStream", "ReadableStreamDefaultReader"] }

@@ -27,32 +27,63 @@ pub enum DbError {
     Json(#[from] serde_json::Error),
 }
 
+impl DbError {
+    #[must_use]
+    pub fn is_pool_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlx(sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+        )
+    }
+}
+
 pub async fn connect() -> Result<Db, DbError> {
     let url = std::env::var("DATABASE_URL").map_err(|_| DbError::MissingUrl)?;
     let url = prefer_session_pooler(&url);
     // Transaction-mode poolers (Supabase :6543) leave unnamed prepared
     // statements on the backend. Next Bind then fails with
     // "supplies 0 parameters, but statement requires 1".
-    let opts = PgConnectOptions::from_str(&url)?.statement_cache_capacity(0);
+    let opts = PgConnectOptions::from_str(&url)?
+        .statement_cache_capacity(0)
+        .application_name("opencut");
+    let host = opts.get_host().to_string();
+    let port = opts.get_port();
+    // Do not run SQL in before_acquire. Dead sockets from the Supabase
+    // pooler make `deallocate all` hang until acquire_timeout, which is
+    // the "pool timed out while waiting for an open connection" log.
+    // sqlx already pings (test_before_acquire defaults to true).
+    let max = env_u32("DB_MAX_CONNECTIONS", 4);
     let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .acquire_timeout(Duration::from_secs(15))
-        .idle_timeout(Duration::from_secs(30))
+        .max_connections(max)
+        .acquire_timeout(Duration::from_secs(env_secs("DB_ACQUIRE_TIMEOUT_SECS", 8)))
+        .idle_timeout(Duration::from_secs(env_secs("DB_IDLE_TIMEOUT_SECS", 90)))
+        .max_lifetime(Duration::from_secs(env_secs("DB_MAX_LIFETIME_SECS", 240)))
         .after_connect(|conn, _| {
             Box::pin(async move {
                 let _ = sqlx::raw_sql("deallocate all").execute(&mut *conn).await;
                 Ok(())
             })
         })
-        .before_acquire(|conn, _| {
-            Box::pin(async move {
-                let _ = sqlx::raw_sql("deallocate all").execute(&mut *conn).await;
-                Ok(true)
-            })
-        })
         .connect_with(opts)
         .await?;
+    tracing::info!(host, port, max, "postgres pool ready");
     Ok(pool)
+}
+
+fn env_secs(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 /// Supabase/Neon :6543 is transaction PgBouncer. sqlx needs session mode (:5432).
@@ -509,4 +540,17 @@ pub async fn list_analysis_for_project(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefer_session_pooler;
+
+    #[test]
+    fn rewrites_supabase_transaction_port() {
+        let url = "postgres://u:p@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres";
+        let next = prefer_session_pooler(url);
+        assert!(next.contains(":5432"), "{next}");
+        assert!(!next.contains(":6543"), "{next}");
+    }
 }

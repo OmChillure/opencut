@@ -1,16 +1,20 @@
 use crate::state::AppState;
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::Response;
+use futures_util::StreamExt;
 use oc_core::{
     inspect_from_mcp, AssembleItem, AssembleStyle, Inspect, MediaId, Op, Project, ProjectId, Time,
     Timeline, TrackKind, UndoStack, apply, is_director_request, mcp_tools, op_from_mcp,
 };
 use oc_core::time::TICKS_PER_SECOND;
-use oc_providers::{ChatTurn, LlmReply};
+use oc_providers::{ChatEvent, ChatTurn, LlmReply};
 use oc_media::{ObjectKind, object_key};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -185,6 +189,7 @@ pub struct ChatBody {
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 pub struct ChatResponse {
     pub text: String,
     pub notes: Vec<String>,
@@ -195,10 +200,59 @@ pub async fn chat(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<ChatBody>,
-) -> ApiResult<Json<ChatResponse>> {
-    let mut project = oc_db::get_project(&state.db, id).await?;
-    let media = oc_db::list_media(&state.db, id).await?;
-    let transcripts = oc_db::list_transcripts_for_project(&state.db, id).await?;
+) -> Result<Response, ApiError> {
+    let (tx, rx) = mpsc::channel::<String>(64);
+    tokio::spawn(async move {
+        if let Err(err) = run_chat(state, id, body, tx.clone()).await {
+            let _ = tx
+                .send(line(&serde_json::json!({
+                    "type": "error",
+                    "text": err,
+                })))
+                .await;
+        }
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|chunk| Ok::<_, std::convert::Infallible>(chunk));
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .expect("ndjson response"))
+}
+
+fn line(value: &serde_json::Value) -> String {
+    format!("{value}\n")
+}
+
+async fn push(tx: &mpsc::Sender<String>, value: serde_json::Value) {
+    let _ = tx.send(line(&value)).await;
+}
+
+async fn forward_events(mut rx: mpsc::Receiver<ChatEvent>, tx: mpsc::Sender<String>) {
+    while let Some(ev) = rx.recv().await {
+        if let Ok(value) = serde_json::to_value(&ev) {
+            let _ = tx.send(line(&value)).await;
+        }
+    }
+}
+
+async fn run_chat(
+    state: AppState,
+    id: Uuid,
+    body: ChatBody,
+    tx: mpsc::Sender<String>,
+) -> Result<(), String> {
+    let mut project = oc_db::get_project(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let media = oc_db::list_media(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let transcripts = oc_db::list_transcripts_for_project(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())?;
     let speech = speech_by_media(&transcripts);
     let looks = oc_db::list_analysis_for_project(&state.db, id)
         .await
@@ -222,6 +276,11 @@ pub async fn chat(
                 && !looks.contains_key(&m.id)
         });
         if needs_scan {
+            push(
+                &tx,
+                serde_json::json!({"type":"status","text":"Watching clips locally (ffmpeg + Whisper)"}),
+            )
+            .await;
             for row in &media {
                 if row.content_type.starts_with("image/") {
                     continue;
@@ -244,12 +303,17 @@ pub async fn chat(
                 .await;
             }
             if !understood {
-                oc_db::save_timeline(&state.db, id, &project.timeline).await?;
-                return Ok(Json(ChatResponse {
-                    text: "Watching and listening to your clips locally (ffmpeg + Whisper). Ask again in a few seconds — silent clips are fine.".into(),
-                    notes: Vec::new(),
-                    timeline: project.timeline,
-                }));
+                oc_db::save_timeline(&state.db, id, &project.timeline)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                finish_chat(
+                    &tx,
+                    "Watching and listening to your clips locally (ffmpeg + Whisper). Ask again in a few seconds — silent clips are fine.",
+                    &[],
+                    &project.timeline,
+                )
+                .await;
+                return Ok(());
             }
         }
         let mut undo = UndoStack::new();
@@ -263,13 +327,27 @@ pub async fn chat(
             &looks,
         );
         match apply(&mut project.timeline, &mut undo, op) {
-            Ok(applied) => notes.push(applied.note),
+            Ok(applied) => {
+                emit_host_tool(
+                    &tx,
+                    "host-assemble",
+                    "assemble",
+                    serde_json::json!({"style":"vlog"}),
+                    Some(applied.note.clone()),
+                    "done",
+                )
+                .await;
+                notes.push(applied.note);
+            }
             Err(err) => {
-                return Ok(Json(ChatResponse {
-                    text: format!("Couldn't cut the short: {err}"),
-                    notes: Vec::new(),
-                    timeline: project.timeline,
-                }));
+                finish_chat(
+                    &tx,
+                    &format!("Couldn't cut the short: {err}"),
+                    &[],
+                    &project.timeline,
+                )
+                .await;
+                return Ok(());
             }
         }
     }
@@ -292,13 +370,16 @@ pub async fn chat(
     };
     let mut turns = body.messages;
     let mut text = String::new();
-    for _ in 0..8 {
-        let reply = match oc_providers::complete(
+    let (ev_tx, ev_rx) = mpsc::channel::<ChatEvent>(64);
+    let pump = tokio::spawn(forward_events(ev_rx, tx.clone()));
+    for turn_i in 0..8 {
+        let reply = match oc_providers::complete_stream(
             &body.provider,
             &body.model,
             &system,
             &turns,
             &tools,
+            Some(ev_tx.clone()),
         )
         .await
         {
@@ -310,7 +391,9 @@ pub async fn chat(
                 break;
             }
             Err(err) => {
-                return Err(ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()));
+                drop(ev_tx);
+                let _ = pump.await;
+                return Err(err.to_string());
             }
         };
         match reply {
@@ -321,29 +404,68 @@ pub async fn chat(
             LlmReply::Tools(calls) => {
                 let mut batch = String::new();
                 let mut undo = UndoStack::new();
-                for call in calls {
-                    if let Some(inspect) = inspect_from_mcp(&call) {
-                        batch.push_str(&run_inspect(
+                for (i, call) in calls.into_iter().enumerate() {
+                    let tool_id = format!("host-{turn_i}-{i}-{}", call.name);
+                    emit_host_tool(
+                        &tx,
+                        &tool_id,
+                        &call.name,
+                        call.arguments.clone(),
+                        None,
+                        "pending",
+                    )
+                    .await;
+                    tracing::info!(tool = %call.name, "host tool");
+                    let (ok, result) = if let Some(inspect) = inspect_from_mcp(&call) {
+                        let out = run_inspect(
                             inspect,
                             &project.timeline,
                             &media,
                             &speech,
                             &looks,
-                        ));
+                        );
+                        batch.push_str(&out);
                         batch.push('\n');
-                        continue;
-                    }
-                    match op_from_mcp(&call) {
-                        Ok(op) => match apply(&mut project.timeline, &mut undo, hydrate_op(op, &media, &speech, &looks)) {
-                            Ok(applied) => {
-                                notes.push(applied.note.clone());
-                                batch.push_str(&applied.note);
-                                batch.push('\n');
+                        (true, out)
+                    } else {
+                        match op_from_mcp(&call) {
+                            Ok(op) => {
+                                match apply(
+                                    &mut project.timeline,
+                                    &mut undo,
+                                    hydrate_op(op, &media, &speech, &looks),
+                                ) {
+                                    Ok(applied) => {
+                                        notes.push(applied.note.clone());
+                                        batch.push_str(&applied.note);
+                                        batch.push('\n');
+                                        (true, applied.note)
+                                    }
+                                    Err(err) => {
+                                        let msg = format!("tool error: {err}");
+                                        batch.push_str(&msg);
+                                        batch.push('\n');
+                                        (false, msg)
+                                    }
+                                }
                             }
-                            Err(err) => batch.push_str(&format!("tool error: {err}\n")),
-                        },
-                        Err(err) => batch.push_str(&format!("bad tool {}: {err}\n", call.name)),
-                    }
+                            Err(err) => {
+                                let msg = format!("bad tool {}: {err}", call.name);
+                                batch.push_str(&msg);
+                                batch.push('\n');
+                                (false, msg)
+                            }
+                        }
+                    };
+                    emit_host_tool(
+                        &tx,
+                        &tool_id,
+                        &call.name,
+                        call.arguments,
+                        Some(result),
+                        if ok { "done" } else { "error" },
+                    )
+                    .await;
                 }
                 turns.push(ChatTurn {
                     role: "assistant".into(),
@@ -356,15 +478,56 @@ pub async fn chat(
             }
         }
     }
-    oc_db::save_timeline(&state.db, id, &project.timeline).await?;
+    drop(ev_tx);
+    let _ = pump.await;
+    oc_db::save_timeline(&state.db, id, &project.timeline)
+        .await
+        .map_err(|e| e.to_string())?;
     if text.is_empty() && !notes.is_empty() {
         text = notes.join(" · ");
     }
-    Ok(Json(ChatResponse {
-        text,
-        notes,
-        timeline: project.timeline,
-    }))
+    finish_chat(&tx, &text, &notes, &project.timeline).await;
+    Ok(())
+}
+
+async fn emit_host_tool(
+    tx: &mpsc::Sender<String>,
+    id: &str,
+    name: &str,
+    args: serde_json::Value,
+    result: Option<String>,
+    status: &str,
+) {
+    push(
+        tx,
+        serde_json::json!({
+            "type": "tool",
+            "id": id,
+            "name": name,
+            "args": args,
+            "result": result,
+            "status": status,
+        }),
+    )
+    .await;
+}
+
+async fn finish_chat(
+    tx: &mpsc::Sender<String>,
+    text: &str,
+    notes: &[String],
+    timeline: &Timeline,
+) {
+    push(
+        tx,
+        serde_json::json!({
+            "type": "done",
+            "text": text,
+            "notes": notes,
+            "timeline": timeline,
+        }),
+    )
+    .await;
 }
 
 struct Speech {

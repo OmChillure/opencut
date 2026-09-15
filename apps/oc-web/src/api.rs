@@ -38,12 +38,34 @@ pub async fn list_ai_providers() -> Result<Vec<AiProvider>, String> {
     Ok(resp.providers)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ChatReply {
     pub text: String,
     #[serde(default)]
     pub notes: Vec<String>,
     pub timeline: Timeline,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChatStreamEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub timeline: Option<Timeline>,
 }
 
 pub async fn register_media(
@@ -93,6 +115,16 @@ pub async fn chat(
     model: &str,
     messages: &[(bool, String)],
 ) -> Result<ChatReply, String> {
+    chat_stream(project_id, provider, model, messages, |_| {}).await
+}
+
+pub async fn chat_stream(
+    project_id: &str,
+    provider: &str,
+    model: &str,
+    messages: &[(bool, String)],
+    mut on_event: impl FnMut(ChatStreamEvent),
+) -> Result<ChatReply, String> {
     let body = serde_json::json!({
         "provider": provider,
         "model": model,
@@ -101,17 +133,141 @@ pub async fn chat(
             "content": text,
         })).collect::<Vec<_>>(),
     });
-    reqwest::Client::new()
-        .post(format!("{API}/v1/projects/{project_id}/chat"))
-        .json(&body)
-        .send()
+    let mut reply = ChatReply {
+        text: String::new(),
+        notes: Vec::new(),
+        timeline: Timeline::default(),
+    };
+    let mut saw_done = false;
+    let url = format!("{API}/v1/projects/{project_id}/chat");
+    read_ndjson(&url, &body.to_string(), |line| {
+        let ev: ChatStreamEvent = serde_json::from_str(line).map_err(|e| e.to_string())?;
+        if ev.kind == "done" {
+            reply.text = ev.text.clone();
+            reply.notes = ev.notes.clone();
+            if let Some(tl) = ev.timeline.clone() {
+                reply.timeline = tl;
+            }
+            saw_done = true;
+        }
+        if ev.kind == "error" && !ev.text.is_empty() {
+            return Err(ev.text.clone());
+        }
+        on_event(ev);
+        Ok(())
+    })
+    .await?;
+    if !saw_done && reply.text.is_empty() {
+        return Err("chat stream ended without a reply".into());
+    }
+    Ok(reply)
+}
+
+async fn read_ndjson(
+    url: &str,
+    json_body: &str,
+    mut on_line: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_read_ndjson(url, json_body, on_line).await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let raw = reqwest::Client::new()
+            .post(url)
+            .header("content-type", "application/json")
+            .body(json_body.to_string())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .text()
+            .await
+            .map_err(|e| e.to_string())?;
+        for line in raw.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                on_line(line)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn wasm_read_ndjson(
+    url: &str,
+    json_body: &str,
+    mut on_line: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{ReadableStreamDefaultReader, Request, RequestInit, RequestMode, Response};
+
+    let opts = RequestInit::new();
+    opts.set_method("POST");
+    opts.set_mode(RequestMode::Cors);
+    opts.set_body(&wasm_bindgen::JsValue::from_str(json_body));
+    let request = Request::new_with_str_and_init(url, &opts).map_err(js_err)?;
+    request
+        .headers()
+        .set("content-type", "application/json")
+        .map_err(js_err)?;
+    let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
+    let resp = JsFuture::from(window.fetch_with_request(&request))
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+        .map_err(js_err)?;
+    let resp: Response = resp.dyn_into().map_err(|_| "bad response".to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let Some(body) = resp.body() else {
+        return Err("empty body".into());
+    };
+    let reader: ReadableStreamDefaultReader = body
+        .get_reader()
+        .dyn_into()
+        .map_err(|_| "stream reader".to_string())?;
+    let mut pending = String::new();
+    loop {
+        let next = JsFuture::from(reader.read()).await.map_err(js_err)?;
+        let done = js_sys::Reflect::get(&next, &"done".into())
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !done {
+            let value = js_sys::Reflect::get(&next, &"value".into()).map_err(js_err)?;
+            if !value.is_undefined() && !value.is_null() {
+                let arr = js_sys::Uint8Array::new(&value);
+                let mut bytes = vec![0u8; arr.length() as usize];
+                arr.copy_to(&mut bytes);
+                pending.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        while let Some(idx) = pending.find('\n') {
+            let line = pending[..idx].trim().to_string();
+            pending = pending[idx + 1..].to_string();
+            if !line.is_empty() {
+                on_line(&line)?;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    let tail = pending.trim().to_string();
+    if !tail.is_empty() {
+        on_line(&tail)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_err(err: wasm_bindgen::JsValue) -> String {
+    err.as_string()
+        .unwrap_or_else(|| format!("{err:?}"))
 }
 
 const API: &str = "http://127.0.0.1:8787";

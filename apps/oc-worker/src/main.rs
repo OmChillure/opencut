@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let db = oc_db::connect().await.context("database")?;
+    let mut db = oc_db::connect().await.context("database")?;
     oc_db::migrate(&db).await.ok();
     let r2 = R2::from_env().await.ok();
     if r2.is_none() {
@@ -24,9 +24,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("understand = local ffmpeg look + Whisper (no paid STT/vision)");
 
     tracing::info!("worker polling jobs");
+    let mut fail = 0u32;
     loop {
         match oc_db::claim_job(&db).await {
             Ok(Some(job)) => {
+                fail = 0;
                 tracing::info!(id = %job.id, kind = %job.kind, "claimed job");
                 let err = handle(&db, r2.as_ref(), &job.kind, job.payload)
                     .await
@@ -39,14 +41,36 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!("finish job: {e}");
                 }
             }
-            Ok(None) => sleep(Duration::from_millis(750)).await,
+            Ok(None) => {
+                fail = 0;
+                sleep(Duration::from_millis(750)).await;
+            }
             Err(err) => {
-                tracing::error!("claim: {err}");
-                sleep(Duration::from_secs(2)).await;
+                fail = fail.saturating_add(1);
+                tracing::error!(
+                    size = db.size(),
+                    idle = db.num_idle(),
+                    fail,
+                    "claim: {err}"
+                );
+                if err.is_pool_timeout() {
+                    match oc_db::connect().await {
+                        Ok(next) => {
+                            tracing::warn!("reconnected database pool");
+                            db = next;
+                            fail = 0;
+                        }
+                        Err(e) => tracing::error!("reconnect failed: {e}"),
+                    }
+                }
+                let wait = 2u64.saturating_mul(u64::from(fail.min(5)));
+                sleep(Duration::from_secs(wait.max(2))).await;
             }
         }
     }
 }
+
+
 
 #[derive(Deserialize)]
 struct TranscribePayload {

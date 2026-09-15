@@ -144,10 +144,61 @@ fn persist(save: WorkspaceSave) {
     });
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ChatRole {
+    User,
+    Bot,
+    Tool,
+    Status,
+}
+
 #[derive(Clone, PartialEq)]
 struct ChatMsg {
-    user: bool,
+    role: ChatRole,
     text: String,
+    tool_id: String,
+    tool_name: String,
+    tool_status: String,
+    tool_args: String,
+    tool_result: String,
+}
+
+impl ChatMsg {
+    fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::User,
+            text: text.into(),
+            tool_id: String::new(),
+            tool_name: String::new(),
+            tool_status: String::new(),
+            tool_args: String::new(),
+            tool_result: String::new(),
+        }
+    }
+
+    fn bot(text: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Bot,
+            text: text.into(),
+            tool_id: String::new(),
+            tool_name: String::new(),
+            tool_status: String::new(),
+            tool_args: String::new(),
+            tool_result: String::new(),
+        }
+    }
+
+    fn status(text: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Status,
+            text: text.into(),
+            tool_id: String::new(),
+            tool_name: String::new(),
+            tool_status: String::new(),
+            tool_args: String::new(),
+            tool_result: String::new(),
+        }
+    }
 }
 
 fn main() {
@@ -1729,9 +1780,34 @@ fn AiSidebar(
                 } else {
                     div { class: "msgs",
                         for msg in messages.read().iter() {
-                            div {
-                                class: if msg.user { "bubble user" } else { "bubble bot" },
-                                "{msg.text}"
+                            match msg.role {
+                                ChatRole::User => rsx! {
+                                    div { class: "bubble user", "{msg.text}" }
+                                },
+                                ChatRole::Bot => rsx! {
+                                    div { class: "bubble bot", "{msg.text}" }
+                                },
+                                ChatRole::Status => rsx! {
+                                    div { class: "bubble status", "{msg.text}" }
+                                },
+                                ChatRole::Tool => rsx! {
+                                    div { class: "bubble tool",
+                                        div { class: "tool-head",
+                                            span { class: "tool-k", "tool" }
+                                            span { class: "tool-name", "{msg.tool_name}" }
+                                            span {
+                                                class: "tool-status {msg.tool_status}",
+                                                "{msg.tool_status}"
+                                            }
+                                        }
+                                        if !msg.tool_args.is_empty() {
+                                            pre { class: "tool-args", "{msg.tool_args}" }
+                                        }
+                                        if !msg.tool_result.is_empty() {
+                                            pre { class: "tool-result", "{msg.tool_result}" }
+                                        }
+                                    }
+                                },
                             }
                         }
                     }
@@ -1872,6 +1948,116 @@ fn ProviderPicker(
     }
 }
 
+fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent) {
+    match ev.kind.as_str() {
+        "status" => {
+            if ev.text.trim().is_empty() {
+                return;
+            }
+            let mut list = messages.write();
+            if let Some(last) = list.iter_mut().rev().find(|m| m.role == ChatRole::Status) {
+                last.text = ev.text;
+            } else {
+                list.push(ChatMsg::status(ev.text));
+            }
+        }
+        "text" => {
+            let text = strip_tool_lines(&ev.text);
+            if text.is_empty() {
+                return;
+            }
+            let mut list = messages.write();
+            if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Bot) {
+                last.text.push_str(&text);
+            } else {
+                list.push(ChatMsg::bot(text));
+            }
+        }
+        "tool" => upsert_tool(messages, ev),
+        "note" => {
+            if !ev.text.is_empty() {
+                messages.write().push(ChatMsg::status(ev.text));
+            }
+        }
+        "done" => clear_status(messages),
+        _ => {}
+    }
+}
+
+fn upsert_tool(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent) {
+    let args = compact_json(&ev.args);
+    let result = ev.result.clone().unwrap_or_default();
+    let id = if ev.id.is_empty() {
+        ev.name.clone()
+    } else {
+        ev.id.clone()
+    };
+    let mut list = messages.write();
+    if let Some(existing) = list
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == ChatRole::Tool && (m.tool_id == id || (id.is_empty() && m.tool_name == ev.name)))
+    {
+        existing.tool_status = ev.status;
+        if !args.is_empty() {
+            existing.tool_args = args;
+        }
+        if !result.is_empty() {
+            existing.tool_result = result;
+        }
+        return;
+    }
+    list.push(ChatMsg {
+        role: ChatRole::Tool,
+        text: ev.name.clone(),
+        tool_id: id,
+        tool_name: ev.name,
+        tool_status: if ev.status.is_empty() {
+            "pending".into()
+        } else {
+            ev.status
+        },
+        tool_args: args,
+        tool_result: result,
+    });
+}
+
+fn strip_tool_lines(text: &str) -> String {
+    let cleaned: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().starts_with("TOOL "))
+        .collect();
+    cleaned.join("\n")
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    if value.is_null() || value == &serde_json::json!({}) {
+        return String::new();
+    }
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn clear_status(mut messages: Signal<Vec<ChatMsg>>) {
+    messages
+        .write()
+        .retain(|m| m.role != ChatRole::Status);
+}
+
+fn finish_bot_text(mut messages: Signal<Vec<ChatMsg>>, text: String) {
+    clear_status(messages);
+    if text.trim().is_empty() {
+        return;
+    }
+    let mut list = messages.write();
+    if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Bot) {
+        if last.text.trim().is_empty() {
+            last.text = text;
+        }
+        return;
+    }
+    list.push(ChatMsg::bot(text));
+}
+
 fn send_prompt(
     mut draft: Signal<String>,
     mut messages: Signal<Vec<ChatMsg>>,
@@ -1886,18 +2072,12 @@ fn send_prompt(
     if text.is_empty() || *busy.peek() {
         return;
     }
-    messages.write().push(ChatMsg {
-        user: true,
-        text: text.clone(),
-    });
+    messages.write().push(ChatMsg::user(text.clone()));
     draft.set(String::new());
     let at = playhead_now().max(*clock.current.peek());
     if let Ok(notes) = tools::run_intent(save, &text, target_track.peek().as_str(), at) {
         if !notes.is_empty() {
-            messages.write().push(ChatMsg {
-                user: false,
-                text: notes.join(" · "),
-            });
+            messages.write().push(ChatMsg::bot(notes.join(" · ")));
             return;
         }
     }
@@ -1908,7 +2088,8 @@ fn send_prompt(
     let history: Vec<(bool, String)> = messages
         .peek()
         .iter()
-        .map(|m| (m.user, m.text.clone()))
+        .filter(|m| matches!(m.role, ChatRole::User | ChatRole::Bot))
+        .map(|m| (m.role == ChatRole::User, m.text.clone()))
         .collect();
     let bin: Vec<(String, String, String, f64, String)> = use_context::<Signal<Vec<MediaItem>>>()
         .peek()
@@ -1934,7 +2115,10 @@ fn send_prompt(
                 }
             }
         }
-        let reply = api::chat(&pid, &provider, &model, &history).await;
+        let reply = api::chat_stream(&pid, &provider, &model, &history, |ev| {
+            apply_chat_event(messages, ev);
+        })
+        .await;
         match reply {
             Ok(resp) => {
                 save.engine.set(resp.timeline.clone());
@@ -1944,21 +2128,18 @@ fn send_prompt(
                     let mut duration = clock.duration;
                     duration.set(end);
                 }
-                let text = if resp.text.trim().is_empty() {
-                    resp.notes.join(" · ")
-                } else {
-                    resp.text
-                };
-                messages.write().push(ChatMsg {
-                    user: false,
-                    text,
-                });
+                finish_bot_text(
+                    messages,
+                    if resp.text.trim().is_empty() {
+                        resp.notes.join(" · ")
+                    } else {
+                        resp.text
+                    },
+                );
             }
             Err(err) => {
-                messages.write().push(ChatMsg {
-                    user: false,
-                    text: err,
-                });
+                clear_status(messages);
+                messages.write().push(ChatMsg::bot(err));
             }
         }
         busy.set(false);
