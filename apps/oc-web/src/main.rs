@@ -150,6 +150,7 @@ enum ChatRole {
     Bot,
     Tool,
     Status,
+    Thought,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1790,6 +1791,9 @@ fn AiSidebar(
                                 ChatRole::Status => rsx! {
                                     div { class: "bubble status", "{msg.text}" }
                                 },
+                                ChatRole::Thought => rsx! {
+                                    div { class: "bubble thought", "{msg.text}" }
+                                },
                                 ChatRole::Tool => rsx! {
                                     div { class: "bubble tool",
                                         div { class: "tool-head",
@@ -1974,6 +1978,32 @@ fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent
             }
         }
         "tool" => upsert_tool(messages, ev),
+        "error" => {
+            if ev.text.trim().is_empty() {
+                return;
+            }
+            clear_status(messages);
+            messages.write().push(ChatMsg::bot(format!("Error: {}", ev.text)));
+        }
+        "thought" => {
+            if ev.text.trim().is_empty() {
+                return;
+            }
+            let mut list = messages.write();
+            if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Thought) {
+                last.text.push_str(&ev.text);
+            } else {
+                list.push(ChatMsg {
+                    role: ChatRole::Thought,
+                    text: ev.text,
+                    tool_id: String::new(),
+                    tool_name: String::new(),
+                    tool_status: String::new(),
+                    tool_args: String::new(),
+                    tool_result: String::new(),
+                });
+            }
+        }
         "note" => {
             if !ev.text.is_empty() {
                 messages.write().push(ChatMsg::status(ev.text));
@@ -1996,9 +2026,16 @@ fn upsert_tool(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent) {
     if let Some(existing) = list
         .iter_mut()
         .rev()
-        .find(|m| m.role == ChatRole::Tool && (m.tool_id == id || (id.is_empty() && m.tool_name == ev.name)))
+        .find(|m| {
+            m.role == ChatRole::Tool
+                && (m.tool_id == id
+                    || (id.is_empty() && m.tool_name == short_tool_name(&ev.name)))
+        })
     {
         existing.tool_status = ev.status;
+        if !ev.name.is_empty() {
+            existing.tool_name = short_tool_name(&ev.name);
+        }
         if !args.is_empty() {
             existing.tool_args = args;
         }
@@ -2011,7 +2048,7 @@ fn upsert_tool(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent) {
         role: ChatRole::Tool,
         text: ev.name.clone(),
         tool_id: id,
-        tool_name: ev.name,
+        tool_name: short_tool_name(&ev.name),
         tool_status: if ev.status.is_empty() {
             "pending".into()
         } else {
@@ -2020,6 +2057,11 @@ fn upsert_tool(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent) {
         tool_args: args,
         tool_result: result,
     });
+}
+
+fn short_tool_name(raw: &str) -> String {
+    let s = raw.rsplit([':', '/', '@']).next().unwrap_or(raw);
+    s.rsplit("__").next().unwrap_or(s).trim().to_string()
 }
 
 fn strip_tool_lines(text: &str) -> String {
@@ -2082,6 +2124,11 @@ fn send_prompt(
         }
     }
     busy.set(true);
+    messages.write().push(ChatMsg::status(format!(
+        "Sending to {} · {}…",
+        provider_id.peek(),
+        model_id.peek()
+    )));
     let pid = save.project_id.peek().clone();
     let provider = provider_id.peek().clone();
     let model = model_id.peek().clone();

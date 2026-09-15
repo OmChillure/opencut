@@ -24,17 +24,44 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
-    pub async fn connect(bin: &str, args: &[String]) -> Result<Self, LlmError> {
+    pub async fn connect(
+        bin: &str,
+        args: &[String],
+        events: Option<EventSink>,
+    ) -> Result<Self, LlmError> {
+        tracing::info!(bin, args = %args.join(" "), "acp spawn");
         let mut cmd = Command::new(bin);
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            LlmError::Message(format!(
-                "spawn {bin}: {e}. Is the CLI installed and logged in?"
-            ))
+            let msg = format!("spawn {bin}: {e}. Is the CLI installed and logged in?");
+            tracing::error!("{msg}");
+            LlmError::Message(msg)
         })?;
+        if let Some(stderr) = child.stderr.take() {
+            let ev = events.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    tracing::warn!(acp_stderr = %line, "acp");
+                    let lower = line.to_ascii_lowercase();
+                    if lower.contains("error")
+                        || lower.contains("fail")
+                        || lower.contains("panic")
+                        || lower.contains("denied")
+                    {
+                        emit(ev.as_ref(), ChatEvent::status(format!("acp: {line}"))).await;
+                    }
+                }
+            });
+        }
         let stdin = child
             .stdin
             .take()
@@ -51,6 +78,7 @@ impl AcpClient {
             stdout,
             next_id: 0,
         };
+        tracing::info!("acp initialize");
         client
             .request(
                 "initialize",
@@ -61,9 +89,10 @@ impl AcpClient {
                         "fs": { "readTextFile": false, "writeTextFile": false },
                     }
                 }),
-                None,
+                events.as_ref(),
             )
             .await?;
+        tracing::info!("acp initialized");
         Ok(client)
     }
 
@@ -72,15 +101,18 @@ impl AcpClient {
         cwd: &str,
         message: &str,
         model: Option<&str>,
+        mcp_servers: &[Value],
         events: Option<&EventSink>,
     ) -> Result<String, LlmError> {
+        tracing::info!(cwd, mcp = mcp_servers.len(), "acp session/new");
         let new = self
             .request(
                 "session/new",
-                serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+                serde_json::json!({ "cwd": cwd, "mcpServers": mcp_servers }),
                 events,
             )
-            .await?;
+            .await
+            .inspect_err(|e| tracing::error!("acp session/new failed: {e}"))?;
         let session_id = new
             .get("sessionId")
             .or_else(|| new.get("session_id"))
@@ -100,6 +132,7 @@ impl AcpClient {
                 )
                 .await;
         }
+        tracing::info!(session_id = %session_id, chars = message.len(), "acp session/prompt");
         let prompt_id = self.next_id + 1;
         self.send(
             "session/prompt",
@@ -121,8 +154,10 @@ impl AcpClient {
             }
             if ids_match(&msg.id, prompt_id) {
                 if let Some(err) = msg.error {
+                    tracing::error!(error = %err, "acp session/prompt error");
                     return Err(LlmError::Message(format!("ACP prompt: {err}")));
                 }
+                tracing::info!(chars = text.len(), "acp session/prompt done");
                 if let Some(chunk) = extract_text(&msg.result) {
                     text.push_str(&chunk);
                 }
@@ -178,6 +213,7 @@ impl AcpClient {
             return Ok(());
         };
         let method = msg.method.as_deref().unwrap_or("");
+        tracing::info!(method, "acp client request");
         let result = match method {
             "session/request_permission" | "session/requestPermission" => {
                 if let Some(ev) = permission_tool_event(&msg.params) {
@@ -186,7 +222,7 @@ impl AcpClient {
                 permission_allow(&msg.params)
             }
             _ => {
-                tracing::debug!(method, "ACP client method not implemented");
+                tracing::warn!(method, "acp client method not implemented — empty reply");
                 serde_json::json!({})
             }
         };
@@ -240,6 +276,7 @@ impl AcpClient {
                 .await
                 .map_err(|e| LlmError::Message(e.to_string()))?;
             if n == 0 {
+                tracing::error!("acp stdout closed (CLI exited)");
                 return Err(LlmError::Message("ACP CLI closed".into()));
             }
             let trimmed = line.trim();
@@ -247,8 +284,12 @@ impl AcpClient {
                 continue;
             }
             if let Ok(msg) = serde_json::from_str::<Rpc>(trimmed) {
+                if let Some(method) = msg.method.as_deref() {
+                    tracing::debug!(method, id = ?msg.id, "acp <<");
+                }
                 return Ok(msg);
             }
+            tracing::warn!(line = %trimmed.chars().take(240).collect::<String>(), "acp non-json stdout");
         }
     }
 }
@@ -319,11 +360,13 @@ async fn emit_update(params: &Option<Value>, events: Option<&EventSink>) {
     match kind {
         "agent_message_chunk" | "agent_message" => {
             if let Some(text) = content_text(v) {
+                tracing::debug!(chars = text.len(), "acp text");
                 emit(events, ChatEvent::text(text)).await;
             }
         }
         "agent_thought_chunk" | "agent_thought" => {
             if let Some(text) = content_text(v) {
+                tracing::debug!(chars = text.len(), "acp thought");
                 emit(events, ChatEvent::thought(text)).await;
             }
         }
@@ -341,6 +384,11 @@ async fn emit_update(params: &Option<Value>, events: Option<&EventSink>) {
     }
 }
 
+pub fn short_tool_name(raw: &str) -> String {
+    let s = raw.rsplit([':', '/', '@']).next().unwrap_or(raw);
+    s.rsplit("__").next().unwrap_or(s).trim().to_string()
+}
+
 fn tool_event_from_update(u: &Value) -> Option<ChatEvent> {
     let id = u
         .get("toolCallId")
@@ -349,16 +397,23 @@ fn tool_event_from_update(u: &Value) -> Option<ChatEvent> {
         .unwrap_or("tool")
         .to_string();
     let name = u
-        .get("title")
-        .or_else(|| u.get("kind"))
+        .get("name")
+        .or_else(|| u.get("title"))
         .and_then(|v| v.as_str())
         .or_else(|| {
             u.pointer("/rawInput/name")
                 .or_else(|| u.pointer("/raw_input/name"))
                 .and_then(|v| v.as_str())
         })
-        .unwrap_or("tool")
-        .to_string();
+        .map(short_tool_name)
+        .filter(|s| !s.is_empty() && s != "other" && s != "mcp")
+        .or_else(|| {
+            u.get("kind")
+                .and_then(|v| v.as_str())
+                .map(short_tool_name)
+                .filter(|s| !s.is_empty() && s != "other" && s != "mcp")
+        })
+        .unwrap_or_else(|| "tool".into());
     let args = u
         .get("rawInput")
         .or_else(|| u.get("raw_input"))
@@ -481,6 +536,13 @@ mod tests {
         let ev = tool_event_from_update(&u).unwrap();
         assert_eq!(ev.name(), "list_bin");
         assert_eq!(ev.status_label(), "pending");
+    }
+
+    #[test]
+    fn shortens_mcp_tool_names() {
+        assert_eq!(short_tool_name("mcp__opencut__list_bin"), "list_bin");
+        assert_eq!(short_tool_name("opencut/split"), "split");
+        assert_eq!(short_tool_name("assemble"), "assemble");
     }
 
     #[test]

@@ -960,13 +960,37 @@ pub fn set_media_duration(library: &mut [MediaItem], tracks: &mut [EditorTrack],
     let Some(item) = library.iter_mut().find(|item| item.url == url) else {
         return false;
     };
-    let mut changed = (item.duration - duration).abs() > 0.05;
+    let old = item.duration;
+    let mut changed = (old - duration).abs() > 0.05;
     item.duration = duration;
     let id = item.id.clone();
     for track in tracks.iter_mut() {
+        let mut bounds: Vec<(f64, f64)> = track
+            .clips
+            .iter()
+            .map(|c| (c.start, c.duration))
+            .collect();
+        bounds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         for clip in track.clips.iter_mut() {
-            if clip.media_id == id && (clip.duration - 5.0).abs() < 0.05 {
-                clip.duration = duration;
+            if clip.media_id != id {
+                continue;
+            }
+            let looks_placeholder = (clip.duration - 5.0).abs() < 0.05
+                || (old > 0.05 && (clip.duration - old).abs() < 0.05);
+            if !looks_placeholder || clip.source_in > 0.05 {
+                continue;
+            }
+            let next_start = bounds
+                .iter()
+                .filter(|(start, _)| *start > clip.start + 1e-3)
+                .map(|(start, _)| *start)
+                .fold(None, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
+            let room = next_start
+                .map(|s| (s - clip.start).max(0.05))
+                .unwrap_or(duration);
+            let next = duration.min(room);
+            if (clip.duration - next).abs() > 0.05 {
+                clip.duration = next;
                 changed = true;
             }
         }
@@ -1085,11 +1109,18 @@ pub fn clip_under(tracks: &[EditorTrack], library: &[MediaItem], time: f64) -> O
         if track.hidden || track.kind != TrackKindUi::Video {
             continue;
         }
+        // If a placeholder duration was later stretched over later clips,
+        // pick the latest-starting clip that still covers this time.
         let Some(clip) = track
             .clips
             .iter()
-            .find(|clip| {
+            .filter(|clip| {
                 !clip.disabled && time + 1e-4 >= clip.start && time < clip.end()
+            })
+            .max_by(|a, b| {
+                a.start
+                    .partial_cmp(&b.start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
         else {
             continue;
@@ -1151,10 +1182,10 @@ fn set_class_off(selector: &str, off: bool) {
     let _ = el.set_attribute("class", &parts.join(" "));
 }
 
-fn seek_video(video: &HtmlVideoElement, time: f64) {
+fn seek_video(video: &HtmlVideoElement, time: f64, force: bool) {
     let ms = js_sys::Date::now();
     let last = LAST_SEEK_MS.with(Cell::get);
-    if ms - last < 80.0 {
+    if !force && ms - last < 80.0 {
         return;
     }
     LAST_SEEK_MS.with(|cell| cell.set(ms));
@@ -1195,34 +1226,43 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
                 let _ = video.set_attribute("data-media", &shot.media_id);
                 video.set_src(&shot.url);
                 LAST_PLAY_MS.with(|cell| cell.set(0.0));
+                LAST_SEEK_MS.with(|cell| cell.set(0.0));
             }
-            let src_time = (shot.source_in + (now - shot.start)).max(0.0);
+            let take = shot.duration.max(0.05);
+            let src_time = (shot.source_in + (now - shot.start))
+                .clamp(shot.source_in, shot.source_in + take);
+            let src_end = shot.source_in + take;
             let ready = video.ready_state() >= 2;
             let paused = video.paused();
             let drift = (video.current_time() - src_time).abs();
             let since_play = js_sys::Date::now() - LAST_PLAY_MS.with(Cell::get);
+            let take_over = video.current_time() >= src_end - 0.02;
 
             if !playing {
                 video.pause();
                 if ready && drift > 0.04 {
-                    seek_video(&video, src_time);
+                    seek_video(&video, src_time, false);
                 }
+            } else if take_over && ready {
+                video.pause();
+                set_playhead(shot.start + take);
+                LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
             } else if paused {
-                if ready && (media_changed || drift > 0.08) && since_play > 120.0 {
-                    seek_video(&video, src_time);
+                if ready && (media_changed || drift > 0.08) {
+                    seek_video(&video, src_time, media_changed);
                 }
                 if ready && since_play > 180.0 {
                     LAST_PLAY_MS.with(|cell| cell.set(js_sys::Date::now()));
                     let _ = video.play();
                 }
             } else if ready && drift > 0.45 && since_play > 250.0 {
-                seek_video(&video, src_time);
+                seek_video(&video, src_time, false);
             }
 
-            if playing && !paused && ready {
+            if playing && !paused && ready && !take_over {
                 let derived = shot.start + (video.current_time() - shot.source_in);
                 if derived.is_finite() {
-                    set_playhead(derived.max(0.0));
+                    set_playhead(derived.clamp(shot.start, shot.start + take - 1e-3));
                     LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                 }
             }
@@ -1305,6 +1345,73 @@ pub fn format_tc(secs: f64) -> String {
     let s = (total % 60.0) as u32;
     let f = (total.fract() * 30.0) as u32;
     format!("{h:02}:{m:02}:{s:02}:{f:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(id: &str, media: &str, start: f64, duration: f64) -> TimelineClip {
+        TimelineClip {
+            id: id.into(),
+            media_id: media.into(),
+            start,
+            duration,
+            source_in: 0.0,
+            speed: 1.0,
+            group_id: String::new(),
+            link_id: String::new(),
+            disabled: false,
+        }
+    }
+
+    fn video_track(clips: Vec<TimelineClip>) -> EditorTrack {
+        EditorTrack {
+            id: "v1".into(),
+            name: "V1".into(),
+            kind: TrackKindUi::Video,
+            muted: false,
+            hidden: false,
+            clips,
+        }
+    }
+
+    fn item(id: &str, url: &str, duration: f64) -> MediaItem {
+        MediaItem {
+            id: id.into(),
+            name: format!("{id}.mp4"),
+            kind: MediaKind::Video,
+            url: url.into(),
+            content_type: "video/mp4".into(),
+            duration,
+        }
+    }
+
+    #[test]
+    fn metadata_does_not_stretch_clip_over_next() {
+        let mut library = vec![item("a", "blob:a", 5.0)];
+        let mut tracks = vec![video_track(vec![
+            clip("c1", "a", 0.0, 5.0),
+            clip("c2", "b", 5.0, 5.0),
+        ])];
+        set_media_duration(&mut library, &mut tracks, "blob:a", 40.0);
+        assert!((library[0].duration - 40.0).abs() < 1e-6);
+        assert!(
+            (tracks[0].clips[0].duration - 5.0).abs() < 1e-6,
+            "must not cover the next clip"
+        );
+    }
+
+    #[test]
+    fn clip_under_prefers_later_start_when_overlapping() {
+        let library = vec![item("a", "blob:a", 40.0), item("b", "blob:b", 8.0)];
+        let tracks = vec![video_track(vec![
+            clip("c1", "a", 0.0, 40.0),
+            clip("c2", "b", 5.0, 5.0),
+        ])];
+        let shot = clip_under(&tracks, &library, 6.0).unwrap();
+        assert_eq!(shot.media_id, "b");
+    }
 }
 
 pub fn format_clock(secs: f64) -> String {

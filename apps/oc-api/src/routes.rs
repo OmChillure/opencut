@@ -1,3 +1,4 @@
+use crate::edit::{self, hydrate_op, look_by_media, speech_by_media};
 use crate::state::AppState;
 use axum::Json;
 use axum::body::Body;
@@ -6,8 +7,7 @@ use axum::http::{StatusCode, header};
 use axum::response::Response;
 use futures_util::StreamExt;
 use oc_core::{
-    inspect_from_mcp, AssembleItem, AssembleStyle, Inspect, MediaId, Op, Project, ProjectId, Time,
-    Timeline, TrackKind, UndoStack, apply, is_director_request, mcp_tools, op_from_mcp,
+    MediaId, Op, Project, ProjectId, Timeline, UndoStack, apply, is_director_request, mcp_tools,
 };
 use oc_core::time::TICKS_PER_SECOND;
 use oc_providers::{ChatEvent, ChatTurn, LlmReply};
@@ -201,9 +201,21 @@ pub async fn chat(
     Path(id): Path<Uuid>,
     Json(body): Json<ChatBody>,
 ) -> Result<Response, ApiError> {
+    tracing::info!(
+        project = %id,
+        provider = %body.provider,
+        model = %body.model,
+        messages = body.messages.len(),
+        "chat request"
+    );
     let (tx, rx) = mpsc::channel::<String>(64);
+    let _ = tx.try_send(line(&serde_json::json!({
+        "type": "status",
+        "text": format!("Starting {} · {}", body.provider, body.model),
+    })));
     tokio::spawn(async move {
         if let Err(err) = run_chat(state, id, body, tx.clone()).await {
+            tracing::error!(project = %id, "chat failed: {err}");
             let _ = tx
                 .send(line(&serde_json::json!({
                     "type": "error",
@@ -266,6 +278,15 @@ async fn run_chat(
         .find(|m| m.role == "user")
         .map(|m| m.content.as_str())
         .unwrap_or("");
+    tracing::info!(
+        project = %id,
+        media = media.len(),
+        transcripts = transcripts.len(),
+        looks = looks.len(),
+        director = is_director_request(last_user),
+        user = %last_user.chars().take(120).collect::<String>(),
+        "chat context"
+    );
     if is_director_request(last_user) && !media.is_empty() {
         let understood = media.iter().any(|m| {
             speech.contains_key(&m.id) || looks.contains_key(&m.id)
@@ -303,43 +324,62 @@ async fn run_chat(
                 .await;
             }
             if !understood {
-                oc_db::save_timeline(&state.db, id, &project.timeline)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                finish_chat(
+                tracing::info!(
+                    project = %id,
+                    "scan queued — not blocking chat on whisper"
+                );
+                push(
                     &tx,
-                    "Watching and listening to your clips locally (ffmpeg + Whisper). Ask again in a few seconds — silent clips are fine.",
-                    &[],
-                    &project.timeline,
+                    serde_json::json!({
+                        "type": "status",
+                        "text": "Hearing clips in the background (ffmpeg look first, Whisper after). Keep talking — don't wait."
+                    }),
                 )
                 .await;
-                return Ok(());
             }
         }
-        let mut undo = UndoStack::new();
-        let op = hydrate_op(
-            Op::Assemble {
-                items: Vec::new(),
-                style: AssembleStyle::Vlog,
-            },
-            &media,
-            &speech,
-            &looks,
-        );
-        match apply(&mut project.timeline, &mut undo, op) {
-            Ok(applied) => {
+        emit_host_tool(
+            &tx,
+            "host-assemble",
+            "assemble",
+            serde_json::json!({"style":"vlog"}),
+            None,
+            "pending",
+        )
+        .await;
+        tracing::info!(project = %id, "host assemble");
+        match edit::call_tool(
+            &state.db,
+            id,
+            "assemble",
+            serde_json::json!({"style":"vlog"}),
+        )
+        .await
+        {
+            Ok(note) => {
+                tracing::info!(project = %id, note = %note, "host assemble ok");
                 emit_host_tool(
                     &tx,
                     "host-assemble",
                     "assemble",
                     serde_json::json!({"style":"vlog"}),
-                    Some(applied.note.clone()),
+                    Some(note.clone()),
                     "done",
                 )
                 .await;
-                notes.push(applied.note);
+                notes.push(note);
             }
             Err(err) => {
+                tracing::error!(project = %id, "host assemble failed: {err}");
+                emit_host_tool(
+                    &tx,
+                    "host-assemble",
+                    "assemble",
+                    serde_json::json!({"style":"vlog"}),
+                    Some(err.clone()),
+                    "error",
+                )
+                .await;
                 finish_chat(
                     &tx,
                     &format!("Couldn't cut the short: {err}"),
@@ -349,6 +389,9 @@ async fn run_chat(
                 .await;
                 return Ok(());
             }
+        }
+        if let Ok(fresh) = oc_db::get_project(&state.db, id).await {
+            project = fresh;
         }
     }
     let tools = mcp_tools();
@@ -363,8 +406,8 @@ async fn run_chat(
     } else {
         format!(
             "Follow the director brief. Project '{}'. \
-             Tools are loaded. Call list_bin and list_timeline when you need the workspace — \
-             do not assume the bin is empty. Call get_media only for one id.",
+             OpenCut MCP tools are attached. Call list_bin and list_timeline when you need \
+             the workspace — do not assume the bin is empty. Call get_media only for one id.",
             project.name
         )
     };
@@ -372,6 +415,18 @@ async fn run_chat(
     let mut text = String::new();
     let (ev_tx, ev_rx) = mpsc::channel::<ChatEvent>(64);
     let pump = tokio::spawn(forward_events(ev_rx, tx.clone()));
+    let mcp_servers = crate::mcp::builtin_mcp_acp(&id.to_string())
+        .into_iter()
+        .collect::<Vec<_>>();
+    tracing::info!(
+        project = %id,
+        mcp = mcp_servers.len(),
+        tools = tools.len(),
+        "starting provider"
+    );
+    if mcp_servers.is_empty() {
+        tracing::warn!(project = %id, "no opencut MCP server — TOOL-line fallback only");
+    }
     for turn_i in 0..8 {
         let reply = match oc_providers::complete_stream(
             &body.provider,
@@ -380,17 +435,20 @@ async fn run_chat(
             &turns,
             &tools,
             Some(ev_tx.clone()),
+            &mcp_servers,
         )
         .await
         {
             Ok(reply) => reply,
             Err(err) if directed => {
+                tracing::error!(project = %id, "provider failed after assemble: {err}");
                 text = format!(
                     "Cut a short from your clips and laid it on the timeline. Play it. ({err})"
                 );
                 break;
             }
             Err(err) => {
+                tracing::error!(project = %id, "provider failed: {err}");
                 drop(ev_tx);
                 let _ = pump.await;
                 return Err(err.to_string());
@@ -403,7 +461,6 @@ async fn run_chat(
             }
             LlmReply::Tools(calls) => {
                 let mut batch = String::new();
-                let mut undo = UndoStack::new();
                 for (i, call) in calls.into_iter().enumerate() {
                     let tool_id = format!("host-{turn_i}-{i}-{}", call.name);
                     emit_host_tool(
@@ -416,45 +473,30 @@ async fn run_chat(
                     )
                     .await;
                     tracing::info!(tool = %call.name, "host tool");
-                    let (ok, result) = if let Some(inspect) = inspect_from_mcp(&call) {
-                        let out = run_inspect(
-                            inspect,
-                            &project.timeline,
-                            &media,
-                            &speech,
-                            &looks,
-                        );
-                        batch.push_str(&out);
-                        batch.push('\n');
-                        (true, out)
-                    } else {
-                        match op_from_mcp(&call) {
-                            Ok(op) => {
-                                match apply(
-                                    &mut project.timeline,
-                                    &mut undo,
-                                    hydrate_op(op, &media, &speech, &looks),
-                                ) {
-                                    Ok(applied) => {
-                                        notes.push(applied.note.clone());
-                                        batch.push_str(&applied.note);
-                                        batch.push('\n');
-                                        (true, applied.note)
-                                    }
-                                    Err(err) => {
-                                        let msg = format!("tool error: {err}");
-                                        batch.push_str(&msg);
-                                        batch.push('\n');
-                                        (false, msg)
-                                    }
-                                }
+                    let (ok, result) = match edit::call_tool(
+                        &state.db,
+                        id,
+                        &call.name,
+                        call.arguments.clone(),
+                    )
+                    .await
+                    {
+                        Ok(out) => {
+                            if !out.starts_with("bin:")
+                                && !out.starts_with("Current timeline")
+                                && !out.starts_with("media ")
+                            {
+                                notes.push(out.clone());
                             }
-                            Err(err) => {
-                                let msg = format!("bad tool {}: {err}", call.name);
-                                batch.push_str(&msg);
-                                batch.push('\n');
-                                (false, msg)
-                            }
+                            batch.push_str(&out);
+                            batch.push('\n');
+                            (true, out)
+                        }
+                        Err(err) => {
+                            let msg = format!("tool error: {err}");
+                            batch.push_str(&msg);
+                            batch.push('\n');
+                            (false, msg)
                         }
                     };
                     emit_host_tool(
@@ -480,12 +522,19 @@ async fn run_chat(
     }
     drop(ev_tx);
     let _ = pump.await;
-    oc_db::save_timeline(&state.db, id, &project.timeline)
-        .await
-        .map_err(|e| e.to_string())?;
+    // MCP + call_tool already persist. Reload so we don't clobber those edits.
+    if let Ok(fresh) = oc_db::get_project(&state.db, id).await {
+        project = fresh;
+    }
     if text.is_empty() && !notes.is_empty() {
         text = notes.join(" · ");
     }
+    tracing::info!(
+        project = %id,
+        notes = notes.len(),
+        chars = text.len(),
+        "chat done"
+    );
     finish_chat(&tx, &text, &notes, &project.timeline).await;
     Ok(())
 }
@@ -530,308 +579,6 @@ async fn finish_chat(
     .await;
 }
 
-struct Speech {
-    words: u32,
-    speech_seconds: f64,
-    hook_in: Time,
-    text: String,
-}
-
-fn speech_by_media(rows: &[oc_db::TranscriptCueRow]) -> std::collections::HashMap<Uuid, Speech> {
-    use std::collections::HashMap;
-    let mut map: HashMap<Uuid, Speech> = HashMap::new();
-    for row in rows {
-        let entry = map.entry(row.media_id).or_insert_with(|| Speech {
-            words: 0,
-            speech_seconds: 0.0,
-            hook_in: Time::ZERO,
-            text: row.full_text.clone(),
-        });
-        let words = row
-            .text
-            .split_whitespace()
-            .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
-            .count() as u32;
-        let secs = (row.end_ticks - row.start_ticks).max(0) as f64 / TICKS_PER_SECOND as f64;
-        if entry.hook_in.as_ticks() == 0 && words >= 4 {
-            entry.hook_in = Time::from_ticks(row.start_ticks);
-        }
-        entry.words += words;
-        entry.speech_seconds += secs;
-    }
-    map
-}
-
-fn run_inspect(
-    inspect: Inspect,
-    timeline: &Timeline,
-    media: &[oc_db::MediaRow],
-    speech: &std::collections::HashMap<Uuid, Speech>,
-    looks: &std::collections::HashMap<Uuid, oc_db::AnalysisRow>,
-) -> String {
-    match inspect {
-        Inspect::ListBin => {
-            if media.is_empty() {
-                return "bin: empty (nothing registered for this project yet)".into();
-            }
-            let mut out = format!("bin: {} items\n", media.len());
-            for row in media {
-                let (kind, dur) = spec_from_row(row);
-                let words = speech.get(&row.id).map(|s| s.words).unwrap_or(0);
-                let look = looks
-                    .get(&row.id)
-                    .map(|l| l.look.as_str())
-                    .unwrap_or("-");
-                out.push_str(&format!(
-                    "{id}  {kind:?}  {dur:.1}s  words={words}  look={look}  {name}\n",
-                    id = row.id,
-                    dur = dur.as_seconds(),
-                    name = row.filename
-                ));
-            }
-            out
-        }
-        Inspect::ListTimeline => timeline_brief(timeline),
-        Inspect::GetMedia { media_id } => {
-            let id = media_id.as_uuid();
-            let Some(row) = media.iter().find(|m| m.id == id) else {
-                return format!("media {id} not in bin");
-            };
-            let (kind, dur) = spec_from_row(row);
-            let mut out = format!(
-                "{id}  {kind:?}  {dur:.1}s  {}\n",
-                row.filename,
-                dur = dur.as_seconds()
-            );
-            if let Some(s) = speech.get(&id) {
-                let excerpt: String = s.text.chars().take(240).collect();
-                out.push_str(&format!(
-                    "speech words={} hook@{:.1}s \"{}\"\n",
-                    s.words,
-                    s.hook_in.as_seconds(),
-                    excerpt.replace('\n', " ")
-                ));
-            } else {
-                out.push_str("speech: none yet\n");
-            }
-            if let Some(l) = looks.get(&id) {
-                out.push_str(&format!(
-                    "look {} motion={:.2} scenes={}\n",
-                    l.look, l.motion, l.scenes
-                ));
-            }
-            out
-        }
-    }
-}
-
-fn look_by_media(
-    rows: &[oc_db::AnalysisRow],
-) -> std::collections::HashMap<Uuid, oc_db::AnalysisRow> {
-    rows.iter().cloned().map(|r| (r.media_id, r)).collect()
-}
-
-fn media_brief(
-    rows: &[oc_db::MediaRow],
-    speech: &std::collections::HashMap<Uuid, Speech>,
-    looks: &std::collections::HashMap<Uuid, oc_db::AnalysisRow>,
-) -> String {
-    if rows.is_empty() {
-        return "Media bin: (empty — ask the user to import clips first)\n".into();
-    }
-    let mut out = String::from(
-        "Media bin (from SPEECH + local LOOK, not filenames):\n",
-    );
-    for row in rows {
-        let (kind, dur) = spec_from_row(row);
-        let look = looks.get(&row.id);
-        let look_s = look
-            .map(|l| {
-                format!(
-                    "LOOK {} motion={:.2} scenes={}",
-                    l.look, l.motion, l.scenes
-                )
-            })
-            .unwrap_or_else(|| "LOOK pending".into());
-        match speech.get(&row.id) {
-            Some(s) if s.words > 0 => {
-                let excerpt: String = s.text.chars().take(140).collect();
-                out.push_str(&format!(
-                    "- id={}  {:?}  {:.1}s  SPEECH words={} hook@{:.1}s  {}  \"{}\"\n",
-                    row.id,
-                    kind,
-                    dur.as_seconds(),
-                    s.words,
-                    s.hook_in.as_seconds(),
-                    look_s,
-                    excerpt.replace('\n', " ")
-                ));
-            }
-            _ => {
-                out.push_str(&format!(
-                    "- id={}  {:?}  {:.1}s  no speech  {}\n",
-                    row.id,
-                    kind,
-                    dur.as_seconds(),
-                    look_s
-                ));
-            }
-        }
-    }
-    out
-}
-
-fn spec_from_row(row: &oc_db::MediaRow) -> (TrackKind, oc_core::Duration) {
-    let kind = kind_from_media(&row.content_type, &row.filename);
-    let seconds = row
-        .duration_ticks
-        .filter(|t| *t > 0)
-        .map(|t| t as f64 / TICKS_PER_SECOND as f64)
-        .unwrap_or(match kind {
-            TrackKind::Audio => 8.0,
-            TrackKind::Caption => 3.0,
-            TrackKind::Video => {
-                if row.content_type.starts_with("image/") {
-                    3.0
-                } else {
-                    5.0
-                }
-            }
-        });
-    (kind, oc_core::Duration::from_seconds(seconds))
-}
-
-fn kind_from_media(content_type: &str, filename: &str) -> TrackKind {
-    if content_type.starts_with("audio/") {
-        return TrackKind::Audio;
-    }
-    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "mp3" | "wav" | "aac" | "m4a" | "ogg" | "flac" => TrackKind::Audio,
-        _ => TrackKind::Video,
-    }
-}
-
-fn hydrate_op(
-    op: Op,
-    media: &[oc_db::MediaRow],
-    speech: &std::collections::HashMap<Uuid, Speech>,
-    looks: &std::collections::HashMap<Uuid, oc_db::AnalysisRow>,
-) -> Op {
-    match op {
-        Op::PlaceMedia {
-            media_id,
-            track_id,
-            start,
-            duration,
-            kind,
-            mode,
-        } => {
-            if let Some(row) = media.iter().find(|r| r.id == media_id.as_uuid()) {
-                let (row_kind, row_dur) = spec_from_row(row);
-                Op::PlaceMedia {
-                    media_id,
-                    track_id,
-                    start,
-                    duration: if duration.as_ticks() > 0 {
-                        duration
-                    } else {
-                        row_dur
-                    },
-                    kind: if kind == TrackKind::Caption {
-                        kind
-                    } else {
-                        row_kind
-                    },
-                    mode,
-                }
-            } else {
-                Op::PlaceMedia {
-                    media_id,
-                    track_id,
-                    start,
-                    duration,
-                    kind,
-                    mode,
-                }
-            }
-        }
-        Op::Assemble { items, style } => {
-            let items = if items.is_empty() {
-                media
-                    .iter()
-                    .rev()
-                    .map(|row| item_from_row(row, speech.get(&row.id), looks.get(&row.id)))
-                    .collect()
-            } else {
-                items
-                    .into_iter()
-                    .map(|item| {
-                        if let Some(row) = media.iter().find(|r| r.id == item.media_id.as_uuid()) {
-                            item_from_row(row, speech.get(&row.id), looks.get(&row.id))
-                        } else {
-                            item
-                        }
-                    })
-                    .collect()
-            };
-            Op::Assemble { items, style }
-        }
-        other => other,
-    }
-}
-
-fn item_from_row(
-    row: &oc_db::MediaRow,
-    speech: Option<&Speech>,
-    look: Option<&oc_db::AnalysisRow>,
-) -> AssembleItem {
-    let (kind, duration) = spec_from_row(row);
-    let still = row.content_type.starts_with("image/");
-    let mut item = AssembleItem {
-        media_id: MediaId::from_uuid(row.id),
-        duration,
-        kind,
-        still,
-        ..AssembleItem::default()
-    };
-    if let Some(s) = speech {
-        item.words = s.words;
-        item.speech_seconds = s.speech_seconds;
-        item.hook_in = s.hook_in;
-        item.text = s.text.clone();
-    }
-    if let Some(l) = look {
-        item.look = l.look.clone();
-        item.motion = l.motion as f32;
-        item.scenes = l.scenes.max(0) as u32;
-    }
-    item
-}
-
-fn timeline_brief(tl: &Timeline) -> String {
-    let mut out = String::from("Current timeline:\n");
-    for track in &tl.tracks {
-        out.push_str(&format!("- track {} ({:?}) {}\n", track.id, track.kind, track.name));
-        for clip in &track.clips {
-            let media = clip
-                .media_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "-".into());
-            out.push_str(&format!(
-                "    clip {} media={} start={:.2}s dur={:.2}s\n",
-                clip.id,
-                media,
-                clip.start.as_seconds(),
-                clip.duration.as_seconds()
-            ));
-        }
-    }
-    if tl.tracks.iter().all(|t| t.clips.is_empty()) {
-        out.push_str("(no clips yet)\n");
-    }
-    out
-}
 
 #[derive(Deserialize)]
 pub struct UploadBody {

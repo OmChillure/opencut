@@ -2,6 +2,7 @@ use crate::acp::{self, AcpClient};
 use crate::catalog::ProviderId;
 use crate::llm::{ChatEvent, ChatTurn, EventSink, LlmError, LlmReply};
 use oc_tools::McpTool;
+use serde_json::Value;
 
 /// Run one turn on the local vendor CLI (same as cbot). No API keys.
 pub async fn complete(
@@ -11,7 +12,7 @@ pub async fn complete(
     turns: &[ChatTurn],
     tools: &[McpTool],
 ) -> Result<LlmReply, LlmError> {
-    complete_stream(provider, model, system, turns, tools, None).await
+    complete_stream(provider, model, system, turns, tools, None, &[]).await
 }
 
 pub async fn complete_stream(
@@ -21,30 +22,74 @@ pub async fn complete_stream(
     turns: &[ChatTurn],
     tools: &[McpTool],
     events: Option<EventSink>,
+    mcp_servers: &[Value],
 ) -> Result<LlmReply, LlmError> {
     let id = ProviderId::parse(provider)
         .ok_or_else(|| LlmError::Message(format!("unknown provider {provider}")))?;
     if !id.connected() {
-        return Err(LlmError::Message(id.login_hint().into()));
+        let hint = id.login_hint();
+        tracing::error!(provider, "provider not logged in: {hint}");
+        return Err(LlmError::Message(hint.into()));
     }
-    let prompt = build_prompt(system, turns, tools);
+    let prompt = build_prompt(system, turns, tools, !mcp_servers.is_empty());
+    tracing::info!(
+        provider,
+        model,
+        turns = turns.len(),
+        tools = tools.len(),
+        mcp = mcp_servers.len(),
+        prompt_chars = prompt.len(),
+        "chat turn"
+    );
     emit(
         events.as_ref(),
         ChatEvent::status(format!("ACP {} · {model}", id.name())),
     )
     .await;
-    let text = run_provider(id, model, &prompt, events.as_ref()).await?;
-    Ok(parse_tool_reply(text))
+    let text = run_provider(id, model, &prompt, mcp_servers, events.as_ref())
+        .await
+        .inspect_err(|e| tracing::error!(provider, model, "provider failed: {e}"))?;
+    let reply = parse_tool_reply(text);
+    match &reply {
+        LlmReply::Text(t) => tracing::info!(chars = t.len(), "provider text"),
+        LlmReply::Tools(calls) => {
+            tracing::info!(n = calls.len(), "provider TOOL lines (MCP fallback)");
+            for c in calls {
+                tracing::info!(tool = %c.name, "fallback tool");
+            }
+        }
+    }
+    Ok(reply)
 }
 
 async fn run_provider(
     id: ProviderId,
     model: &str,
     prompt: &str,
+    mcp_servers: &[Value],
     events: Option<&EventSink>,
 ) -> Result<String, LlmError> {
     let (bin, args) = acp_launch(id, model);
-    match spawn_acp(&bin, &args, model, prompt, events).await {
+    let acp_missing = matches!(id, ProviderId::Claude | ProviderId::Openai)
+        && bin != "npx"
+        && !std::path::Path::new(&bin).is_file()
+        && !which(&bin);
+    if acp_missing {
+        tracing::warn!(bin = %bin, "acp adapter not on PATH — print fallback");
+        return match id {
+            ProviderId::Claude => {
+                emit(events, ChatEvent::status("ACP adapter missing — `claude -p`")).await;
+                claude_print(prompt).await
+            }
+            ProviderId::Openai => {
+                emit(events, ChatEvent::status("ACP adapter missing — `codex exec`")).await;
+                codex_print(prompt).await
+            }
+            ProviderId::Xai => Err(LlmError::Message(format!("ACP adapter missing: {bin}"))),
+        };
+    }
+    tracing::info!(bin = %bin, args = %args.join(" "), "acp launch");
+    match spawn_acp(&bin, &args, model, prompt, mcp_servers, events).await {
         Ok(text) => Ok(text),
         Err(err) => match id {
             ProviderId::Xai => Err(err),
@@ -91,11 +136,11 @@ fn claude_launch(model: &str) -> (String, Vec<String>) {
     if let Ok(bin) = std::env::var("OPENCUT_CLAUDE_ACP") {
         return (bin, acp_model_args(model));
     }
-    if which("claude-agent-acp") {
-        return ("claude-agent-acp".into(), acp_model_args(model));
+    if let Some(bin) = resolve_bin("claude-agent-acp") {
+        return (bin, acp_model_args(model));
     }
-    if which("claude-code-acp") {
-        return ("claude-code-acp".into(), acp_model_args(model));
+    if let Some(bin) = resolve_bin("claude-code-acp") {
+        return (bin, acp_model_args(model));
     }
     if npx_ok() {
         return (
@@ -106,6 +151,7 @@ fn claude_launch(model: &str) -> (String, Vec<String>) {
             ],
         );
     }
+    // No adapter on PATH — run_provider falls through to `claude -p`.
     ("claude-agent-acp".into(), acp_model_args(model))
 }
 
@@ -141,11 +187,24 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 fn which(bin: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(bin)
-        .output()
-        .ok()
-        .is_some_and(|o| o.status.success())
+    resolve_bin(bin).is_some()
+}
+
+fn resolve_bin(bin: &str) -> Option<String> {
+    if let Ok(out) = std::process::Command::new("which").arg(bin).output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() && std::path::Path::new(&p).is_file() {
+                return Some(p);
+            }
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let extras = [
+        format!("{home}/.local/bin/{bin}"),
+        format!("{home}/.nvm/versions/node/v24.10.0/bin/{bin}"),
+    ];
+    extras.into_iter().find(|p| std::path::Path::new(p).is_file())
 }
 
 fn npx_ok() -> bool {
@@ -160,14 +219,17 @@ async fn spawn_acp(
     args: &[String],
     model: &str,
     prompt: &str,
+    mcp_servers: &[Value],
     events: Option<&EventSink>,
 ) -> Result<String, LlmError> {
-    tracing::info!(bin, "acp connect");
+    tracing::info!(bin, mcp = mcp_servers.len(), "acp connect");
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".into());
-    let mut client = AcpClient::connect(bin, args).await?;
-    client.prompt(&cwd, prompt, Some(model), events).await
+    let mut client = AcpClient::connect(bin, args, events.cloned()).await?;
+    client
+        .prompt(&cwd, prompt, Some(model), mcp_servers, events)
+        .await
 }
 
 async fn emit(events: Option<&EventSink>, ev: ChatEvent) {
@@ -176,11 +238,23 @@ async fn emit(events: Option<&EventSink>, ev: ChatEvent) {
     }
 }
 
-fn build_prompt(system: &str, turns: &[ChatTurn], tools: &[McpTool]) -> String {
+fn build_prompt(system: &str, turns: &[ChatTurn], tools: &[McpTool], mcp_attached: bool) -> String {
     let mut out = String::new();
     // Every provider goes through here — Grok, Claude, Codex, and any added later.
     out.push_str(&crate::prompts::with_shared_prompts(system));
-    if !tools.is_empty() {
+    if mcp_attached && !tools.is_empty() {
+        out.push_str(
+            "\n\nThe OpenCut MCP server `opencut` is attached. Call these tools \
+             through MCP (do not invent media ids):\n",
+        );
+        for tool in tools {
+            out.push_str(&format!("- {}: {}\n", tool.name, tool.description));
+        }
+        out.push_str(
+            "Call the tools. Do not print TOOL lines when MCP works. \
+             After edits, reply in 2–4 short sentences.\n",
+        );
+    } else if !tools.is_empty() {
         out.push_str(
             "\n\nYou can edit the timeline by emitting one or more lines of the form:\n\
              TOOL <name> <json-args>\n\

@@ -1,3 +1,5 @@
+mod grok_stt;
+mod groq_stt;
 mod local;
 mod punctuate;
 
@@ -6,6 +8,8 @@ use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use grok_stt::configured as grok_stt_configured;
+pub use groq_stt::configured as groq_stt_configured;
 pub use local::{LocalSttError, transcribe_local};
 pub use punctuate::restore_punctuation;
 

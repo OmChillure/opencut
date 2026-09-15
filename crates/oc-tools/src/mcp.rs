@@ -432,6 +432,32 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
         "duck" => Ok(Op::Duck {
             amount: number(&call.arguments, "amount").unwrap_or(0.6) as f32,
         }),
+        "add_captions" => {
+            let cues = call
+                .arguments
+                .get("cues")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let cues = cues
+                .iter()
+                .filter_map(|c| {
+                    Some(oc_timeline::CaptionCue {
+                        start: Time::from_seconds(c.get("start")?.as_f64()?),
+                        end: Time::from_seconds(c.get("end")?.as_f64()?),
+                        text: c.get("text")?.as_str()?.to_string(),
+                        speaker: c
+                            .get("speaker")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                })
+                .collect();
+            Ok(Op::AddCaptions {
+                style: oc_timeline::CaptionStyle::default(),
+                cues,
+            })
+        }
         "list_bin" | "list_timeline" | "get_media" => {
             Err("inspect tools are handled by the host".into())
         }

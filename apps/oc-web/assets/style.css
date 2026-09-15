@@ -1111,6 +1111,15 @@ button:disabled { opacity: 0.45; cursor: default; }
   font-size: 11px;
   padding: 2px 4px;
 }
+.bubble.thought {
+  align-self: stretch;
+  max-width: 100%;
+  background: transparent;
+  color: var(--faint);
+  font-size: 11px;
+  font-style: italic;
+  padding: 2px 4px;
+}
 .bubble.tool {
   align-self: stretch;
   max-width: 100%;
