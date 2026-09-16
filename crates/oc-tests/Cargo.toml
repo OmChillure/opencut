@@ -1,0 +1,18 @@
+[package]
+name = "oc-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Integration tests for the OpenCut editor: look, mix, graphics, ops"
+publish = false
+
+[dependencies]
+oc-compositor.workspace = true
+oc-core.workspace = true
+oc-time.workspace = true
+oc-timeline.workspace = true
+oc-tools.workspace = true
+oc-render.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
