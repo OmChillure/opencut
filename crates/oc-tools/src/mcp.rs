@@ -1,6 +1,7 @@
 //! MCP tool list so any LLM provider can call the same edits as the UI.
 
 use crate::ops::{AssembleItem, AssembleStyle, ExportPreset, Op, TimeRange, TimelineEditMode};
+use oc_timeline::{Fx, Grade, Graphic, GraphicKind, TransitionKind};
 use crate::registry::tools;
 use crate::ToolGroup;
 use oc_time::{Duration, Time};
@@ -29,6 +30,7 @@ pub enum Inspect {
     ListBin,
     ListTimeline,
     GetMedia { media_id: MediaId },
+    ListCues { media_id: MediaId },
 }
 
 #[must_use]
@@ -39,6 +41,9 @@ pub fn inspect_from_mcp(call: &McpCall) -> Option<Inspect> {
         "get_media" => media_id(&call.arguments, "media_id")
             .ok()
             .map(|media_id| Inspect::GetMedia { media_id }),
+        "list_cues" => media_id(&call.arguments, "media_id")
+            .ok()
+            .map(|media_id| Inspect::ListCues { media_id }),
         _ => None,
     }
 }
@@ -72,9 +77,73 @@ pub fn mcp_tools() -> Vec<McpTool> {
         McpTool {
             name: "get_media".into(),
             description:
-                "Details for one media id: duration, speech excerpt, look. Use after list_bin."
+                "Details for one media id: duration, timestamped speech cues, look. \
+                 Call this (or list_cues) before cutting a long file."
                     .into(),
             input_schema: object(&[("media_id", str_prop("Media id from list_bin"), true)]),
+        },
+        McpTool {
+            name: "list_cues".into(),
+            description:
+                "Timestamped speech cues for one media id (source seconds + text). \
+                 Use this to pick excerpts from a long take."
+                    .into(),
+            input_schema: object(&[("media_id", str_prop("Media id from list_bin"), true)]),
+        },
+        McpTool {
+            name: "clear_timeline".into(),
+            description: "Remove every clip from the timeline. Use before a new cut.".into(),
+            input_schema: object(&[]),
+        },
+        McpTool {
+            name: "set_transition".into(),
+            description: "Same-track mix at this clip's outgoing cut. \
+                 kind: cut, dissolve, fade_black, fade_white, slide_left/right/up/down, \
+                 wipe_left/right/up/down, circle_open, radial, pixelize, …"
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Outgoing clip id"), true),
+                ("kind", str_prop("xfade / editor name, e.g. dissolve, wipe_left"), true),
+            ]),
+        },
+        McpTool {
+            name: "set_grade".into(),
+            description: "Color grade on a clip (exposure, contrast, saturation, temperature)."
+                .into(),
+            input_schema: object(&[("clip_id", str_prop("Clip id"), true)]),
+        },
+        McpTool {
+            name: "set_fx".into(),
+            description: "Blur, grain, vignette on a clip.".into(),
+            input_schema: object(&[("clip_id", str_prop("Clip id"), true)]),
+        },
+        McpTool {
+            name: "set_fade".into(),
+            description: "Fade in/out on a clip (seconds).".into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("fade_in", num_prop("Fade in seconds"), false),
+                ("fade_out", num_prop("Fade out seconds"), false),
+            ]),
+        },
+        McpTool {
+            name: "set_volume".into(),
+            description: "Set audio clip volume (1.0 = unity).".into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("volume", num_prop("Volume 0-2"), true),
+            ]),
+        },
+        McpTool {
+            name: "add_title".into(),
+            description: "Put a title, lower third, card, shape, or sticker on the picture."
+                .into(),
+            input_schema: object(&[
+                ("kind", str_prop("title, lower_third, card, shape, sticker"), false),
+                ("text", str_prop("On-screen text"), false),
+                ("start", num_prop("Timeline start in seconds"), false),
+                ("duration", num_prop("Duration in seconds"), false),
+            ]),
         },
         McpTool {
             name: "move".into(),
@@ -257,11 +326,23 @@ pub fn mcp_tools() -> Vec<McpTool> {
         McpTool {
             name: "place_clip".into(),
             description:
-                "Put one imported media file on the timeline. Use a media_id from the bin."
+                "Put a take on the timeline. media_id from the bin. \
+                 source_in + duration select a slice of that file (required for a long source). \
+                 start is where it lands on the timeline."
                     .into(),
             input_schema: object(&[
                 ("media_id", str_prop("Media id from the bin"), true),
-                ("start", num_prop("Start time in seconds (default 0)"), false),
+                ("start", num_prop("Timeline start in seconds (default 0)"), false),
+                (
+                    "source_in",
+                    num_prop("In-point in the source file, seconds (default 0)"),
+                    false,
+                ),
+                (
+                    "duration",
+                    num_prop("Take length in seconds (default: rest of the file)"),
+                    false,
+                ),
                 ("track_id", str_prop("Track id, or omit for first matching track"), false),
                 (
                     "mode",
@@ -272,10 +353,9 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "assemble".into(),
-            description: "Build a sequence from imported clips. \
-                 style=vlog lays talking/video end-to-end and beds audio underneath. \
-                 style=sequential is the same order, no ducking. \
-                 Omit media_ids to use the whole bin."
+            description: "Shortcut: lay several *bin items* into one short. \
+                 Not for picking highlights inside one long file — use place_clip excerpts. \
+                 Omit media_ids to use the whole bin. target_seconds defaults to ~45."
                 .into(),
             input_schema: object(&[
                 (
@@ -289,6 +369,11 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 (
                     "style",
                     str_prop("vlog (default) or sequential"),
+                    false,
+                ),
+                (
+                    "target_seconds",
+                    num_prop("Aim length in seconds (default 45)"),
                     false,
                 ),
             ]),
@@ -458,10 +543,10 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 cues,
             })
         }
-        "list_bin" | "list_timeline" | "get_media" => {
+        "list_bin" | "list_timeline" | "get_media" | "list_cues" => {
             Err("inspect tools are handled by the host".into())
         }
-        "place" | "place_clip" => Ok(Op::PlaceMedia {
+        "place" | "place_clip" | "place_excerpt" => Ok(Op::PlaceMedia {
             media_id: media_id(&call.arguments, "media_id")?,
             track_id: optional_track(&call.arguments, "track_id"),
             start: seconds(&call.arguments, "start").unwrap_or(Time::ZERO),
@@ -471,6 +556,7 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 .and_then(Value::as_f64)
                 .map(Duration::from_seconds)
                 .unwrap_or(Duration::ZERO),
+            source_in: seconds(&call.arguments, "source_in").unwrap_or(Time::ZERO),
             kind: match call
                 .arguments
                 .get("kind")
@@ -492,6 +578,81 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 _ => TimelineEditMode::Insert,
             },
         }),
+        "clear_timeline" | "clear" => Ok(Op::ClearTimeline),
+        "set_transition" => {
+            let raw = call
+                .arguments
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("dissolve");
+            Ok(Op::SetTransition {
+                clip_id: clip_id(&call.arguments, "clip_id")?,
+                kind: TransitionKind::from_key(raw),
+            })
+        }
+        "set_grade" => Ok(Op::SetGrade {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            grade: Grade {
+                exposure: number(&call.arguments, "exposure").unwrap_or(0.08) as f32,
+                contrast: number(&call.arguments, "contrast").unwrap_or(0.14) as f32,
+                saturation: number(&call.arguments, "saturation").unwrap_or(0.12) as f32,
+                temperature: number(&call.arguments, "temperature").unwrap_or(0.06) as f32,
+            },
+        }),
+        "set_fx" => Ok(Op::SetFx {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            fx: Fx {
+                blur: number(&call.arguments, "blur").unwrap_or(0.0) as f32,
+                grain: number(&call.arguments, "grain").unwrap_or(0.18) as f32,
+                vignette: number(&call.arguments, "vignette").unwrap_or(0.35) as f32,
+            },
+        }),
+        "set_fade" => Ok(Op::SetFade {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            fade_in: Duration::from_seconds(number(&call.arguments, "fade_in").unwrap_or(0.8)),
+            fade_out: Duration::from_seconds(number(&call.arguments, "fade_out").unwrap_or(0.8)),
+        }),
+        "set_volume" => Ok(Op::SetVolume {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            volume: number(&call.arguments, "volume").unwrap_or(1.0) as f32,
+        }),
+        "add_title" | "add_graphic" => {
+            let kind = match call
+                .arguments
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("title")
+            {
+                "lower_third" | "lower" => GraphicKind::LowerThird,
+                "card" => GraphicKind::Card,
+                "shape" => GraphicKind::Shape,
+                "sticker" => GraphicKind::Sticker,
+                _ => GraphicKind::Title,
+            };
+            let text = call
+                .arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or(match kind {
+                    GraphicKind::Title => "Title",
+                    GraphicKind::LowerThird => "Name",
+                    GraphicKind::Card => "Card",
+                    GraphicKind::Sticker => "★",
+                    GraphicKind::Shape => "",
+                })
+                .to_string();
+            Ok(Op::AddGraphic {
+                graphic: Graphic { kind, text },
+                start: seconds(&call.arguments, "start").unwrap_or(Time::ZERO),
+                duration: call
+                    .arguments
+                    .get("duration")
+                    .and_then(Value::as_f64)
+                    .map(Duration::from_seconds)
+                    .unwrap_or(Duration::from_seconds(4.0)),
+                track_id: optional_track(&call.arguments, "track_id"),
+            })
+        }
         "assemble" => {
             let ids = call
                 .arguments
@@ -517,7 +678,12 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 "sequential" => AssembleStyle::Sequential,
                 _ => AssembleStyle::Vlog,
             };
-            Ok(Op::Assemble { items, style })
+            let target_seconds = call.arguments.get("target_seconds").and_then(Value::as_f64);
+            Ok(Op::Assemble {
+                items,
+                style,
+                target_seconds,
+            })
         }
         other => Err(format!("unknown tool {other}")),
     }
@@ -683,6 +849,46 @@ fn media_id(args: &Value, key: &str) -> Result<MediaId, String> {
     Uuid::parse_str(raw)
         .map(MediaId::from_uuid)
         .map_err(|_| format!("bad {key}"))
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn place_clip_reads_source_in() {
+        let call = McpCall {
+            name: "place_clip".into(),
+            arguments: json!({
+                "media_id": "11111111-1111-1111-1111-111111111111",
+                "start": 0,
+                "source_in": 81.5,
+                "duration": 3.2
+            }),
+        };
+        match op_from_mcp(&call).unwrap() {
+            Op::PlaceMedia {
+                source_in,
+                duration,
+                start,
+                ..
+            } => {
+                assert!((source_in.as_seconds() - 81.5).abs() < 1e-6);
+                assert!((duration.as_seconds() - 3.2).abs() < 1e-6);
+                assert_eq!(start, Time::ZERO);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_cues_is_inspect() {
+        let call = McpCall {
+            name: "list_cues".into(),
+            arguments: json!({ "media_id": "11111111-1111-1111-1111-111111111111" }),
+        };
+        assert!(matches!(inspect_from_mcp(&call), Some(Inspect::ListCues { .. })));
+    }
 }
 
 fn clip_ids(args: &Value, key: &str) -> Result<Vec<ClipId>, String> {

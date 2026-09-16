@@ -10,6 +10,8 @@ members = [
     "crates/oc-core",
     "crates/oc-tools",
     "crates/oc-db",
+    "crates/oc-render",
+    "crates/oc-tests",
     "apps/oc-api",
     "apps/oc-worker",
     "apps/oc-web",
@@ -24,6 +26,8 @@ default-members = [
     "crates/oc-core",
     "crates/oc-tools",
     "crates/oc-db",
+    "crates/oc-render",
+    "crates/oc-tests",
     "apps/oc-api",
     "apps/oc-worker",
 ]
@@ -45,6 +49,7 @@ oc-voice = { path = "crates/oc-voice" }
 oc-db = { path = "crates/oc-db" }
 oc-core = { path = "crates/oc-core" }
 oc-tools = { path = "crates/oc-tools" }
+oc-render = { path = "crates/oc-render" }
 
 anyhow = "1.0"
 async-trait = "0.1"

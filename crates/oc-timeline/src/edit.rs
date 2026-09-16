@@ -1,5 +1,5 @@
 use crate::ids::{ClipId, GroupId, LinkId, MarkerId, TrackId};
-use crate::model::{Clip, ClipKind, Marker, Timeline, TrackKind};
+use crate::model::{Clip, ClipKind, ClipLook, Marker, Timeline, TrackKind};
 use crate::{Result, TimelineError};
 use oc_time::{Duration, Time};
 
@@ -440,6 +440,7 @@ impl Timeline {
             group_id: clone.group_id,
             link_id: Some(link),
             disabled: false,
+            look: ClipLook::default(),
         };
         self.add_clip(audio_id, audio)
     }
@@ -565,6 +566,7 @@ mod tests {
             group_id: None,
             link_id: None,
             disabled: false,
+            look: ClipLook::default(),
         }
     }
 

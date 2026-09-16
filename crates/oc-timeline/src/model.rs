@@ -30,6 +30,498 @@ impl Default for Transform {
     }
 }
 
+/// Same-track mix at a clip's outgoing cut. Kdenlive Mix / Shotcut overlap / ffmpeg xfade.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionKind {
+    #[default]
+    Cut,
+    Dissolve,
+    FadeBlack,
+    FadeWhite,
+    /// Kept as the default slide (right). Prefer `SlideRight`.
+    Slide,
+    SlideLeft,
+    SlideRight,
+    SlideUp,
+    SlideDown,
+    /// Kept as the default wipe (left). Prefer `WipeLeft`.
+    Wipe,
+    WipeLeft,
+    WipeRight,
+    WipeUp,
+    WipeDown,
+    WipeTl,
+    WipeTr,
+    WipeBl,
+    WipeBr,
+    SmoothLeft,
+    SmoothRight,
+    SmoothUp,
+    SmoothDown,
+    CoverLeft,
+    CoverRight,
+    CoverUp,
+    CoverDown,
+    RevealLeft,
+    RevealRight,
+    RevealUp,
+    RevealDown,
+    CircleOpen,
+    CircleClose,
+    Radial,
+    Pixelize,
+    HorzOpen,
+    VertOpen,
+}
+
+impl TransitionKind {
+    pub const ALL: &'static [Self] = &[
+        Self::Cut,
+        Self::Dissolve,
+        Self::FadeBlack,
+        Self::FadeWhite,
+        Self::SlideLeft,
+        Self::SlideRight,
+        Self::SlideUp,
+        Self::SlideDown,
+        Self::WipeLeft,
+        Self::WipeRight,
+        Self::WipeUp,
+        Self::WipeDown,
+        Self::WipeTl,
+        Self::WipeTr,
+        Self::WipeBl,
+        Self::WipeBr,
+        Self::SmoothLeft,
+        Self::SmoothRight,
+        Self::SmoothUp,
+        Self::SmoothDown,
+        Self::CoverLeft,
+        Self::CoverRight,
+        Self::CoverUp,
+        Self::CoverDown,
+        Self::RevealLeft,
+        Self::RevealRight,
+        Self::RevealUp,
+        Self::RevealDown,
+        Self::CircleOpen,
+        Self::CircleClose,
+        Self::Radial,
+        Self::Pixelize,
+        Self::HorzOpen,
+        Self::VertOpen,
+    ];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cut => "Cut",
+            Self::Dissolve => "Dissolve",
+            Self::FadeBlack => "Fade black",
+            Self::FadeWhite => "Fade white",
+            Self::Slide | Self::SlideRight => "Slide right",
+            Self::SlideLeft => "Slide left",
+            Self::SlideUp => "Slide up",
+            Self::SlideDown => "Slide down",
+            Self::Wipe | Self::WipeLeft => "Wipe left",
+            Self::WipeRight => "Wipe right",
+            Self::WipeUp => "Wipe up",
+            Self::WipeDown => "Wipe down",
+            Self::WipeTl => "Wipe top-left",
+            Self::WipeTr => "Wipe top-right",
+            Self::WipeBl => "Wipe bottom-left",
+            Self::WipeBr => "Wipe bottom-right",
+            Self::SmoothLeft => "Smooth left",
+            Self::SmoothRight => "Smooth right",
+            Self::SmoothUp => "Smooth up",
+            Self::SmoothDown => "Smooth down",
+            Self::CoverLeft => "Cover left",
+            Self::CoverRight => "Cover right",
+            Self::CoverUp => "Cover up",
+            Self::CoverDown => "Cover down",
+            Self::RevealLeft => "Reveal left",
+            Self::RevealRight => "Reveal right",
+            Self::RevealUp => "Reveal up",
+            Self::RevealDown => "Reveal down",
+            Self::CircleOpen => "Circle open",
+            Self::CircleClose => "Circle close",
+            Self::Radial => "Radial",
+            Self::Pixelize => "Pixelize",
+            Self::HorzOpen => "Open horizontal",
+            Self::VertOpen => "Open vertical",
+        }
+    }
+
+    #[must_use]
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Cut => "Hard cut, no blend",
+            Self::Dissolve => "Crossfade between shots",
+            Self::FadeBlack => "Dip to black, then the next shot",
+            Self::FadeWhite => "Dip to white, then the next shot",
+            Self::Slide | Self::SlideRight | Self::SlideLeft | Self::SlideUp | Self::SlideDown => {
+                "Push the next shot on"
+            }
+            Self::Wipe
+            | Self::WipeLeft
+            | Self::WipeRight
+            | Self::WipeUp
+            | Self::WipeDown
+            | Self::WipeTl
+            | Self::WipeTr
+            | Self::WipeBl
+            | Self::WipeBr
+            | Self::SmoothLeft
+            | Self::SmoothRight
+            | Self::SmoothUp
+            | Self::SmoothDown => "Edge wipe across the frame",
+            Self::CoverLeft
+            | Self::CoverRight
+            | Self::CoverUp
+            | Self::CoverDown => "Next shot covers this one",
+            Self::RevealLeft
+            | Self::RevealRight
+            | Self::RevealUp
+            | Self::RevealDown => "This shot slides off, revealing the next",
+            Self::CircleOpen | Self::CircleClose | Self::Radial => "Iris / clock wipe",
+            Self::Pixelize => "Pixelate into the next shot",
+            Self::HorzOpen | Self::VertOpen => "Split open to the next shot",
+        }
+    }
+
+    #[must_use]
+    pub fn group(self) -> &'static str {
+        match self {
+            Self::Cut => "Cut",
+            Self::Dissolve | Self::FadeBlack | Self::FadeWhite => "Dissolve",
+            Self::Slide
+            | Self::SlideLeft
+            | Self::SlideRight
+            | Self::SlideUp
+            | Self::SlideDown
+            | Self::CoverLeft
+            | Self::CoverRight
+            | Self::CoverUp
+            | Self::CoverDown
+            | Self::RevealLeft
+            | Self::RevealRight
+            | Self::RevealUp
+            | Self::RevealDown => "Slide",
+            Self::Wipe
+            | Self::WipeLeft
+            | Self::WipeRight
+            | Self::WipeUp
+            | Self::WipeDown
+            | Self::WipeTl
+            | Self::WipeTr
+            | Self::WipeBl
+            | Self::WipeBr
+            | Self::SmoothLeft
+            | Self::SmoothRight
+            | Self::SmoothUp
+            | Self::SmoothDown => "Wipe",
+            Self::CircleOpen
+            | Self::CircleClose
+            | Self::Radial
+            | Self::Pixelize
+            | Self::HorzOpen
+            | Self::VertOpen => "Shape",
+        }
+    }
+
+    #[must_use]
+    pub fn mix_seconds(self) -> f64 {
+        match self {
+            Self::Cut => 0.0,
+            _ => 0.8,
+        }
+    }
+
+    /// ffmpeg `xfade=transition=` name.
+    #[must_use]
+    pub fn xfade(self) -> &'static str {
+        match self {
+            Self::Cut | Self::Dissolve => "fade",
+            Self::FadeBlack => "fadeblack",
+            Self::FadeWhite => "fadewhite",
+            Self::Slide | Self::SlideRight => "slideright",
+            Self::SlideLeft => "slideleft",
+            Self::SlideUp => "slideup",
+            Self::SlideDown => "slidedown",
+            Self::Wipe | Self::WipeLeft => "wipeleft",
+            Self::WipeRight => "wiperight",
+            Self::WipeUp => "wipeup",
+            Self::WipeDown => "wipedown",
+            Self::WipeTl => "wipetl",
+            Self::WipeTr => "wipetr",
+            Self::WipeBl => "wipebl",
+            Self::WipeBr => "wipebr",
+            Self::SmoothLeft => "smoothleft",
+            Self::SmoothRight => "smoothright",
+            Self::SmoothUp => "smoothup",
+            Self::SmoothDown => "smoothdown",
+            Self::CoverLeft => "coverleft",
+            Self::CoverRight => "coverright",
+            Self::CoverUp => "coverup",
+            Self::CoverDown => "coverdown",
+            Self::RevealLeft => "revealleft",
+            Self::RevealRight => "revealright",
+            Self::RevealUp => "revealup",
+            Self::RevealDown => "revealdown",
+            Self::CircleOpen => "circleopen",
+            Self::CircleClose => "circleclose",
+            Self::Radial => "radial",
+            Self::Pixelize => "pixelize",
+            Self::HorzOpen => "horzopen",
+            Self::VertOpen => "vertopen",
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(raw: &str) -> Self {
+        let k = raw.trim().to_ascii_lowercase().replace('-', "_");
+        match k.as_str() {
+            "cut" => Self::Cut,
+            "dissolve" | "fade" | "crossfade" => Self::Dissolve,
+            "fade_black" | "fadeblack" | "dip_to_black" => Self::FadeBlack,
+            "fade_white" | "fadewhite" => Self::FadeWhite,
+            "slide" | "slide_right" | "slideright" => Self::SlideRight,
+            "slide_left" | "slideleft" => Self::SlideLeft,
+            "slide_up" | "slideup" => Self::SlideUp,
+            "slide_down" | "slidedown" => Self::SlideDown,
+            "wipe" | "wipe_left" | "wipeleft" => Self::WipeLeft,
+            "wipe_right" | "wiperight" => Self::WipeRight,
+            "wipe_up" | "wipeup" => Self::WipeUp,
+            "wipe_down" | "wipedown" => Self::WipeDown,
+            "wipe_tl" | "wipetl" => Self::WipeTl,
+            "wipe_tr" | "wipetr" => Self::WipeTr,
+            "wipe_bl" | "wipebl" => Self::WipeBl,
+            "wipe_br" | "wipebr" => Self::WipeBr,
+            "smooth_left" | "smoothleft" => Self::SmoothLeft,
+            "smooth_right" | "smoothright" => Self::SmoothRight,
+            "smooth_up" | "smoothup" => Self::SmoothUp,
+            "smooth_down" | "smoothdown" => Self::SmoothDown,
+            "cover_left" | "coverleft" => Self::CoverLeft,
+            "cover_right" | "coverright" => Self::CoverRight,
+            "cover_up" | "coverup" => Self::CoverUp,
+            "cover_down" | "coverdown" => Self::CoverDown,
+            "reveal_left" | "revealleft" => Self::RevealLeft,
+            "reveal_right" | "revealright" => Self::RevealRight,
+            "reveal_up" | "revealup" => Self::RevealUp,
+            "reveal_down" | "revealdown" => Self::RevealDown,
+            "circle_open" | "circleopen" => Self::CircleOpen,
+            "circle_close" | "circleclose" => Self::CircleClose,
+            "radial" => Self::Radial,
+            "pixelize" | "pixel" => Self::Pixelize,
+            "horz_open" | "horzopen" => Self::HorzOpen,
+            "vert_open" | "vertopen" => Self::VertOpen,
+            _ => Self::Dissolve,
+        }
+    }
+
+    #[must_use]
+    pub fn slide_delta(self) -> Option<(f64, f64)> {
+        match self {
+            Self::Slide | Self::SlideRight | Self::CoverRight | Self::RevealLeft => Some((-1.0, 0.0)),
+            Self::SlideLeft | Self::CoverLeft | Self::RevealRight => Some((1.0, 0.0)),
+            Self::SlideUp | Self::CoverUp | Self::RevealDown => Some((0.0, 1.0)),
+            Self::SlideDown | Self::CoverDown | Self::RevealUp => Some((0.0, -1.0)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn wipe_inset(self, p: f64) -> Option<String> {
+        let p = (p * 100.0).clamp(0.0, 100.0);
+        match self {
+            Self::Wipe | Self::WipeLeft | Self::SmoothLeft => {
+                Some(format!("inset(0 {p:.1}% 0 0)"))
+            }
+            Self::WipeRight | Self::SmoothRight => Some(format!("inset(0 0 0 {p:.1}%)")),
+            Self::WipeUp | Self::SmoothUp => Some(format!("inset(0 0 {p:.1}% 0)")),
+            Self::WipeDown | Self::SmoothDown => Some(format!("inset({p:.1}% 0 0 0)")),
+            Self::WipeTl => Some(format!("inset(0 {p:.1}% {p:.1}% 0)")),
+            Self::WipeTr => Some(format!("inset(0 0 {p:.1}% {p:.1}%)")),
+            Self::WipeBl => Some(format!("inset({p:.1}% {p:.1}% 0 0)")),
+            Self::WipeBr => Some(format!("inset({p:.1}% 0 0 {p:.1}%)")),
+            Self::HorzOpen => {
+                let h = p / 2.0;
+                Some(format!("inset(0 {h:.1}% 0 {h:.1}%)"))
+            }
+            Self::VertOpen => {
+                let h = p / 2.0;
+                Some(format!("inset({h:.1}% 0 {h:.1}% 0)"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Lift / gamma-style grade. 0 = unchanged. Range roughly -1..1.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Grade {
+    #[serde(default)]
+    pub exposure: f32,
+    #[serde(default)]
+    pub contrast: f32,
+    #[serde(default)]
+    pub saturation: f32,
+    #[serde(default)]
+    pub temperature: f32,
+}
+
+impl Grade {
+    #[must_use]
+    pub fn punchy() -> Self {
+        Self {
+            exposure: 0.08,
+            contrast: 0.14,
+            saturation: 0.12,
+            temperature: 0.06,
+        }
+    }
+
+    #[must_use]
+    pub fn is_identity(self) -> bool {
+        self.exposure.abs() < 1e-4
+            && self.contrast.abs() < 1e-4
+            && self.saturation.abs() < 1e-4
+            && self.temperature.abs() < 1e-4
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Fx {
+    #[serde(default)]
+    pub blur: f32,
+    #[serde(default)]
+    pub grain: f32,
+    #[serde(default)]
+    pub vignette: f32,
+}
+
+impl Fx {
+    #[must_use]
+    pub fn film() -> Self {
+        Self {
+            blur: 0.0,
+            grain: 0.18,
+            vignette: 0.35,
+        }
+    }
+
+    #[must_use]
+    pub fn is_identity(self) -> bool {
+        self.blur < 1e-4 && self.grain < 1e-4 && self.vignette < 1e-4
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphicKind {
+    #[default]
+    Title,
+    LowerThird,
+    Card,
+    Shape,
+    Sticker,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Graphic {
+    pub kind: GraphicKind,
+    #[serde(default)]
+    pub text: String,
+}
+
+impl Graphic {
+    #[must_use]
+    pub fn title(text: impl Into<String>) -> Self {
+        Self {
+            kind: GraphicKind::Title,
+            text: text.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn lower_third(text: impl Into<String>) -> Self {
+        Self {
+            kind: GraphicKind::LowerThird,
+            text: text.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn card(text: impl Into<String>) -> Self {
+        Self {
+            kind: GraphicKind::Card,
+            text: text.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn shape() -> Self {
+        Self {
+            kind: GraphicKind::Shape,
+            text: String::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn sticker(text: impl Into<String>) -> Self {
+        Self {
+            kind: GraphicKind::Sticker,
+            text: text.into(),
+        }
+    }
+}
+
+/// Per-clip mix / look. Defaults keep old project JSON valid.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct ClipLook {
+    #[serde(default)]
+    pub fade_in: Duration,
+    #[serde(default)]
+    pub fade_out: Duration,
+    #[serde(default)]
+    pub transition: TransitionKind,
+    #[serde(default)]
+    pub grade: Grade,
+    #[serde(default)]
+    pub fx: Fx,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphic: Option<Graphic>,
+}
+
+impl ClipLook {
+    /// Linear fade gain like Shotcut fade-in / fade-out filters. 1 = full.
+    #[must_use]
+    pub fn fade_gain(&self, local: f64, duration: f64) -> f64 {
+        let mut g = 1.0;
+        let fi = self.fade_in.as_seconds();
+        let fo = self.fade_out.as_seconds();
+        if fi > 1e-4 && local < fi {
+            g *= (local / fi).clamp(0.0, 1.0);
+        }
+        if fo > 1e-4 && duration - local < fo {
+            g *= ((duration - local) / fo).clamp(0.0, 1.0);
+        }
+        g.clamp(0.0, 1.0)
+    }
+
+    /// Mix length at a join, clamped to half of each side (Kdenlive Mix / xfade).
+    #[must_use]
+    pub fn mix_window(&self, clip_dur: f64, next_dur: f64) -> f64 {
+        let raw = self.transition.mix_seconds();
+        if raw <= 1e-4 {
+            return 0.0;
+        }
+        let half = clip_dur.min(next_dur).max(0.0) * 0.5;
+        raw.min(half).min(clip_dur).max(0.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AspectRatio {
@@ -88,6 +580,9 @@ pub enum ClipKind {
         #[serde(default)]
         cues: Vec<CaptionCue>,
     },
+    Graphic {
+        graphic: Graphic,
+    },
 }
 
 fn default_volume() -> f32 {
@@ -98,7 +593,7 @@ impl ClipKind {
     #[must_use]
     pub fn track_kind(&self) -> TrackKind {
         match self {
-            Self::Video { .. } => TrackKind::Video,
+            Self::Video { .. } | Self::Graphic { .. } => TrackKind::Video,
             Self::Audio { .. } => TrackKind::Audio,
             Self::Caption { .. } => TrackKind::Caption,
         }
@@ -135,6 +630,8 @@ pub struct Clip {
     pub link_id: Option<LinkId>,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub look: ClipLook,
 }
 
 impl Clip {
@@ -420,11 +917,15 @@ impl Timeline {
             right.start = at;
             right.duration = clip.duration - offset;
             right.source_in = clip.source_in + offset;
+            // Inner cut is a hard cut. Outgoing mix / fade-out stay on the right.
+            right.look.fade_in = Duration::ZERO;
             (track.id, offset, right)
         };
         let right_id = new_clip.id;
         if let Some(clip) = self.clip_mut(clip_id) {
             clip.duration = left_end;
+            clip.look.fade_out = Duration::ZERO;
+            clip.look.transition = TransitionKind::Cut;
         }
         self.add_clip(track_id, new_clip)?;
         Ok(right_id)
@@ -554,6 +1055,7 @@ impl Timeline {
             group_id: None,
             link_id: None,
             disabled: false,
+            look: ClipLook::default(),
         };
         self.add_clip(track_id, clip)
     }

@@ -9,6 +9,7 @@ crates/oc-time         integer tick clock (120_000 / sec)
 crates/oc-timeline     tracks, clips, captions, undo
 crates/oc-tools        UI tools, timeline ops, MCP schemas for providers
 crates/oc-compositor   frame planner (wgpu later)
+crates/oc-render       ffmpeg bake (xfade, titles, grade, mix, captions)
 crates/oc-media        probe / object-key helpers
 crates/oc-providers    AI providers (SpaceXAI / xAI)
 crates/oc-voice        speech: STT + TTS

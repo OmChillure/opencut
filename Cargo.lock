@@ -3142,6 +3142,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "oc-render"
+version = "0.1.0"
+dependencies = [
+ "oc-time",
+ "oc-timeline",
+ "oc-tools",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "oc-tests"
+version = "0.1.0"
+dependencies = [
+ "oc-compositor",
+ "oc-core",
+ "oc-render",
+ "oc-time",
+ "oc-timeline",
+ "oc-tools",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "oc-time"
 version = "0.1.0"
 dependencies = [
@@ -3215,7 +3241,9 @@ dependencies = [
  "oc-core",
  "oc-db",
  "oc-media",
+ "oc-render",
  "oc-timeline",
+ "oc-tools",
  "oc-voice",
  "serde",
  "serde_json",

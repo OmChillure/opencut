@@ -8,8 +8,8 @@ mod registry;
 pub use intent::{Intent, is_director_request, parse_intent};
 pub use mcp::{inspect_from_mcp, Inspect, McpCall, McpTool, mcp_tools, op_from_mcp};
 pub use ops::{
-    AppliedOp, AssembleItem, AssembleStyle, ExportPreset, Op, OpError, TimeRange, TimelineEditMode,
-    apply,
+    AppliedOp, AssembleItem, AssembleStyle, Excerpt, ExportPreset, Op, OpError, TimeRange,
+    TimelineEditMode, apply, pick_reel_excerpts,
 };
 pub use oc_timeline::PlaceMode;
 pub use registry::{actions, modes, tool, tools, track_actions};

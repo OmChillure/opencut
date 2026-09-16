@@ -7,8 +7,8 @@ mod undo;
 pub use ids::{ClipId, GroupId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
 pub use edit::PlaceMode;
 pub use model::{
-    AspectRatio, CaptionCue, CaptionStyle, Clip, ClipKind, Marker, Timeline, Track, TrackKind,
-    Transform,
+    AspectRatio, CaptionCue, CaptionStyle, Clip, ClipKind, ClipLook, Fx, Grade, Graphic,
+    GraphicKind, Marker, Timeline, Track, TrackKind, Transform, TransitionKind,
 };
 pub use project::Project;
 pub use undo::{Edit, UndoStack};
@@ -61,6 +61,7 @@ mod tests {
             group_id: None,
             link_id: None,
             disabled: false,
+            look: ClipLook::default(),
         }
     }
 

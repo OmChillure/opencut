@@ -1,7 +1,8 @@
 use oc_time::{Duration, Time};
 use oc_timeline::{
-    AspectRatio, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, MarkerId, MediaId, PlaceMode,
-    Timeline, TimelineError, Track, TrackId, TrackKind, Transform, UndoStack,
+    AspectRatio, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook, Fx, Grade, Graphic,
+    MarkerId, MediaId, PlaceMode, Timeline, TimelineError, Track, TrackId, TrackKind,
+    Transform, TransitionKind, UndoStack,
 };
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,26 @@ pub enum ExportPreset {
     Youtube1080,
     Vertical1080,
     Square1080,
+}
+
+impl ExportPreset {
+    #[must_use]
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            Self::Youtube1080 => (1920, 1080),
+            Self::Vertical1080 => (1080, 1920),
+            Self::Square1080 => (1080, 1080),
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Youtube1080 => "youtube-1080",
+            Self::Vertical1080 => "vertical-1080",
+            Self::Square1080 => "square-1080",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -220,12 +241,44 @@ pub enum Op {
         track_id: Option<TrackId>,
         start: Time,
         duration: Duration,
+        #[serde(default)]
+        source_in: Time,
         kind: TrackKind,
         mode: TimelineEditMode,
     },
     Assemble {
         items: Vec<AssembleItem>,
         style: AssembleStyle,
+        #[serde(default)]
+        target_seconds: Option<f64>,
+    },
+    ClearTimeline,
+    SetTransition {
+        clip_id: ClipId,
+        kind: TransitionKind,
+    },
+    SetGrade {
+        clip_id: ClipId,
+        grade: Grade,
+    },
+    SetFx {
+        clip_id: ClipId,
+        fx: Fx,
+    },
+    SetFade {
+        clip_id: ClipId,
+        fade_in: Duration,
+        fade_out: Duration,
+    },
+    SetVolume {
+        clip_id: ClipId,
+        volume: f32,
+    },
+    AddGraphic {
+        graphic: Graphic,
+        start: Time,
+        duration: Duration,
+        track_id: Option<TrackId>,
     },
 }
 
@@ -264,6 +317,15 @@ pub struct AssembleItem {
     pub motion: f32,
     #[serde(default)]
     pub scenes: u32,
+    /// Takes to cut from this source. Empty = one take from hook_in.
+    #[serde(default)]
+    pub excerpts: Vec<Excerpt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Excerpt {
+    pub source_in: Time,
+    pub duration: Duration,
 }
 
 impl Default for AssembleItem {
@@ -281,6 +343,7 @@ impl Default for AssembleItem {
             look: String::new(),
             motion: 0.0,
             scenes: 0,
+            excerpts: Vec::new(),
         }
     }
 }
@@ -490,23 +553,121 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             track_id,
             start,
             duration,
+            source_in,
             kind,
             mode,
         } => {
             let track_id = resolve_track(timeline, *track_id, *kind);
-            let clip = clip_for_media(*media_id, *start, *duration, *kind);
+            let clip = clip_for_media(*media_id, *start, *duration, *kind, *source_in);
             let id = timeline.place_clip(track_id, clip, mode.as_place())?;
-            format!("placed {id} from {media_id} at {:.2}s", start.as_seconds())
+            format!(
+                "placed {id} from {media_id} at {:.2}s (src {:.2}s, {:.2}s)",
+                start.as_seconds(),
+                source_in.as_seconds(),
+                duration.as_seconds()
+            )
         }
-        Op::Assemble { items, style } => {
-            let n = assemble(timeline, items, *style)?;
+        Op::Assemble {
+            items,
+            style,
+            target_seconds,
+        } => {
+            let n = assemble(timeline, items, *style, *target_seconds)?;
             format!("assembled {n} clips ({style:?})")
+        }
+        Op::ClearTimeline => {
+            let n = clear_timeline(timeline);
+            format!("cleared {n} clips")
+        }
+        Op::SetTransition { clip_id, kind } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            clip.look.transition = *kind;
+            format!("{} on {clip_id}", kind.label())
+        }
+        Op::SetGrade { clip_id, grade } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            clip.look.grade = *grade;
+            format!("grade on {clip_id}")
+        }
+        Op::SetFx { clip_id, fx } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            clip.look.fx = *fx;
+            format!("fx on {clip_id}")
+        }
+        Op::SetFade {
+            clip_id,
+            fade_in,
+            fade_out,
+        } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            clip.look.fade_in = *fade_in;
+            clip.look.fade_out = *fade_out;
+            format!(
+                "fade in {:.1}s out {:.1}s on {clip_id}",
+                fade_in.as_seconds(),
+                fade_out.as_seconds()
+            )
+        }
+        Op::SetVolume { clip_id, volume } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            match &mut clip.kind {
+                ClipKind::Audio { volume: v, .. } => {
+                    *v = (*volume).clamp(0.0, 2.0);
+                }
+                _ => {
+                    return Err(OpError::Message(
+                        "volume is for audio clips — select an audio clip".into(),
+                    ));
+                }
+            }
+            format!("volume {volume:.2} on {clip_id}")
+        }
+        Op::AddGraphic {
+            graphic,
+            start,
+            duration,
+            track_id,
+        } => {
+            let track_id = match track_id {
+                Some(id) if timeline.track(*id).is_some() => *id,
+                _ => overlay_track(timeline),
+            };
+            let mut clip = clip_for_media(
+                MediaId::new(),
+                *start,
+                *duration,
+                TrackKind::Video,
+                Time::ZERO,
+            );
+            clip.media_id = None;
+            clip.kind = ClipKind::Graphic {
+                graphic: graphic.clone(),
+            };
+            clip.look.graphic = Some(graphic.clone());
+            let id = timeline.place_clip(track_id, clip, PlaceMode::Normal)?;
+            format!("graphic {id}")
         }
     };
     Ok(AppliedOp { op, note })
 }
 
-fn clip_for_media(media_id: MediaId, start: Time, duration: Duration, kind: TrackKind) -> Clip {
+fn clip_for_media(
+    media_id: MediaId,
+    start: Time,
+    duration: Duration,
+    kind: TrackKind,
+    source_in: Time,
+) -> Clip {
     let duration = if duration.as_ticks() <= 0 {
         Duration::from_seconds(match kind {
             TrackKind::Caption => 3.0,
@@ -534,12 +695,26 @@ fn clip_for_media(media_id: MediaId, start: Time, duration: Duration, kind: Trac
         },
         start,
         duration,
-        source_in: Time::ZERO,
+        source_in,
         speed: 1.0,
         group_id: None,
         link_id: None,
         disabled: false,
+        look: ClipLook::default(),
     }
+}
+
+fn overlay_track(timeline: &mut Timeline) -> TrackId {
+    let videos: Vec<TrackId> = timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video)
+        .map(|t| t.id)
+        .collect();
+    if let Some(id) = videos.get(1).copied() {
+        return id;
+    }
+    timeline.add_track(TrackKind::Video, "GFX")
 }
 
 fn resolve_track(timeline: &mut Timeline, track_id: Option<TrackId>, kind: TrackKind) -> TrackId {
@@ -559,6 +734,15 @@ fn resolve_track(timeline: &mut Timeline, track_id: Option<TrackId>, kind: Track
     timeline.add_track(kind, name)
 }
 
+fn clear_timeline(timeline: &mut Timeline) -> usize {
+    let mut n = 0;
+    for track in &mut timeline.tracks {
+        n += track.clips.len();
+        track.clips.clear();
+    }
+    n
+}
+
 fn clear_kind(timeline: &mut Timeline, kind: TrackKind) {
     let Some(id) = timeline.first_track(kind).map(|t| t.id) else {
         return;
@@ -576,13 +760,14 @@ fn assemble(
     timeline: &mut Timeline,
     items: &[AssembleItem],
     style: AssembleStyle,
+    target_seconds: Option<f64>,
 ) -> Result<usize> {
     if items.is_empty() {
         return Err(OpError::Message("no media to assemble".into()));
     }
     match style {
         AssembleStyle::Sequential => assemble_linear(timeline, items),
-        AssembleStyle::Vlog => assemble_short(timeline, items),
+        AssembleStyle::Vlog => assemble_short(timeline, items, target_seconds),
     }
 }
 
@@ -596,14 +781,26 @@ fn assemble_linear(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<us
     let mut n = 0;
     for item in items {
         if role_of(item) == Role::Music {
-            let clip = clip_for_media(item.media_id, t_audio, item.duration, TrackKind::Audio);
+            let clip = clip_for_media(
+                item.media_id,
+                t_audio,
+                item.duration,
+                TrackKind::Audio,
+                Time::ZERO,
+            );
             let dur = clip.duration;
             timeline.place_clip(audio_track, clip, PlaceMode::Normal)?;
             t_audio += dur;
             n += 1;
             continue;
         }
-        let clip = clip_for_media(item.media_id, t_video, item.duration, TrackKind::Video);
+        let clip = clip_for_media(
+            item.media_id,
+            t_video,
+            item.duration,
+            TrackKind::Video,
+            Time::ZERO,
+        );
         let dur = clip.duration;
         timeline.place_clip(video_track, clip, PlaceMode::Normal)?;
         t_video += dur;
@@ -613,7 +810,11 @@ fn assemble_linear(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<us
 }
 
 /// Cut a 30s–60s short: hook + A-roll spine, B-roll on V2, music ducked under.
-fn assemble_short(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<usize> {
+fn assemble_short(
+    timeline: &mut Timeline,
+    items: &[AssembleItem],
+    target_seconds: Option<f64>,
+) -> Result<usize> {
     let mut a_roll = Vec::new();
     let mut b_roll = Vec::new();
     let mut music = Vec::new();
@@ -650,12 +851,29 @@ fn assemble_short(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<usi
     };
     let a1 = resolve_track(timeline, None, TrackKind::Audio);
 
-    let n_a = a_roll.len().max(1) as f64;
-    let target = (n_a * 5.0).clamp(30.0, 60.0);
+    let excerpt_n = a_roll.iter().map(|i| i.excerpts.len().max(1)).sum::<usize>() as f64;
+    let n_a = excerpt_n.max(1.0);
+    let target = target_seconds.unwrap_or((n_a * 5.0).clamp(30.0, 60.0));
     let per = (target / n_a).clamp(2.8, 10.0);
     let mut cursor = Time::ZERO;
     let mut n = 0;
     for (i, item) in a_roll.iter().enumerate() {
+        if !item.excerpts.is_empty() {
+            for ex in &item.excerpts {
+                let clip = clip_for_media(
+                    item.media_id,
+                    cursor,
+                    ex.duration,
+                    TrackKind::Video,
+                    ex.source_in,
+                );
+                let dur = clip.duration;
+                timeline.place_clip(v1, clip, PlaceMode::Normal)?;
+                cursor += dur;
+                n += 1;
+            }
+            continue;
+        }
         let src = item.duration.as_seconds().max(0.4);
         let take = if i == 0 {
             per.min(4.0).min(src)
@@ -664,13 +882,13 @@ fn assemble_short(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<usi
         } else {
             per.min(src)
         };
-        let mut clip = clip_for_media(
+        let clip = clip_for_media(
             item.media_id,
             cursor,
             Duration::from_seconds(take),
             TrackKind::Video,
+            item.hook_in,
         );
-        clip.source_in = item.hook_in;
         let dur = clip.duration;
         timeline.place_clip(v1, clip, PlaceMode::Normal)?;
         cursor += dur;
@@ -695,6 +913,7 @@ fn assemble_short(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<usi
                 at,
                 Duration::from_seconds(take),
                 TrackKind::Video,
+                Time::ZERO,
             );
             timeline.place_clip(v2, clip, PlaceMode::Normal)?;
             n += 1;
@@ -708,6 +927,7 @@ fn assemble_short(timeline: &mut Timeline, items: &[AssembleItem]) -> Result<usi
             Time::ZERO,
             Duration::from_seconds(take.max(span.as_seconds())),
             TrackKind::Audio,
+            Time::ZERO,
         );
         timeline.place_clip(a1, clip, PlaceMode::Normal)?;
         duck_audio(timeline, 0.7);
@@ -843,6 +1063,144 @@ fn cut_ranges(timeline: &mut Timeline, ranges: &[TimeRange]) -> Result<usize> {
     Ok(count)
 }
 
+/// Pick keep-takes from timestamped speech so one long source can become a short.
+#[must_use]
+pub fn pick_reel_excerpts(cues: &[(Time, Time, &str)], target_s: f64) -> Vec<Excerpt> {
+    let target = target_s.clamp(20.0, 75.0);
+    let takes = merge_speech_takes(cues);
+    if takes.is_empty() {
+        return Vec::new();
+    }
+    let hook = takes
+        .iter()
+        .position(|t| t.hook)
+        .or_else(|| takes.iter().position(|t| t.words >= 4))
+        .unwrap_or(0);
+    let mut picked = vec![takes[hook]];
+    let mut used = takes[hook].duration_s();
+    for take in takes.iter().skip(hook + 1) {
+        if used >= target {
+            break;
+        }
+        let last_end = picked.last().map(|t| t.end).unwrap_or(Time::ZERO);
+        if take.start < last_end {
+            continue;
+        }
+        let gap = (take.start - last_end).as_seconds();
+        if gap < 0.25 && take.start != last_end {
+            continue;
+        }
+        used += take.duration_s();
+        picked.push(*take);
+    }
+    if used < target * 0.7 {
+        for take in takes.iter().take(hook) {
+            if used >= target {
+                break;
+            }
+            if picked.iter().any(|p| p.start == take.start) {
+                continue;
+            }
+            used += take.duration_s();
+            picked.push(*take);
+        }
+        picked.sort_by_key(|t| t.start);
+    }
+    picked
+        .into_iter()
+        .map(|t| Excerpt {
+            source_in: t.start,
+            duration: t.end - t.start,
+        })
+        .filter(|e| e.duration.as_seconds() >= 0.6)
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct SpeechTake {
+    start: Time,
+    end: Time,
+    words: u32,
+    hook: bool,
+}
+
+impl SpeechTake {
+    fn duration_s(self) -> f64 {
+        (self.end - self.start).as_seconds()
+    }
+}
+
+fn merge_speech_takes(cues: &[(Time, Time, &str)]) -> Vec<SpeechTake> {
+    let mut out = Vec::new();
+    let mut cur: Option<SpeechTake> = None;
+    for (start, end, text) in cues {
+        if end <= start || is_filler(text) {
+            if let Some(take) = cur.take() {
+                if take.duration_s() >= 0.8 {
+                    out.push(take);
+                }
+            }
+            continue;
+        }
+        let words = word_count(text);
+        let hook = text.contains('?') || text.contains('!');
+        match cur.as_mut() {
+            None => {
+                cur = Some(SpeechTake {
+                    start: *start,
+                    end: *end,
+                    words,
+                    hook,
+                });
+            }
+            Some(take) => {
+                let gap = (*start - take.end).as_seconds();
+                let merged = (take.end.max(*end) - take.start).as_seconds();
+                if gap <= 0.7 && merged <= 6.5 {
+                    take.end = take.end.max(*end);
+                    take.words += words;
+                    take.hook |= hook;
+                } else {
+                    if take.duration_s() >= 0.8 {
+                        out.push(*take);
+                    }
+                    *take = SpeechTake {
+                        start: *start,
+                        end: *end,
+                        words,
+                        hook,
+                    };
+                }
+            }
+        }
+    }
+    if let Some(take) = cur {
+        if take.duration_s() >= 0.8 {
+            out.push(take);
+        }
+    }
+    out
+}
+
+fn word_count(text: &str) -> u32 {
+    text.split_whitespace()
+        .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
+        .count() as u32
+}
+
+fn is_filler(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return true;
+    }
+    t.split_whitespace().all(|w| {
+        matches!(
+            w.trim_matches(|c: char| !c.is_alphanumeric()),
+            "um" | "uh" | "uhm" | "hmm" | "mm" | "yeah" | "yep" | "ok" | "okay" | "so" | "like"
+        )
+    })
+}
+
 fn duck_audio(timeline: &mut Timeline, amount: f32) {
     let amount = amount.clamp(0.0, 1.0);
     for track in &mut timeline.tracks {
@@ -881,6 +1239,7 @@ mod tests {
             group_id: None,
             link_id: None,
             disabled: false,
+            look: ClipLook::default(),
         };
         let id = tl.add_clip(track, clip).unwrap();
         apply(
@@ -934,6 +1293,7 @@ mod tests {
             group_id: None,
             link_id: None,
             disabled: false,
+            look: ClipLook::default(),
         };
         let id = clip.id;
         apply(
@@ -962,6 +1322,7 @@ mod tests {
             &mut undo,
             Op::Assemble {
                 style: AssembleStyle::Vlog,
+                target_seconds: None,
                 items: vec![
                     AssembleItem {
                         media_id: v1,
@@ -1017,6 +1378,7 @@ mod tests {
             &mut undo,
             Op::Assemble {
                 style: AssembleStyle::Vlog,
+                target_seconds: None,
                 items: vec![AssembleItem {
                     media_id: MediaId::new(),
                     duration: Duration::from_seconds(90.0),
@@ -1032,5 +1394,189 @@ mod tests {
         let video = tl.first_track(TrackKind::Video).unwrap();
         assert_eq!(video.clips.len(), 1);
         assert!(video.clips[0].duration.as_seconds() <= 8.1);
+    }
+
+    #[test]
+    fn assemble_long_source_uses_excerpts() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        let media = MediaId::new();
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::Assemble {
+                style: AssembleStyle::Vlog,
+                target_seconds: Some(30.0),
+                items: vec![AssembleItem {
+                    media_id: media,
+                    duration: Duration::from_seconds(300.0),
+                    kind: TrackKind::Video,
+                    words: 400,
+                    speech_seconds: 240.0,
+                    excerpts: vec![
+                        Excerpt {
+                            source_in: Time::from_seconds(4.0),
+                            duration: Duration::from_seconds(5.0),
+                        },
+                        Excerpt {
+                            source_in: Time::from_seconds(40.0),
+                            duration: Duration::from_seconds(8.0),
+                        },
+                        Excerpt {
+                            source_in: Time::from_seconds(120.0),
+                            duration: Duration::from_seconds(6.0),
+                        },
+                        Excerpt {
+                            source_in: Time::from_seconds(200.0),
+                            duration: Duration::from_seconds(5.0),
+                        },
+                    ],
+                    ..AssembleItem::default()
+                }],
+            },
+        )
+        .unwrap();
+        let video = tl.first_track(TrackKind::Video).unwrap();
+        assert_eq!(video.clips.len(), 4);
+        assert!((video.clips[0].source_in.as_seconds() - 4.0).abs() < 1e-6);
+        assert!((video.clips[1].source_in.as_seconds() - 40.0).abs() < 1e-6);
+        let span: f64 = video.clips.iter().map(|c| c.duration.as_seconds()).sum();
+        assert!((span - 24.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn place_media_keeps_source_in() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        let media = MediaId::new();
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::PlaceMedia {
+                media_id: media,
+                track_id: None,
+                start: Time::from_seconds(2.0),
+                duration: Duration::from_seconds(3.5),
+                source_in: Time::from_seconds(81.0),
+                kind: TrackKind::Video,
+                mode: TimelineEditMode::Normal,
+            },
+        )
+        .unwrap();
+        let clip = &tl.first_track(TrackKind::Video).unwrap().clips[0];
+        assert!((clip.source_in.as_seconds() - 81.0).abs() < 1e-6);
+        assert!((clip.start.as_seconds() - 2.0).abs() < 1e-6);
+        assert!((clip.duration.as_seconds() - 3.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pick_reel_skips_filler_and_hits_target() {
+        let cues = [
+            (Time::from_seconds(0.0), Time::from_seconds(0.6), "um"),
+            (
+                Time::from_seconds(1.0),
+                Time::from_seconds(4.0),
+                "what if we just left tonight?",
+            ),
+            (Time::from_seconds(4.2), Time::from_seconds(7.0), "pack the car"),
+            (Time::from_seconds(20.0), Time::from_seconds(24.0), "the road was empty"),
+            (Time::from_seconds(40.0), Time::from_seconds(44.0), "we made it by dawn"),
+            (Time::from_seconds(80.0), Time::from_seconds(84.0), "that was the whole trip"),
+        ];
+        let takes = pick_reel_excerpts(&cues, 30.0);
+        assert!(takes.len() >= 3, "{takes:?}");
+        assert!(takes[0].source_in.as_seconds() >= 0.9);
+        let span: f64 = takes.iter().map(|t| t.duration.as_seconds()).sum();
+        assert!(span >= 12.0, "{span}");
+        assert!(span <= 40.0, "{span}");
+    }
+
+    #[test]
+    fn clear_timeline_drops_clips() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let clip = Clip {
+            id: ClipId::new(),
+            media_id: Some(MediaId::new()),
+            kind: ClipKind::Video {
+                transform: Transform::default(),
+            },
+            start: Time::ZERO,
+            duration: Duration::from_seconds(2.0),
+            source_in: Time::ZERO,
+            speed: 1.0,
+            group_id: None,
+            link_id: None,
+            disabled: false,
+            look: ClipLook::default(),
+        };
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::AddClip {
+                track_id: track,
+                clip,
+            },
+        )
+        .unwrap();
+        apply(&mut tl, &mut undo, Op::ClearTimeline).unwrap();
+        assert!(tl.first_track(TrackKind::Video).unwrap().clips.is_empty());
+    }
+
+    #[test]
+    fn set_transition_and_graphic() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let clip = Clip {
+            id: ClipId::new(),
+            media_id: Some(MediaId::new()),
+            kind: ClipKind::Video {
+                transform: Transform::default(),
+            },
+            start: Time::ZERO,
+            duration: Duration::from_seconds(4.0),
+            source_in: Time::ZERO,
+            speed: 1.0,
+            group_id: None,
+            link_id: None,
+            disabled: false,
+            look: ClipLook::default(),
+        };
+        let id = tl.add_clip(track, clip).unwrap();
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::SetTransition {
+                clip_id: id,
+                kind: TransitionKind::Dissolve,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tl.find_clip(id).unwrap().1.look.transition,
+            TransitionKind::Dissolve
+        );
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::AddGraphic {
+                graphic: Graphic::title("Hello"),
+                start: Time::from_seconds(1.0),
+                duration: Duration::from_seconds(2.0),
+                track_id: None,
+            },
+        )
+        .unwrap();
+        let has_title = tl.tracks.iter().flat_map(|t| &t.clips).any(|c| {
+            matches!(
+                &c.kind,
+                ClipKind::Graphic {
+                    graphic
+                } if graphic.text == "Hello"
+            )
+        });
+        assert!(has_title);
     }
 }
