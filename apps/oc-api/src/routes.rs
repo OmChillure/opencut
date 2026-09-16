@@ -163,7 +163,11 @@ pub async fn apply_ops(
     );
     let mut undo = UndoStack::new();
     let mut notes = Vec::new();
+    let mut exports = Vec::new();
     for op in body.ops {
+        if let Op::Export { preset } = &op {
+            exports.push(*preset);
+        }
         let op = hydrate_op(op, &media, &speech, &looks);
         match apply(&mut project.timeline, &mut undo, op) {
             Ok(applied) => notes.push(applied.note),
@@ -171,6 +175,13 @@ pub async fn apply_ops(
         }
     }
     oc_db::save_timeline(&state.db, id, &project.timeline).await?;
+    for preset in exports {
+        if let Err(err) = edit::queue_export(&state.db, id, preset).await {
+            notes.push(format!("export queue failed: {err}"));
+        } else {
+            notes.push(format!("export job queued ({preset:?})"));
+        }
+    }
     Ok(Json(ApplyOpsResponse {
         timeline: project.timeline,
         notes,
@@ -287,7 +298,7 @@ async fn run_chat(
         user = %last_user.chars().take(120).collect::<String>(),
         "chat context"
     );
-    if is_director_request(last_user) && !media.is_empty() {
+    if !media.is_empty() {
         let understood = media.iter().any(|m| {
             speech.contains_key(&m.id) || looks.contains_key(&m.id)
         });
@@ -338,79 +349,16 @@ async fn run_chat(
                 .await;
             }
         }
-        emit_host_tool(
-            &tx,
-            "host-assemble",
-            "assemble",
-            serde_json::json!({"style":"vlog"}),
-            None,
-            "pending",
-        )
-        .await;
-        tracing::info!(project = %id, "host assemble");
-        match edit::call_tool(
-            &state.db,
-            id,
-            "assemble",
-            serde_json::json!({"style":"vlog"}),
-        )
-        .await
-        {
-            Ok(note) => {
-                tracing::info!(project = %id, note = %note, "host assemble ok");
-                emit_host_tool(
-                    &tx,
-                    "host-assemble",
-                    "assemble",
-                    serde_json::json!({"style":"vlog"}),
-                    Some(note.clone()),
-                    "done",
-                )
-                .await;
-                notes.push(note);
-            }
-            Err(err) => {
-                tracing::error!(project = %id, "host assemble failed: {err}");
-                emit_host_tool(
-                    &tx,
-                    "host-assemble",
-                    "assemble",
-                    serde_json::json!({"style":"vlog"}),
-                    Some(err.clone()),
-                    "error",
-                )
-                .await;
-                finish_chat(
-                    &tx,
-                    &format!("Couldn't cut the short: {err}"),
-                    &[],
-                    &project.timeline,
-                )
-                .await;
-                return Ok(());
-            }
-        }
-        if let Ok(fresh) = oc_db::get_project(&state.db, id).await {
-            project = fresh;
-        }
     }
     let tools = mcp_tools();
-    let directed = !notes.is_empty();
-    let system = if directed {
-        format!(
-            "A short is already on the timeline. Follow the director brief. \
-             Call list_timeline if you need the cut. Do not assemble again unless they ask.\n\
-             Project '{}'.",
-            project.name
-        )
-    } else {
-        format!(
-            "Follow the director brief. Project '{}'. \
-             OpenCut MCP tools are attached. Call list_bin and list_timeline when you need \
-             the workspace — do not assume the bin is empty. Call get_media only for one id.",
-            project.name
-        )
-    };
+    let system = format!(
+        "You are the picture editor for project '{}'. Do what the user asked — \
+         reel, trim, recut, captions, silence, whatever. There is no default cut. \
+         Call list_bin and list_timeline first. For a long file, call get_media or \
+         list_cues and place excerpts with source_in + duration. Do not assume the \
+         bin is empty. Never describe an edit you did not make with tools.",
+        project.name
+    );
     let mut turns = body.messages;
     let mut text = String::new();
     let (ev_tx, ev_rx) = mpsc::channel::<ChatEvent>(64);
@@ -440,13 +388,6 @@ async fn run_chat(
         .await
         {
             Ok(reply) => reply,
-            Err(err) if directed => {
-                tracing::error!(project = %id, "provider failed after assemble: {err}");
-                text = format!(
-                    "Cut a short from your clips and laid it on the timeline. Play it. ({err})"
-                );
-                break;
-            }
             Err(err) => {
                 tracing::error!(project = %id, "provider failed: {err}");
                 drop(ev_tx);
@@ -515,7 +456,9 @@ async fn run_chat(
                 });
                 turns.push(ChatTurn {
                     role: "user".into(),
-                    content: "Done. Reply briefly with what you changed.".into(),
+                    content: "Tool results above. If the timeline does not match the request, \
+                              keep using tools. If it does, reply in 2–4 sentences."
+                        .into(),
                 });
             }
         }

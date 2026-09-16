@@ -114,7 +114,8 @@ mod tests {
     fn ships_director_brief() {
         let text = shared_prompts();
         assert!(text.contains("picture editor"), "{text}");
-        assert!(text.contains("TOOL assemble"), "{text}");
+        assert!(text.contains("place_clip"), "{text}");
+        assert!(text.contains("source_in"), "{text}");
         assert!(!text.to_ascii_lowercase().contains("only claude"));
     }
 }

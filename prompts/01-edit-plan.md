@@ -1,46 +1,48 @@
 # Edit plan
 
-Think in this order, then act.
+Think, then act. Match the tools to **this** request — do not run a stock vlog recipe.
 
 ## 1. Inventory
 
-Call `list_bin` and `list_timeline` first. Do not guess. Do not ask the user to paste clips.
+Call `list_bin` and `list_timeline` first. For a long file, call `get_media` or `list_cues`
+so you have timestamped sentences. Do not guess. Do not ask the user to paste clips.
 
 From those tools (not filenames):
 
-- who is speaking, and the first useful line
+- who is speaking, and which lines are worth keeping (with source times)
 - which clips have almost no speech (B-roll / stills)
 - which file is music
-- total usable talk vs target ~30s
+- what is already on the timeline (`source_in` is the in-point in the source)
 
 ## 2. Plan (keep this in your head; do not dump a long essay)
 
-- **Hook** — 2–4s, strongest opening line
-- **Spine** — A-roll, trimmed, in story order
-- **Cover** — B-roll over gaps or dull talk
-- **End** — last clear sentence or a wide
-- **Bed** — one music clip, ducked
+Decide the shape from the ask:
+
+- **Reel / short / tiktok / 30–60s** — hook, spine, cover, end. Vertical if they said reel/tiktok.
+- **One long source** — several excerpts, not one 4s bite and not the whole file.
+- **Trim / split / delete / recut** — touch only what they named.
+- **Captions / silence / duck / reframe** — just that.
 
 ## 3. Execute
 
-If the user asked to make a vlog/video/short, after list_bin:
+Tools first, then a short sentence for the user.
+
+Put a **slice** of a source on the timeline:
 
 ```
-TOOL assemble {"style":"vlog"}
+TOOL place_clip {"media_id":"<id>","start":0,"source_in":12.4,"duration":3.8}
 ```
 
-That uses the whole bin. Omit `media_ids` unless they named specific ids.
+`start` is timeline time. `source_in` + `duration` are the take in the file.
+Repeat for each keep. `clear_timeline` first if you are starting a new cut.
 
-To place one file:
+`assemble` is a shortcut when many short bin items should land in one pass.
+It is **not** required, and it is the wrong tool for picking highlights inside one long take —
+use `place_clip` excerpts for that.
 
-```
-TOOL place_clip {"media_id":"<id from bin>","start":0}
-```
-
-Then only if needed: `trim`, `split`, `move`, `remove_silence`, `add_captions`, `duck`.
-
-Emit `TOOL name {json}` lines first, then one short sentence for the user.
+Then only if needed: `trim`, `split`, `slip`, `move`, `remove_silence`, `add_captions`, `duck`, `reframe`.
 
 ## 4. Review
 
-If the hook is slow, the short is over ~40s, or two talk tracks overlap — fix it with tools. Do not congratulate yourself.
+If the hook is slow, the length is wrong, or two talk tracks overlap — fix it with tools.
+Do not congratulate yourself. Do not claim a cut you did not make.

@@ -200,9 +200,11 @@ mod tests {
             "list_bin",
             "list_timeline",
             "get_media",
+            "list_cues",
             "split",
             "assemble",
             "place_clip",
+            "clear_timeline",
             "move",
         ] {
             assert!(names.contains(&need), "missing {need} in {names:?}");

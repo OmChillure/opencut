@@ -1,8 +1,8 @@
 //! Shared inspect + apply so chat and the MCP child hit the same tools.
 
 use oc_core::{
-    inspect_from_mcp, apply, op_from_mcp, AssembleItem, Inspect, MediaId, McpCall, Op, Time,
-    Timeline, TrackKind, UndoStack,
+    inspect_from_mcp, apply, op_from_mcp, pick_reel_excerpts, AssembleItem, ExportPreset, Inspect,
+    MediaId, McpCall, Op, Time, Timeline, TrackKind, UndoStack,
 };
 use oc_core::time::TICKS_PER_SECOND;
 use oc_db::Db;
@@ -14,6 +14,13 @@ pub(crate) struct Speech {
     pub words: u32,
     pub speech_seconds: f64,
     pub hook_in: Time,
+    pub text: String,
+    pub cues: Vec<CueBrief>,
+}
+
+pub(crate) struct CueBrief {
+    pub start: Time,
+    pub end: Time,
     pub text: String,
 }
 
@@ -53,6 +60,10 @@ pub(crate) async fn call_tool(
     })?;
     let op = hydrate_op(op, &media, &speech, &looks);
     let mut undo = UndoStack::new();
+    let export = match &op {
+        oc_core::Op::Export { preset } => Some(*preset),
+        _ => None,
+    };
     let applied = apply(&mut project.timeline, &mut undo, op).map_err(|e| {
         tracing::error!(project = %project_id, tool = name, "apply failed: {e}");
         e.to_string()
@@ -60,8 +71,30 @@ pub(crate) async fn call_tool(
     oc_db::save_timeline(db, project_id, &project.timeline)
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(preset) = export {
+        queue_export(db, project_id, preset).await?;
+    }
     tracing::info!(project = %project_id, tool = name, note = %applied.note, "applied");
     Ok(applied.note)
+}
+
+pub(crate) async fn queue_export(
+    db: &Db,
+    project_id: Uuid,
+    preset: ExportPreset,
+) -> Result<(), String> {
+    let id = oc_db::enqueue_job(
+        db,
+        "export",
+        serde_json::json!({
+            "project_id": project_id,
+            "preset": preset,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    tracing::info!(project = %project_id, job = %id, ?preset, "export queued");
+    Ok(())
 }
 
 pub(crate) fn speech_by_media(rows: &[oc_db::TranscriptCueRow]) -> HashMap<Uuid, Speech> {
@@ -72,6 +105,7 @@ pub(crate) fn speech_by_media(rows: &[oc_db::TranscriptCueRow]) -> HashMap<Uuid,
             speech_seconds: 0.0,
             hook_in: Time::ZERO,
             text: row.full_text.clone(),
+            cues: Vec::new(),
         });
         let words = row
             .text
@@ -84,6 +118,11 @@ pub(crate) fn speech_by_media(rows: &[oc_db::TranscriptCueRow]) -> HashMap<Uuid,
         }
         entry.words += words;
         entry.speech_seconds += secs;
+        entry.cues.push(CueBrief {
+            start: Time::from_ticks(row.start_ticks),
+            end: Time::from_ticks(row.end_ticks),
+            text: row.text.clone(),
+        });
     }
     map
 }
@@ -108,9 +147,10 @@ pub(crate) fn run_inspect(
             for row in media {
                 let (kind, dur) = spec_from_row(row);
                 let words = speech.get(&row.id).map(|s| s.words).unwrap_or(0);
+                let cues = speech.get(&row.id).map(|s| s.cues.len()).unwrap_or(0);
                 let look = looks.get(&row.id).map(|l| l.look.as_str()).unwrap_or("-");
                 out.push_str(&format!(
-                    "{id}  {kind:?}  {dur:.1}s  words={words}  look={look}  {name}\n",
+                    "{id}  {kind:?}  {dur:.1}s  words={words}  cues={cues}  look={look}  {name}\n",
                     id = row.id,
                     dur = dur.as_seconds(),
                     name = row.filename
@@ -131,13 +171,13 @@ pub(crate) fn run_inspect(
                 dur = dur.as_seconds()
             );
             if let Some(s) = speech.get(&id) {
-                let excerpt: String = s.text.chars().take(240).collect();
                 out.push_str(&format!(
-                    "speech words={} hook@{:.1}s \"{}\"\n",
+                    "speech words={} hook@{:.1}s cues={}\n",
                     s.words,
                     s.hook_in.as_seconds(),
-                    excerpt.replace('\n', " ")
+                    s.cues.len()
                 ));
+                out.push_str(&format_cues(&s.cues, 80));
             } else {
                 out.push_str("speech: none yet\n");
             }
@@ -148,6 +188,19 @@ pub(crate) fn run_inspect(
                 ));
             }
             out
+        }
+        Inspect::ListCues { media_id } => {
+            let id = media_id.as_uuid();
+            let Some(s) = speech.get(&id) else {
+                return format!("no cues for {id} yet");
+            };
+            format!(
+                "cues {} words={} hook@{:.1}s\n{}",
+                s.cues.len(),
+                s.words,
+                s.hook_in.as_seconds(),
+                format_cues(&s.cues, 200)
+            )
         }
     }
 }
@@ -164,11 +217,18 @@ pub(crate) fn hydrate_op(
             track_id,
             start,
             duration,
+            source_in,
             kind,
             mode,
         } => {
             if let Some(row) = media.iter().find(|r| r.id == media_id.as_uuid()) {
                 let (row_kind, row_dur) = spec_from_row(row);
+                let remain = if source_in.as_ticks() > 0 && row_dur.as_ticks() > source_in.as_ticks()
+                {
+                    oc_core::Duration::from_ticks(row_dur.as_ticks() - source_in.as_ticks())
+                } else {
+                    row_dur
+                };
                 Op::PlaceMedia {
                     media_id,
                     track_id,
@@ -176,8 +236,9 @@ pub(crate) fn hydrate_op(
                     duration: if duration.as_ticks() > 0 {
                         duration
                     } else {
-                        row_dur
+                        remain
                     },
+                    source_in,
                     kind: if kind == TrackKind::Caption {
                         kind
                     } else {
@@ -191,31 +252,43 @@ pub(crate) fn hydrate_op(
                     track_id,
                     start,
                     duration,
+                    source_in,
                     kind,
                     mode,
                 }
             }
         }
-        Op::Assemble { items, style } => {
+        Op::Assemble {
+            items,
+            style,
+            target_seconds,
+        } => {
+            let target = target_seconds.unwrap_or(45.0);
             let items = if items.is_empty() {
                 media
                     .iter()
                     .rev()
-                    .map(|row| item_from_row(row, speech.get(&row.id), looks.get(&row.id)))
+                    .map(|row| {
+                        item_from_row(row, speech.get(&row.id), looks.get(&row.id), target)
+                    })
                     .collect()
             } else {
                 items
                     .into_iter()
                     .map(|item| {
                         if let Some(row) = media.iter().find(|r| r.id == item.media_id.as_uuid()) {
-                            item_from_row(row, speech.get(&row.id), looks.get(&row.id))
+                            item_from_row(row, speech.get(&row.id), looks.get(&row.id), target)
                         } else {
                             item
                         }
                     })
                     .collect()
             };
-            Op::Assemble { items, style }
+            Op::Assemble {
+                items,
+                style,
+                target_seconds: Some(target),
+            }
         }
         other => other,
     }
@@ -256,6 +329,7 @@ fn item_from_row(
     row: &oc_db::MediaRow,
     speech: Option<&Speech>,
     look: Option<&oc_db::AnalysisRow>,
+    target_seconds: f64,
 ) -> AssembleItem {
     let (kind, duration) = spec_from_row(row);
     let still = row.content_type.starts_with("image/");
@@ -271,6 +345,14 @@ fn item_from_row(
         item.speech_seconds = s.speech_seconds;
         item.hook_in = s.hook_in;
         item.text = s.text.clone();
+        if duration.as_seconds() >= 20.0 && s.cues.len() >= 3 {
+            let cues: Vec<_> = s
+                .cues
+                .iter()
+                .map(|c| (c.start, c.end, c.text.as_str()))
+                .collect();
+            item.excerpts = pick_reel_excerpts(&cues, target_seconds);
+        }
     }
     if let Some(l) = look {
         item.look = l.look.clone();
@@ -278,6 +360,22 @@ fn item_from_row(
         item.scenes = l.scenes.max(0) as u32;
     }
     item
+}
+
+fn format_cues(cues: &[CueBrief], limit: usize) -> String {
+    let mut out = String::new();
+    for cue in cues.iter().take(limit) {
+        out.push_str(&format!(
+            "{:.1}-{:.1}  {}\n",
+            cue.start.as_seconds(),
+            cue.end.as_seconds(),
+            cue.text.replace('\n', " ")
+        ));
+    }
+    if cues.len() > limit {
+        out.push_str(&format!("… {} more cues\n", cues.len() - limit));
+    }
+    out
 }
 
 fn timeline_brief(tl: &Timeline) -> String {
@@ -293,11 +391,12 @@ fn timeline_brief(tl: &Timeline) -> String {
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "-".into());
             out.push_str(&format!(
-                "    clip {} media={} start={:.2}s dur={:.2}s\n",
+                "    clip {} media={} start={:.2}s dur={:.2}s src_in={:.2}s\n",
                 clip.id,
                 media,
                 clip.start.as_seconds(),
-                clip.duration.as_seconds()
+                clip.duration.as_seconds(),
+                clip.source_in.as_seconds()
             ));
         }
     }
