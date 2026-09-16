@@ -320,7 +320,36 @@ pub async fn set_media_r2_key(pool: &Db, id: Uuid, r2_key: &str) -> Result<(), D
 }
 
 pub fn is_r2_object_key(key: &str) -> bool {
-    !key.is_empty() && !key.starts_with("workspace/")
+    !key.is_empty() && !key.starts_with("workspace/") && !key.starts_with("local/")
+}
+
+pub fn is_local_media_key(key: &str) -> bool {
+    key.starts_with("local/")
+}
+
+pub fn media_data_dir() -> std::path::PathBuf {
+    std::env::var("OPENCUT_MEDIA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("data/media"))
+}
+
+pub fn local_media_key(project_id: Uuid, media_id: Uuid, filename: &str) -> String {
+    let safe: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("local/{project_id}/{media_id}/{safe}")
+}
+
+pub fn local_media_path(key: &str) -> Option<std::path::PathBuf> {
+    let rest = key.strip_prefix("local/")?;
+    Some(media_data_dir().join(rest))
 }
 
 pub async fn list_media(pool: &Db, project_id: Uuid) -> Result<Vec<MediaRow>, DbError> {

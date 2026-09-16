@@ -260,6 +260,8 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
             let r2 = r2.context("R2 required to fetch source clips")?;
             let bytes = r2.get_bytes(&row.r2_key).await?;
             tokio::fs::write(&dest, bytes).await?;
+        } else if let Some(path) = oc_db::local_media_path(&row.r2_key) {
+            tokio::fs::copy(&path, &dest).await?;
         } else if Path::new(&row.r2_key).is_file() {
             tokio::fs::copy(&row.r2_key, &dest).await?;
         } else {

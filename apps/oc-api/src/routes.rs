@@ -554,29 +554,13 @@ pub async fn put_media_bytes(
     if media.project_id != id {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
     }
-    let r2 = state
-        .r2
-        .as_ref()
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "R2 not configured"))?;
     let ctype = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&media.content_type)
         .to_string();
     let project_id = ProjectId::from_uuid(id);
-    let key = if oc_db::is_r2_object_key(&media.r2_key) {
-        media.r2_key.clone()
-    } else {
-        object_key(
-            ObjectKind::Raw,
-            project_id,
-            MediaId::from_uuid(media_id),
-            &media.filename,
-        )
-    };
-    r2.put_bytes(&key, body.to_vec(), &ctype)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let key = store_media_bytes(&state, id, media_id, &media, &ctype, body.to_vec()).await?;
     oc_db::set_media_r2_key(&state.db, media_id, &key).await?;
     if !ctype.starts_with("image/") {
         let _ = oc_db::enqueue_job(
@@ -667,7 +651,7 @@ pub async fn list_media(
     let rows = oc_db::list_media(&state.db, id).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let play_url = media_play_url(&state, &row.r2_key).await;
+        let play_url = media_play_url(id, row.id, &row.r2_key).await;
         out.push(MediaOut {
             id: row.id,
             project_id: row.project_id,
@@ -681,18 +665,159 @@ pub async fn list_media(
     Ok(Json(out))
 }
 
-async fn media_play_url(state: &AppState, key: &str) -> Option<String> {
-    let base = std::env::var("R2_PUBLIC_BASE_URL").ok().filter(|s| !s.is_empty());
-    if let Some(base) = base {
-        return Some(format!("{}/{key}", base.trim_end_matches('/')));
+async fn media_play_url(project_id: Uuid, media_id: Uuid, key: &str) -> Option<String> {
+    if oc_db::is_r2_object_key(key)
+        || oc_db::is_local_media_key(key)
+        || oc_db::local_media_path(key).is_some_and(|p| p.is_file())
+    {
+        return Some(media_file_url(project_id, media_id));
     }
-    if let Some(r2) = &state.r2 {
-        return r2
-            .presign_get(key, Duration::from_secs(6 * 3600))
-            .await
-            .ok();
+    if key.starts_with("workspace/") {
+        let guessed = oc_db::local_media_path(&oc_db::local_media_key(
+            project_id,
+            media_id,
+            "media.bin",
+        ));
+        if guessed.is_some_and(|p| p.is_file()) {
+            return Some(media_file_url(project_id, media_id));
+        }
     }
     None
+}
+
+fn media_file_url(project_id: Uuid, media_id: Uuid) -> String {
+    let base = std::env::var("API_PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".into());
+    format!(
+        "{}/v1/projects/{project_id}/media/{media_id}/file",
+        base.trim_end_matches('/')
+    )
+}
+
+async fn store_media_bytes(
+    state: &AppState,
+    project_id: Uuid,
+    media_id: Uuid,
+    media: &oc_db::MediaRow,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> Result<String, ApiError> {
+    if let Some(r2) = &state.r2 {
+        let key = if oc_db::is_r2_object_key(&media.r2_key) {
+            media.r2_key.clone()
+        } else {
+            object_key(
+                ObjectKind::Raw,
+                ProjectId::from_uuid(project_id),
+                MediaId::from_uuid(media_id),
+                &media.filename,
+            )
+        };
+        r2.put_bytes(&key, bytes, content_type)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+        return Ok(key);
+    }
+    let key = oc_db::local_media_key(project_id, media_id, &media.filename);
+    let path = oc_db::local_media_path(&key)
+        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "bad local key"))?;
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(key)
+}
+
+pub async fn get_media_file(
+    State(state): State<AppState>,
+    Path((id, media_id)): Path<(Uuid, Uuid)>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    let media = oc_db::get_media(&state.db, media_id).await?;
+    if media.project_id != id {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
+    }
+    if oc_db::is_local_media_key(&media.r2_key) {
+        if let Some(path) = oc_db::local_media_path(&media.r2_key) {
+            return serve_local_file(&path, &media.content_type, headers.get(header::RANGE)).await;
+        }
+    }
+    if oc_db::is_r2_object_key(&media.r2_key) {
+        if let Some(r2) = &state.r2 {
+            let url = r2
+                .presign_get(&media.r2_key, Duration::from_secs(6 * 3600))
+                .await
+                .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+            return Ok(Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, url)
+                .body(Body::empty())
+                .unwrap_or_else(|_| Response::new(Body::empty())));
+        }
+    }
+    // workspace/ rows: still try the local file we may have written
+    let fallback = oc_db::local_media_key(id, media_id, &media.filename);
+    if let Some(path) = oc_db::local_media_path(&fallback) {
+        if path.is_file() {
+            return serve_local_file(&path, &media.content_type, headers.get(header::RANGE)).await;
+        }
+    }
+    Err(ApiError::new(
+        StatusCode::NOT_FOUND,
+        "media file is not stored — re-import the clip",
+    ))
+}
+
+async fn serve_local_file(
+    path: &std::path::Path,
+    content_type: &str,
+    range: Option<&axum::http::HeaderValue>,
+) -> ApiResult<Response> {
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "media file missing"))?;
+    let len = data.len() as u64;
+    let ctype = if content_type.is_empty() {
+        "application/octet-stream"
+    } else {
+        content_type
+    };
+    if let Some(range) = range.and_then(|v| v.to_str().ok()).and_then(parse_byte_range) {
+        let (start, end) = range;
+        let start = start.min(len.saturating_sub(1));
+        let end = end.unwrap_or(len.saturating_sub(1)).min(len.saturating_sub(1)).max(start);
+        let slice = data[start as usize..=end as usize].to_vec();
+        return Ok(Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, ctype)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{len}"),
+            )
+            .header(header::CONTENT_LENGTH, slice.len())
+            .body(Body::from(slice))
+            .unwrap_or_else(|_| Response::new(Body::empty())));
+    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, ctype)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, len)
+        .body(Body::from(data))
+        .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
+fn parse_byte_range(raw: &str) -> Option<(u64, Option<u64>)> {
+    let spec = raw.strip_prefix("bytes=")?;
+    let spec = spec.split(',').next()?.trim();
+    let (a, b) = spec.split_once('-')?;
+    let start = if a.is_empty() { 0 } else { a.parse().ok()? };
+    let end = if b.is_empty() { None } else { Some(b.parse().ok()?) };
+    Some((start, end))
 }
 
 #[derive(Deserialize)]

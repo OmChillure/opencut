@@ -324,7 +324,9 @@ fn Workspace(id: String) -> Element {
             let mut merged = library.peek().clone();
             for item in remote {
                 if let Some(existing) = merged.iter_mut().find(|m| m.id == item.id) {
-                    if existing.url.is_empty() {
+                    if !item.url.is_empty()
+                        && (existing.url.is_empty() || existing.url.starts_with("blob:"))
+                    {
                         existing.url = item.url;
                     }
                     if existing.duration <= 0.05 && item.duration > 0.05 {
@@ -884,12 +886,18 @@ fn MediaPanel() -> Element {
                                     .await
                                     {
                                         Ok(id) => id,
-                                        Err(_) => uuid::Uuid::now_v7().to_string(),
+                                        Err(err) => {
+                                            crate::toast::try_toast()
+                                                .map(|t| t.error(format!("Import failed: {err}")));
+                                            uuid::Uuid::now_v7().to_string()
+                                        }
                                     };
-                                    let Some(item) = item_from_bytes_id(name, &bytes, media_id)
+                                    let Some(mut item) =
+                                        item_from_bytes_id(name, &bytes, media_id.clone())
                                     else {
                                         continue;
                                     };
+                                    item.url = crate::api::media_file_url(&pid, &item.id);
                                     if matches!(item.kind, MediaKind::Video | MediaKind::Image)
                                         && active.read().is_none()
                                     {

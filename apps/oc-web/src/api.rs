@@ -396,13 +396,20 @@ pub async fn list_media(project_id: &str) -> Result<Vec<MediaItem>, String> {
     Ok(rows
         .into_iter()
         .map(|row| {
-            bind::media_from_api(
-                &value_to_id(row.id),
-                row.filename,
-                &row.content_type,
-                row.duration_ticks,
-                row.play_url,
-            )
+            {
+                let id = value_to_id(row.id);
+                let play = row
+                    .play_url
+                    .filter(|u| !u.is_empty() && !u.starts_with("blob:"))
+                    .unwrap_or_else(|| media_file_url(project_id, &id));
+                bind::media_from_api(
+                    &id,
+                    row.filename,
+                    &row.content_type,
+                    row.duration_ticks,
+                    Some(play),
+                )
+            }
         })
         .collect())
 }
@@ -477,22 +484,28 @@ pub async fn upload_media(
         .map_err(|e| e.to_string())?;
     let media_id = value_to_id(res.media_id);
     if let Some(url) = res.upload_url {
-        client
-            .put(url)
+        if client
+            .put(&url)
             .header("content-type", content_type)
-            .body(bytes)
+            .body(bytes.clone())
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
-        client
-            .post(format!(
-                "{API}/v1/projects/{project_id}/media/{media_id}/complete"
-            ))
-            .send()
-            .await
-            .ok();
+            .and_then(|r| r.error_for_status())
+            .is_ok()
+        {
+            let _ = client
+                .post(format!(
+                    "{API}/v1/projects/{project_id}/media/{media_id}/complete"
+                ))
+                .send()
+                .await;
+            return Ok(media_id);
+        }
     }
+    put_media_bytes(project_id, &media_id, content_type, bytes).await?;
     Ok(media_id)
+}
+
+pub fn media_file_url(project_id: &str, media_id: &str) -> String {
+    format!("{API}/v1/projects/{project_id}/media/{media_id}/file")
 }
