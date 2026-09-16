@@ -12,21 +12,33 @@ use uuid::Uuid;
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,oc_worker=debug,oc_voice=debug,oc_media=info,oc_db=info")
+        }))
         .init();
 
-    let db = oc_db::connect().await.context("database")?;
+    let mut db = oc_db::connect().await.context("database")?;
     oc_db::migrate(&db).await.ok();
     let r2 = R2::from_env().await.ok();
     if r2.is_none() {
         tracing::warn!("R2 not configured — transcribe jobs will fail");
     }
-    tracing::info!("understand = local ffmpeg look + Whisper (no paid STT/vision)");
+    if oc_voice::groq_stt_configured() {
+        tracing::info!("understand = ffmpeg look + Groq Whisper (free, ~8h audio/day)");
+    } else if oc_voice::grok_stt_configured() {
+        tracing::info!("understand = ffmpeg look + Grok STT ($0.10/hour)");
+    } else {
+        tracing::info!(
+            "understand = ffmpeg look + local Whisper (set GROQ_API_KEY for free hosted Whisper)"
+        );
+    }
 
     tracing::info!("worker polling jobs");
+    let mut fail = 0u32;
     loop {
         match oc_db::claim_job(&db).await {
             Ok(Some(job)) => {
+                fail = 0;
                 tracing::info!(id = %job.id, kind = %job.kind, "claimed job");
                 let err = handle(&db, r2.as_ref(), &job.kind, job.payload)
                     .await
@@ -39,14 +51,36 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!("finish job: {e}");
                 }
             }
-            Ok(None) => sleep(Duration::from_millis(750)).await,
+            Ok(None) => {
+                fail = 0;
+                sleep(Duration::from_millis(750)).await;
+            }
             Err(err) => {
-                tracing::error!("claim: {err}");
-                sleep(Duration::from_secs(2)).await;
+                fail = fail.saturating_add(1);
+                tracing::error!(
+                    size = db.size(),
+                    idle = db.num_idle(),
+                    fail,
+                    "claim: {err}"
+                );
+                if err.is_pool_timeout() {
+                    match oc_db::connect().await {
+                        Ok(next) => {
+                            tracing::warn!("reconnected database pool");
+                            db = next;
+                            fail = 0;
+                        }
+                        Err(e) => tracing::error!("reconnect failed: {e}"),
+                    }
+                }
+                let wait = 2u64.saturating_mul(u64::from(fail.min(5)));
+                sleep(Duration::from_secs(wait.max(2))).await;
             }
         }
     }
 }
+
+
 
 #[derive(Deserialize)]
 struct TranscribePayload {
@@ -75,6 +109,8 @@ async fn transcribe(
     r2: Option<&R2>,
     p: TranscribePayload,
 ) -> anyhow::Result<()> {
+    let t0 = std::time::Instant::now();
+    tracing::info!(media = %p.media_id, key = %p.r2_key, "transcribe start");
     if !oc_db::is_r2_object_key(&p.r2_key) {
         oc_db::set_media_status(db, p.media_id, "ready").await?;
         anyhow::bail!("clip not in R2 yet (workspace-only). Re-import or wait for upload.");
@@ -87,6 +123,12 @@ async fn transcribe(
             anyhow::bail!("R2 missing object {}: {e}", p.r2_key);
         }
     };
+    tracing::info!(
+        media = %p.media_id,
+        bytes = bytes.len(),
+        ms = t0.elapsed().as_millis(),
+        "r2 download"
+    );
     let filename = p.r2_key.rsplit('/').next().unwrap_or("audio.bin");
 
     match oc_media::analyze_local(&bytes, filename).await {
@@ -108,16 +150,22 @@ async fn transcribe(
             {
                 tracing::warn!("save look: {e}");
             } else {
-                tracing::info!(look = %look.look, scenes = look.scenes, "looked at clip");
+                tracing::info!(
+                    look = %look.look,
+                    scenes = look.scenes,
+                    ms = t0.elapsed().as_millis(),
+                    "look saved — chat can proceed"
+                );
             }
         }
         Err(e) => tracing::warn!("local look failed: {e}"),
     }
 
+    tracing::info!(media = %p.media_id, "whisper start");
     let transcript = match transcribe_local(&bytes, filename).await {
         Ok(t) => t,
         Err(e) => {
-            tracing::info!("no speech / whisper skipped: {e}");
+            tracing::warn!(media = %p.media_id, "whisper skipped: {e}");
             oc_voice::Transcript {
                 language: None,
                 full_text: String::new(),
@@ -126,9 +174,21 @@ async fn transcribe(
         }
     };
     if transcript.full_text.trim().is_empty() && transcript.cues.is_empty() {
+        tracing::info!(
+            media = %p.media_id,
+            ms = t0.elapsed().as_millis(),
+            "no speech (silent or whisper empty)"
+        );
         oc_db::set_media_status(db, p.media_id, "ready").await?;
         return Ok(());
     }
+    tracing::info!(
+        media = %p.media_id,
+        words = transcript.full_text.split_whitespace().count(),
+        cues = transcript.cues.len(),
+        ms = t0.elapsed().as_millis(),
+        "whisper saved"
+    );
 
     let raw = serde_json::to_value(&transcript)?;
     let cue_rows: Vec<(i64, i64, String, Option<String>)> = transcript

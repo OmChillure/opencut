@@ -1,3 +1,5 @@
+mod edit;
+mod mcp;
 mod routes;
 mod state;
 
@@ -21,8 +23,14 @@ use crate::state::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        return mcp::serve().await;
+    }
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // Crate names are oc_api / oc_providers — not opencut_api.
+            EnvFilter::new("info,oc_api=debug,oc_providers=debug,oc_db=info,tower_http=info")
+        }))
         .init();
 
     let state = AppState::connect().await.context("connect dependencies")?;

@@ -3066,6 +3066,7 @@ dependencies = [
  "anyhow",
  "axum",
  "dotenvy",
+ "futures-util",
  "oc-core",
  "oc-db",
  "oc-media",
@@ -3073,6 +3074,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -3136,6 +3138,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3199,6 +3202,7 @@ dependencies = [
  "serde_json",
  "uuid",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
