@@ -194,6 +194,8 @@ pub struct TimelineClip {
     pub group_id: String,
     pub link_id: String,
     pub disabled: bool,
+    pub transition: String,
+    pub graphic: String,
 }
 
 impl TimelineClip {
@@ -882,6 +884,8 @@ fn push_clip(track: &mut EditorTrack, media_id: String, start: f64, duration: f6
         group_id: String::new(),
         link_id: String::new(),
         disabled: false,
+        transition: String::new(),
+        graphic: String::new(),
     });
 }
 
@@ -912,6 +916,8 @@ fn split_track_at(track: &mut EditorTrack, at: f64) {
                 group_id: clip.group_id.clone(),
                 link_id: clip.link_id.clone(),
                 disabled: clip.disabled,
+                transition: clip.transition.clone(),
+                graphic: clip.graphic.clone(),
             });
             next.push(TimelineClip {
                 id: Uuid::now_v7().to_string(),
@@ -923,6 +929,8 @@ fn split_track_at(track: &mut EditorTrack, at: f64) {
                 group_id: clip.group_id,
                 link_id: clip.link_id,
                 disabled: clip.disabled,
+                transition: String::new(),
+                graphic: clip.graphic,
             });
         } else {
             next.push(clip);
@@ -1066,6 +1074,7 @@ thread_local! {
     static LAST_TICK_MS: Cell<f64> = const { Cell::new(0.0) };
     static LAST_PLAY_MS: Cell<f64> = const { Cell::new(0.0) };
     static LAST_SEEK_MS: Cell<f64> = const { Cell::new(0.0) };
+    static FRONT_IS_B: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn playhead_now() -> f64 {
@@ -1105,37 +1114,22 @@ pub struct ProgramShot {
 }
 
 pub fn clip_under(tracks: &[EditorTrack], library: &[MediaItem], time: f64) -> Option<ProgramShot> {
-    for track in display_tracks(tracks) {
+    let mut best: Option<&TimelineClip> = None;
+    for track in tracks {
         if track.hidden || track.kind != TrackKindUi::Video {
             continue;
         }
-        // If a placeholder duration was later stretched over later clips,
-        // pick the latest-starting clip that still covers this time.
-        let Some(clip) = track
-            .clips
-            .iter()
-            .filter(|clip| {
-                !clip.disabled && time + 1e-4 >= clip.start && time < clip.end()
-            })
-            .max_by(|a, b| {
-                a.start
-                    .partial_cmp(&b.start)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        else {
-            continue;
-        };
-        let item = library.iter().find(|item| item.id == clip.media_id)?;
-        return Some(ProgramShot {
-            media_id: item.id.clone(),
-            url: item.url.clone(),
-            kind: item.kind,
-            start: clip.start,
-            source_in: clip.source_in,
-            duration: clip.duration,
-        });
+        for clip in &track.clips {
+            if clip.disabled || time + 1e-4 < clip.start || time >= clip.end() {
+                continue;
+            }
+            // Later start wins (V2 over a V1 tail). Same start → later track.
+            if best.is_none_or(|b| clip.start + 1e-6 >= b.start) {
+                best = Some(clip);
+            }
+        }
     }
-    None
+    shot_from(library, best?)
 }
 
 pub fn video_duration_from_src(src: &str) -> Option<f64> {
@@ -1157,14 +1151,120 @@ pub fn video_duration_from_src(src: &str) -> Option<f64> {
     None
 }
 
-pub fn preview_video() -> Option<HtmlVideoElement> {
+fn query_video(selector: &str) -> Option<HtmlVideoElement> {
     web_sys::window()?
         .document()?
-        .query_selector(".preview-video")
+        .query_selector(selector)
         .ok()
         .flatten()?
         .dyn_into::<HtmlVideoElement>()
         .ok()
+}
+
+fn front_is_b() -> bool {
+    FRONT_IS_B.with(Cell::get)
+}
+
+fn swap_program() {
+    FRONT_IS_B.with(|c| c.set(!c.get()));
+}
+
+pub fn preview_video() -> Option<HtmlVideoElement> {
+    if front_is_b() {
+        query_video(".preview-video-b")
+    } else {
+        query_video(".preview-video")
+    }
+}
+
+fn standby_video() -> Option<HtmlVideoElement> {
+    if front_is_b() {
+        query_video(".preview-video")
+    } else {
+        query_video(".preview-video-b")
+    }
+}
+
+pub fn following_shot(
+    tracks: &[EditorTrack],
+    library: &[MediaItem],
+    time: f64,
+) -> Option<ProgramShot> {
+    let cur = clip_under(tracks, library, time)?;
+    let cur_end = cur.start + cur.duration;
+    let mut join: Option<(f64, String)> = None;
+    let mut later: Option<(f64, String)> = None;
+    for track in tracks {
+        if track.hidden || track.kind != TrackKindUi::Video {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.disabled || clip.start <= cur.start + 0.04 {
+                continue;
+            }
+            if is_join_ui(cur.start, cur_end, clip.start) {
+                if join.as_ref().is_none_or(|(s, _)| clip.start < *s) {
+                    join = Some((clip.start, clip.id.clone()));
+                }
+            } else if clip.start >= cur_end - 0.05 {
+                if later.as_ref().is_none_or(|(s, _)| clip.start < *s) {
+                    later = Some((clip.start, clip.id.clone()));
+                }
+            }
+        }
+    }
+    let id = join.or(later).map(|(_, id)| id)?;
+    let clip = tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .find(|c| c.id == id)?;
+    shot_from(library, clip)
+}
+
+fn is_join_ui(a_start: f64, a_end: f64, b_start: f64) -> bool {
+    b_start > a_start + 0.05 && b_start < a_end + 0.2 && b_start > a_end - 1.2
+}
+
+fn shot_from(library: &[MediaItem], clip: &TimelineClip) -> Option<ProgramShot> {
+    let item = library.iter().find(|item| item.id == clip.media_id)?;
+    Some(ProgramShot {
+        media_id: item.id.clone(),
+        url: item.url.clone(),
+        kind: item.kind,
+        start: clip.start,
+        source_in: clip.source_in,
+        duration: clip.duration,
+    })
+}
+
+fn contiguous_source(a: &ProgramShot, b: &ProgramShot) -> bool {
+    a.media_id == b.media_id
+        && (a.source_in + a.duration - b.source_in).abs() < 0.08
+}
+
+fn preroll(video: &HtmlVideoElement, shot: &ProgramShot) {
+    let loaded = video.get_attribute("data-media").unwrap_or_default();
+    if loaded != shot.media_id {
+        let _ = video.set_attribute("data-media", &shot.media_id);
+        video.set_src(&shot.url);
+        video.set_muted(true);
+        return;
+    }
+    if video.ready_state() >= 2 {
+        let drift = (video.current_time() - shot.source_in).abs();
+        if drift > 0.08 {
+            video.set_current_time(shot.source_in.max(0.0));
+        }
+    }
+    if !video.paused() {
+        video.pause();
+    }
+}
+
+fn preroll_ready(video: &HtmlVideoElement, shot: &ProgramShot) -> bool {
+    video.get_attribute("data-media").unwrap_or_default() == shot.media_id
+        && video.ready_state() >= 2
+        && (video.current_time() - shot.source_in).abs() < 0.2
 }
 
 fn set_class_off(selector: &str, off: bool) {
@@ -1192,8 +1292,260 @@ fn seek_video(video: &HtmlVideoElement, time: f64, force: bool) {
     video.set_current_time(time.max(0.0));
 }
 
+pub fn css_filter(grade: oc_core::Grade, fx: oc_core::Fx) -> String {
+    let b = (1.0 + grade.exposure).clamp(0.2, 2.4);
+    let c = (1.0 + grade.contrast).clamp(0.2, 2.4);
+    let s = (1.0 + grade.saturation).clamp(0.0, 2.4);
+    let hue = grade.temperature * 18.0;
+    let blur = fx.blur * 8.0;
+    format!("brightness({b:.3}) contrast({c:.3}) saturate({s:.3}) hue-rotate({hue:.1}deg) blur({blur:.2}px)")
+}
+
+fn mix_preview_css(
+    kind: oc_core::TransitionKind,
+    mix: f64,
+    opacity: f64,
+    filter: &str,
+) -> (f64, String, String, String) {
+    if mix <= 0.0 || kind == oc_core::TransitionKind::Cut {
+        return (opacity, "none".into(), "none".into(), filter.into());
+    }
+    if let Some((dx, dy)) = kind.slide_delta() {
+        return (
+            opacity,
+            format!("translate({:.1}%, {:.1}%)", dx * mix * 100.0, dy * mix * 100.0),
+            "none".into(),
+            filter.into(),
+        );
+    }
+    if let Some(clip) = kind.wipe_inset(mix) {
+        return (opacity, "none".into(), clip, filter.into());
+    }
+    match kind {
+        oc_core::TransitionKind::FadeBlack => {
+            let dip = 1.0 - (2.0 * mix - 1.0).abs();
+            let f = format!("{filter} brightness({:.3})", (1.0 - dip).max(0.05));
+            ((opacity * (1.0 - mix)).clamp(0.0, 1.0), "none".into(), "none".into(), f)
+        }
+        oc_core::TransitionKind::FadeWhite => {
+            let f = format!("{filter} brightness({:.3})", 1.0 + mix);
+            ((opacity * (1.0 - mix)).clamp(0.0, 1.0), "none".into(), "none".into(), f)
+        }
+        oc_core::TransitionKind::CircleOpen => {
+            let r = mix * 80.0;
+            (
+                opacity,
+                "none".into(),
+                format!("circle({r:.1}% at 50% 50%)"),
+                filter.into(),
+            )
+        }
+        oc_core::TransitionKind::CircleClose => {
+            let r = (1.0 - mix) * 80.0;
+            (
+                opacity,
+                "none".into(),
+                format!("circle({r:.1}% at 50% 50%)"),
+                filter.into(),
+            )
+        }
+        oc_core::TransitionKind::Radial => {
+            let r = mix * 100.0;
+            (
+                opacity,
+                "none".into(),
+                format!("circle({r:.1}% at 50% 50%)"),
+                filter.into(),
+            )
+        }
+        oc_core::TransitionKind::Pixelize => {
+            let f = format!("{filter} contrast({:.2}) saturate({:.2})", 1.0 + mix, 1.0 - mix * 0.4);
+            ((opacity * (1.0 - mix * 0.5)).clamp(0.0, 1.0), "none".into(), "none".into(), f)
+        }
+        _ => (
+            (opacity * (1.0 - mix)).clamp(0.0, 1.0),
+            "none".into(),
+            "none".into(),
+            filter.into(),
+        ),
+    }
+}
+
+fn incoming_preview_css(kind: oc_core::TransitionKind, mix: f64) -> (f64, String) {
+    if let Some((dx, dy)) = kind.slide_delta() {
+        return (
+            1.0,
+            format!(
+                "translate({:.1}%, {:.1}%)",
+                -dx * (1.0 - mix) * 100.0,
+                -dy * (1.0 - mix) * 100.0
+            ),
+        );
+    }
+    match kind {
+        oc_core::TransitionKind::FadeBlack | oc_core::TransitionKind::FadeWhite => {
+            (mix.clamp(0.0, 1.0), "none".into())
+        }
+        oc_core::TransitionKind::Cut => (0.0, "none".into()),
+        _ => (mix.clamp(0.15, 1.0), "none".into()),
+    }
+}
+
+pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let t = oc_core::Time::from_seconds(now);
+    let mut filter = "none".to_string();
+    let mut opacity = 1.0_f64;
+    let mut mix = 0.0_f64;
+    let mut kind = oc_core::TransitionKind::Cut;
+    let mut vignette = 0.0_f32;
+    let mut grain = 0.0_f32;
+    let mut volume = 1.0_f64;
+    let mut graphics: Vec<(String, String)> = Vec::new();
+    let mut next_url = String::new();
+    let mut next_src = 0.0_f64;
+
+    for track in &engine.tracks {
+        if track.hidden || track.muted {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.disabled || !clip.contains(t) {
+                continue;
+            }
+            let local = (t - clip.start).as_seconds();
+            let fade = clip.look.fade_gain(local, clip.duration.as_seconds());
+            match &clip.kind {
+                oc_core::ClipKind::Video { .. } => {
+                    filter = css_filter(clip.look.grade, clip.look.fx);
+                    opacity = fade;
+                    vignette = clip.look.fx.vignette;
+                    grain = clip.look.fx.grain;
+                    kind = clip.look.transition;
+                    let next = engine.tracks.iter().flat_map(|t| t.clips.iter()).find(|other| {
+                        other.id != clip.id
+                            && matches!(other.kind, oc_core::ClipKind::Video { .. })
+                            && !other.disabled
+                            && is_join_ui(
+                                clip.start.as_seconds(),
+                                clip.end().as_seconds(),
+                                other.start.as_seconds(),
+                            )
+                    });
+                    let dur = next
+                        .map(|n| {
+                            clip.look
+                                .mix_window(clip.duration.as_seconds(), n.duration.as_seconds())
+                        })
+                        .unwrap_or(0.0);
+                    if dur > 1e-4 {
+                        let start = clip.end().as_seconds() - dur;
+                        if now >= start && now < clip.end().as_seconds() {
+                            if let Some(other) = next {
+                                mix = ((now - start) / dur).clamp(0.0, 1.0);
+                                if let Some(id) = other.media_id {
+                                    if let Some(item) =
+                                        library.iter().find(|m| m.id == id.to_string())
+                                    {
+                                        next_url = item.url.clone();
+                                        next_src = other.source_in.as_seconds()
+                                            + (now - other.start.as_seconds()).max(0.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                oc_core::ClipKind::Audio { volume: v, ducked } => {
+                    let duck = if *ducked { 0.3 } else { 1.0 };
+                    volume = fade * f64::from(*v) * duck;
+                }
+                oc_core::ClipKind::Graphic { graphic } => {
+                    let cls = match graphic.kind {
+                        oc_core::GraphicKind::Title => "title",
+                        oc_core::GraphicKind::LowerThird => "lower",
+                        oc_core::GraphicKind::Card => "card-gfx",
+                        oc_core::GraphicKind::Shape => "shape",
+                        oc_core::GraphicKind::Sticker => "sticker",
+                    };
+                    graphics.push((cls.into(), graphic.text.clone()));
+                }
+                oc_core::ClipKind::Caption { style: _, cues } => {
+                    let local_t = oc_core::Time::from_ticks((t - clip.start).as_ticks());
+                    if let Some(cue) = cues.iter().find(|c| local_t >= c.start && local_t < c.end) {
+                        graphics.push(("caption".into(), cue.text.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(video) = preview_video() {
+        let (a, transform, clip_path, extra_filter) = mix_preview_css(kind, mix, opacity, &filter);
+        let _ = video.set_attribute(
+            "style",
+            &format!(
+                "filter:{extra_filter};opacity:{a:.3};transform:{transform};clip-path:{clip_path}"
+            ),
+        );
+        video.set_volume(volume.clamp(0.0, 1.0));
+    }
+
+    if let Some(b) = standby_video() {
+        let show = mix > 0.0 && kind != oc_core::TransitionKind::Cut && !next_url.is_empty();
+        let standby_sel = if front_is_b() {
+            ".preview-video"
+        } else {
+            ".preview-video-b"
+        };
+        set_class_off(standby_sel, !show);
+        if show {
+            if b.get_attribute("data-url").unwrap_or_default() != next_url {
+                let _ = b.set_attribute("data-url", &next_url);
+                if b.get_attribute("data-media").unwrap_or_default().is_empty() {
+                    b.set_src(&next_url);
+                }
+            }
+            if b.ready_state() >= 2 && (b.current_time() - next_src).abs() > 0.12 {
+                b.set_current_time(next_src.max(0.0));
+            }
+            let (b_op, b_tf) = incoming_preview_css(kind, mix);
+            let _ = b.set_attribute("style", &format!("opacity:{b_op:.3};transform:{b_tf}"));
+        }
+    }
+
+    if let Some(el) = doc.query_selector(".preview-vignette").ok().flatten() {
+        let _ = el.set_attribute(
+            "style",
+            &format!(
+                "box-shadow: inset 0 0 {}px rgba(0,0,0,{:.2})",
+                80.0 + vignette * 140.0,
+                vignette * 0.85
+            ),
+        );
+        set_class_off(".preview-vignette", vignette < 0.02);
+    }
+    if let Some(el) = doc.query_selector(".preview-grain").ok().flatten() {
+        let _ = el.set_attribute("style", &format!("opacity:{:.2}", grain));
+        set_class_off(".preview-grain", grain < 0.02);
+    }
+    if let Some(layer) = doc.query_selector(".preview-gfx").ok().flatten() {
+        layer.set_inner_html("");
+        for (cls, text) in graphics {
+            if let Some(node) = doc.create_element("div").ok() {
+                let _ = node.set_attribute("class", &format!("gfx {cls}"));
+                node.set_text_content(Some(&text));
+                let _ = layer.append_child(&node);
+            }
+        }
+    }
+}
+
 pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, playing: bool) {
     let shot = clip_under(tracks, library, now);
+    let next = following_shot(tracks, library, now);
     let video = preview_video();
     match shot {
         None => {
@@ -1201,6 +1553,7 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
                 video.pause();
             }
             set_class_off(".preview-video", true);
+            set_class_off(".preview-video-b", true);
             set_class_off(".preview-image", true);
             set_class_off(".monitor-blank", false);
         }
@@ -1215,16 +1568,25 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
                 let _ = img.set_attribute("src", &shot.url);
             }
             set_class_off(".preview-video", true);
+            set_class_off(".preview-video-b", true);
             set_class_off(".preview-image", false);
             set_class_off(".monitor-blank", true);
         }
         Some(shot) => {
             let Some(video) = video else { return };
+            if let Some(standby) = standby_video() {
+                if let Some(next) = &next {
+                    if next.kind == MediaKind::Video {
+                        preroll(&standby, next);
+                    }
+                }
+            }
             let loaded = video.get_attribute("data-media").unwrap_or_default();
             let media_changed = loaded != shot.media_id;
             if media_changed {
                 let _ = video.set_attribute("data-media", &shot.media_id);
                 video.set_src(&shot.url);
+                video.set_muted(false);
                 LAST_PLAY_MS.with(|cell| cell.set(0.0));
                 LAST_SEEK_MS.with(|cell| cell.set(0.0));
             }
@@ -1236,38 +1598,71 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
             let paused = video.paused();
             let drift = (video.current_time() - src_time).abs();
             let since_play = js_sys::Date::now() - LAST_PLAY_MS.with(Cell::get);
-            let take_over = video.current_time() >= src_end - 0.02;
+            let near_end = now >= shot.start + take - 0.05
+                || (ready && video.current_time() >= src_end - 0.04);
+            let keep_rolling = next
+                .as_ref()
+                .is_some_and(|n| contiguous_source(&shot, n));
 
             if !playing {
                 video.pause();
                 if ready && drift > 0.04 {
                     seek_video(&video, src_time, false);
                 }
-            } else if take_over && ready {
-                video.pause();
-                set_playhead(shot.start + take);
-                LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
+            } else if near_end && ready {
+                if keep_rolling {
+                    if let Some(n) = &next {
+                        set_playhead(n.start.max(now) + 1e-3);
+                        LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
+                    }
+                } else if next.as_ref().is_some_and(|n| {
+                    n.kind == MediaKind::Video
+                        && standby_video().is_some_and(|s| preroll_ready(&s, n))
+                }) {
+                    if let Some(n) = &next {
+                        if let Some(standby) = standby_video() {
+                            standby.set_muted(false);
+                            let _ = standby.play();
+                        }
+                        video.pause();
+                        video.set_muted(true);
+                        swap_program();
+                        set_playhead(n.start.max(now) + 1e-3);
+                        LAST_PLAY_MS.with(|cell| cell.set(js_sys::Date::now()));
+                        LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
+                    }
+                } else if let Some(n) = &next {
+                    set_playhead(n.start.max(now) + 1e-3);
+                    LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
+                } else {
+                    video.pause();
+                    set_playhead(shot.start + take);
+                    LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
+                }
             } else if paused {
                 if ready && (media_changed || drift > 0.08) {
                     seek_video(&video, src_time, media_changed);
                 }
-                if ready && since_play > 180.0 {
+                if ready && since_play > 40.0 {
                     LAST_PLAY_MS.with(|cell| cell.set(js_sys::Date::now()));
+                    video.set_muted(false);
                     let _ = video.play();
                 }
             } else if ready && drift > 0.45 && since_play > 250.0 {
                 seek_video(&video, src_time, false);
             }
 
-            if playing && !paused && ready && !take_over {
+            if playing && !paused && ready && !near_end {
                 let derived = shot.start + (video.current_time() - shot.source_in);
-                if derived.is_finite() {
-                    set_playhead(derived.clamp(shot.start, shot.start + take - 1e-3));
+                if derived.is_finite() && derived + 0.02 >= now {
+                    set_playhead(derived.clamp(shot.start.max(now), shot.start + take - 1e-3));
                     LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                 }
             }
 
-            set_class_off(".preview-video", false);
+            let a_front = !front_is_b();
+            set_class_off(".preview-video", !a_front);
+            set_class_off(".preview-video-b", a_front);
             set_class_off(".preview-image", true);
             set_class_off(".monitor-blank", true);
         }
@@ -1362,13 +1757,19 @@ mod tests {
             group_id: String::new(),
             link_id: String::new(),
             disabled: false,
+            transition: String::new(),
+            graphic: String::new(),
         }
     }
 
     fn video_track(clips: Vec<TimelineClip>) -> EditorTrack {
+        video_track_named("v1", "V1", clips)
+    }
+
+    fn video_track_named(id: &str, name: &str, clips: Vec<TimelineClip>) -> EditorTrack {
         EditorTrack {
-            id: "v1".into(),
-            name: "V1".into(),
+            id: id.into(),
+            name: name.into(),
             kind: TrackKindUi::Video,
             muted: false,
             hidden: false,
@@ -1411,6 +1812,62 @@ mod tests {
         ])];
         let shot = clip_under(&tracks, &library, 6.0).unwrap();
         assert_eq!(shot.media_id, "b");
+    }
+
+    #[test]
+    fn following_shot_is_the_next_take() {
+        let library = vec![item("a", "blob:a", 40.0), item("b", "blob:b", 8.0)];
+        let tracks = vec![video_track(vec![
+            clip("c1", "a", 0.0, 4.0),
+            clip("c2", "b", 4.0, 4.0),
+        ])];
+        let next = following_shot(&tracks, &library, 2.0).unwrap();
+        assert_eq!(next.media_id, "b");
+        assert!((next.start - 4.0).abs() < 1e-6);
+        assert!(following_shot(&tracks, &library, 5.0).is_none());
+    }
+
+    #[test]
+    fn contiguous_excerpts_keep_rolling() {
+        let a = ProgramShot {
+            media_id: "x".into(),
+            url: "blob:x".into(),
+            kind: MediaKind::Video,
+            start: 0.0,
+            source_in: 10.0,
+            duration: 4.0,
+        };
+        let b = ProgramShot {
+            media_id: "x".into(),
+            url: "blob:x".into(),
+            kind: MediaKind::Video,
+            start: 4.0,
+            source_in: 14.0,
+            duration: 3.0,
+        };
+        let c = ProgramShot {
+            media_id: "x".into(),
+            url: "blob:x".into(),
+            kind: MediaKind::Video,
+            start: 7.0,
+            source_in: 30.0,
+            duration: 2.0,
+        };
+        assert!(contiguous_source(&a, &b));
+        assert!(!contiguous_source(&b, &c));
+    }
+
+    #[test]
+    fn overlap_prefers_later_track_clip() {
+        let library = vec![item("a", "blob:a", 40.0), item("b", "blob:b", 20.0)];
+        let tracks = vec![
+            video_track(vec![clip("c1", "a", 0.0, 8.0)]),
+            video_track_named("v2", "V2", vec![clip("c2", "b", 7.0, 12.0)]),
+        ];
+        let shot = clip_under(&tracks, &library, 7.4).unwrap();
+        assert_eq!(shot.media_id, "b", "V2 must win the overlap, not V1");
+        let next = following_shot(&tracks, &library, 6.0).unwrap();
+        assert_eq!(next.media_id, "b");
     }
 }
 

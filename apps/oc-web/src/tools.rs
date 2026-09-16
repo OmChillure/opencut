@@ -1,7 +1,10 @@
 use crate::bind;
 use crate::{WorkspaceSave, api};
 use dioxus::prelude::*;
-use oc_core::{ClipId, Duration, Intent, Op, Time, TrackId, UndoStack, apply, parse_intent};
+use oc_core::{
+    ClipId, Duration, Fx, Grade, Graphic, Intent, Op, Time, TrackId, TransitionKind,
+    UndoStack, apply, parse_intent,
+};
 use uuid::Uuid;
 
 pub fn run_ops(mut save: WorkspaceSave, ops: Vec<Op>) -> Result<Vec<String>, String> {
@@ -126,14 +129,25 @@ pub fn trim_end_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<S
 }
 
 fn clip_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<ClipId, String> {
-    let at = Time::from_seconds(at);
+    let at_t = Time::from_seconds(at);
     let tl = save.engine.peek();
-    match parse_track_id(track_id).and_then(|id| tl.clip_at(id, at)) {
-        Some(id) => Ok(id),
-        None => tl
-            .clip_at_any(at)
-            .ok_or_else(|| "no clip at the playhead".to_string()),
+    if let Some(id) = parse_track_id(track_id).and_then(|id| tl.clip_at(id, at_t)) {
+        return Ok(id);
     }
+    if let Some(id) = tl.clip_at_any(at_t) {
+        return Ok(id);
+    }
+    drop(tl);
+    // UI tracks can be ahead of a stale engine after a local drop.
+    let tracks = save.tracks.peek();
+    let from_ui = tracks
+        .iter()
+        .flat_map(|track| track.clips.iter().map(move |c| (track.id.as_str(), c)))
+        .find(|(_, clip)| at + 1e-4 >= clip.start && at < clip.end())
+        .and_then(|(_, clip)| parse_clip_id(&clip.id));
+    from_ui.ok_or_else(|| {
+        "no clip at the playhead — click the shot, then apply the mix".to_string()
+    })
 }
 
 pub fn delete_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<String>, String> {
@@ -311,6 +325,146 @@ pub fn multicam_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<S
             at: Time::from_seconds(at),
         }],
     )
+}
+
+pub fn sync_engine_from_tracks(mut save: WorkspaceSave) {
+    let engine = save.engine.peek().clone();
+    let next = bind::timeline_from_tracks(
+        &save.tracks.peek(),
+        &engine,
+        engine.width,
+        engine.height,
+    );
+    save.engine.set(next);
+}
+
+pub fn selected_or_playhead(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+) -> Result<ClipId, String> {
+    sync_engine_from_tracks(save);
+    if let Some(raw) = selected {
+        if let Some(id) = parse_clip_id(raw) {
+            if save.engine.peek().find_clip(id).is_some() {
+                return Ok(id);
+            }
+        }
+    }
+    clip_at(save, track_id, at)
+}
+
+pub fn set_transition_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    kind: TransitionKind,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    let mut notes = run_ops(save, vec![Op::SetTransition { clip_id, kind }])?;
+    let has_next = save.engine.peek().tracks.iter().any(|track| {
+        let Some(i) = track.clips.iter().position(|c| c.id == clip_id) else {
+            return false;
+        };
+        track
+            .clips
+            .get(i + 1)
+            .is_some_and(|n| (n.start - track.clips[i].end()).as_seconds().abs() < 0.08)
+    });
+    if kind != TransitionKind::Cut && !has_next {
+        notes.push(
+            "applied — add or split a following shot so the mix has something to blend into"
+                .into(),
+        );
+    } else if kind != TransitionKind::Cut {
+        notes.push("play across the join to see it".into());
+    }
+    Ok(notes)
+}
+
+pub fn set_grade_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    grade: Grade,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(save, vec![Op::SetGrade { clip_id, grade }])
+}
+
+pub fn set_fx_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    fx: Fx,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(save, vec![Op::SetFx { clip_id, fx }])
+}
+
+pub fn set_fade_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    fade: f64,
+) -> Result<Vec<String>, String> {
+    set_fade_ends(save, selected, track_id, at, fade, fade)
+}
+
+pub fn set_fade_ends(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    fade_in: f64,
+    fade_out: f64,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(
+        save,
+        vec![Op::SetFade {
+            clip_id,
+            fade_in: Duration::from_seconds(fade_in),
+            fade_out: Duration::from_seconds(fade_out),
+        }],
+    )
+}
+
+pub fn set_volume_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    volume: f32,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(save, vec![Op::SetVolume { clip_id, volume }])
+}
+
+pub fn add_graphic_at(
+    save: WorkspaceSave,
+    at: f64,
+    graphic: Graphic,
+    duration: f64,
+) -> Result<Vec<String>, String> {
+    run_ops(
+        save,
+        vec![Op::AddGraphic {
+            graphic,
+            start: Time::from_seconds(at),
+            duration: Duration::from_seconds(duration),
+            track_id: None,
+        }],
+    )
+}
+
+pub fn duck_at(save: WorkspaceSave) -> Result<Vec<String>, String> {
+    run_ops(save, vec![Op::Duck { amount: 0.7 }])
 }
 
 fn parse_track_id(raw: &str) -> Option<TrackId> {

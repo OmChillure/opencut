@@ -1,8 +1,8 @@
 use crate::media::{EditorTrack, MediaItem, MediaKind, TimelineClip, TrackKindUi};
 use oc_core::time::TICKS_PER_SECOND;
 use oc_core::{
-    Clip, ClipId, Duration, GroupId, LinkId, MediaId, Time, Timeline, Track, TrackId, TrackKind,
-    timeline::ClipKind,
+    Clip, ClipId, Duration, GroupId, LinkId, MediaId, Time, Timeline, Track, TrackId,
+    TrackKind, timeline::ClipKind,
 };
 use uuid::Uuid;
 
@@ -32,6 +32,22 @@ pub fn tracks_from_timeline(timeline: &Timeline) -> Vec<EditorTrack> {
                     group_id: clip.group_id.map(|id| id.to_string()).unwrap_or_default(),
                     link_id: clip.link_id.map(|id| id.to_string()).unwrap_or_default(),
                     disabled: clip.disabled,
+                    transition: clip.look.transition.label().to_ascii_lowercase(),
+                    graphic: match &clip.kind {
+                        ClipKind::Graphic { graphic } => {
+                            if graphic.text.is_empty() {
+                                "shape".into()
+                            } else {
+                                graphic.text.clone()
+                            }
+                        }
+                        _ => clip
+                            .look
+                            .graphic
+                            .as_ref()
+                            .map(|g| g.text.clone())
+                            .unwrap_or_default(),
+                    },
                 })
                 .collect(),
         })
@@ -73,9 +89,11 @@ pub fn timeline_from_tracks(
 fn clip_from_ui(clip: &TimelineClip, kind: TrackKindUi, prev: &Timeline) -> Clip {
     let id = parse_clip_id(&clip.id);
     let prev_kind = prev.find_clip(id).map(|(_, c)| c.kind.clone());
+    let look = prev.find_clip(id).map(|(_, c)| c.look.clone()).unwrap_or_default();
     let kind = match kind {
         TrackKindUi::Video => match prev_kind {
             Some(k @ ClipKind::Video { .. }) => k,
+            Some(k @ ClipKind::Graphic { .. }) => k,
             _ => ClipKind::Video {
                 transform: Default::default(),
             },
@@ -111,6 +129,7 @@ fn clip_from_ui(clip: &TimelineClip, kind: TrackKindUi, prev: &Timeline) -> Clip
         group_id: parse_group(&clip.group_id).or_else(|| prev_clip.and_then(|c| c.group_id)),
         link_id: parse_link(&clip.link_id).or_else(|| prev_clip.and_then(|c| c.link_id)),
         disabled: clip.disabled,
+        look,
     }
 }
 

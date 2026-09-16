@@ -3,6 +3,7 @@ mod auth;
 mod bind;
 mod media;
 mod pages;
+mod toast;
 mod tools;
 
 use dioxus::prelude::*;
@@ -12,14 +13,18 @@ use media::{
     display_tracks, film_tiles, fit_scale, format_clock, format_tc_short,
     item_from_bytes_id, lane_height, next_track_name, paint_clock, paint_playhead, place_clip,
     playhead_now, preview_video, reset_tick_clock, ruler_marks_nle, scroll_left,
+    apply_monitor_look,
     seek_by, max_timeline_h, set_media_duration, sync_monitor, timeline_end,
     timeline_viewport_h, timeline_viewport_w, update_drag, wave_bars,
     capture_pointer, clamp_pps, video_duration_from_src,
 };
-use oc_core::{Op, Timeline as EngineTimeline, TrackKind};
+use oc_core::{
+    Fx, Grade, Graphic, Op, Timeline as EngineTimeline, TrackKind, TransitionKind,
+};
 use oc_core::TimelineEditMode;
 use oc_tools::{ToolId, actions as cut_actions, modes as edit_tools, track_actions};
 use pages::{Login, NewProject, Projects};
+use toast::{ToastProvider, show_toast};
 
 const CSS: &str = include_str!("../assets/style.css");
 
@@ -42,17 +47,19 @@ enum AssetTab {
     Captions,
     Audio,
     Elements,
+    Transitions,
     Visuals,
     Settings,
 }
 
 impl AssetTab {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Media,
         Self::Text,
         Self::Captions,
         Self::Audio,
         Self::Elements,
+        Self::Transitions,
         Self::Visuals,
         Self::Settings,
     ];
@@ -64,6 +71,7 @@ impl AssetTab {
             Self::Captions => "Captions",
             Self::Audio => "Audio",
             Self::Elements => "Elements",
+            Self::Transitions => "Transitions",
             Self::Visuals => "Visuals",
             Self::Settings => "Settings",
         }
@@ -210,7 +218,9 @@ fn main() {
 fn App() -> Element {
     rsx! {
         style { "{CSS}" }
-        Router::<Route> {}
+        ToastProvider {
+            Router::<Route> {}
+        }
     }
 }
 
@@ -243,6 +253,7 @@ fn Workspace(id: String) -> Element {
     let mut tl_drag = use_signal(|| None::<(f64, f64)>);
     let persist_q = use_signal(Vec::<Vec<Op>>::new);
     let persist_busy = use_signal(|| false);
+    let selected_clip = use_signal(|| None::<String>);
     let clock = Clock {
         current,
         duration,
@@ -257,6 +268,8 @@ fn Workspace(id: String) -> Element {
         persist_busy,
     };
 
+    use_context_provider(|| tab);
+    use_context_provider(|| aspect);
     use_context_provider(|| library);
     use_context_provider(|| tracks);
     use_context_provider(|| active);
@@ -271,6 +284,7 @@ fn Workspace(id: String) -> Element {
     use_context_provider(|| tl_h);
     use_context_provider(|| tl_drag);
     use_context_provider(|| save);
+    use_context_provider(|| selected_clip);
 
     use_effect(move || {
         if !auth::is_signed_in() {
@@ -338,6 +352,7 @@ fn Workspace(id: String) -> Element {
             let span = timeline_end(&tracks.peek()).max(*clock.duration.peek()).max(0.1);
             let before = playhead_now();
             sync_monitor(&library.peek(), &tracks.peek(), before, true);
+            apply_monitor_look(&engine.peek(), &library.peek(), playhead_now().max(before));
             let now = if let Some(shot) = crate::media::clip_under(
                 &tracks.peek(),
                 &library.peek(),
@@ -474,6 +489,8 @@ fn drag_chip(drag: Signal<Option<DragSession>>) -> Element {
 #[component]
 fn Header(name: Signal<String>) -> Element {
     let project_id = use_context::<Signal<String>>();
+    let save = use_context::<WorkspaceSave>();
+    let aspect = use_context::<Signal<Aspect>>();
     rsx! {
         header { class: "header",
             div { class: "header-left",
@@ -511,7 +528,23 @@ fn Header(name: Signal<String>) -> Element {
                     },
                     "Delete"
                 }
-                button { class: "btn btn-primary", "Export" }
+                button {
+                    class: "btn btn-primary",
+                    onclick: move |_| {
+                        let preset = match *aspect.peek() {
+                            Aspect::Vertical => oc_core::ExportPreset::Vertical1080,
+                            Aspect::Square => oc_core::ExportPreset::Square1080,
+                            _ => oc_core::ExportPreset::Youtube1080,
+                        };
+                        match crate::tools::run_ops(save, vec![oc_core::Op::Export { preset }]) {
+                            Ok(_) => show_toast().success(
+                                "Export queued — worker writes an MP4 under data/exports.",
+                            ),
+                            Err(err) => show_toast().error(err),
+                        }
+                    },
+                    "Export"
+                }
             }
         }
     }
@@ -537,7 +570,7 @@ fn Assets(tab: Signal<AssetTab>) -> Element {
             } else {
                 div { class: "assets-body",
                     div { class: "assets-title", "{current.label()}" }
-                    {asset_view(current)}
+                    AssetView { tab: current }
                 }
             }
         }
@@ -551,27 +584,128 @@ fn tab_icon(tab: AssetTab) -> Element {
         AssetTab::Captions => rsx! { IconCaptions {} },
         AssetTab::Audio => rsx! { IconWave {} },
         AssetTab::Elements => rsx! { IconShapes {} },
+        AssetTab::Transitions => rsx! { IconTransition {} },
         AssetTab::Visuals => rsx! { IconSliders {} },
         AssetTab::Settings => rsx! { IconGear {} },
     }
 }
 
-fn asset_view(tab: AssetTab) -> Element {
+fn mix_preview_class(kind: TransitionKind) -> &'static str {
+    match kind {
+        TransitionKind::Cut => "cut",
+        TransitionKind::Dissolve => "dissolve",
+        TransitionKind::FadeBlack => "fadeblack",
+        TransitionKind::FadeWhite => "fadewhite",
+        TransitionKind::Slide | TransitionKind::SlideRight => "slide-r",
+        TransitionKind::SlideLeft => "slide-l",
+        TransitionKind::SlideUp => "slide-u",
+        TransitionKind::SlideDown => "slide-d",
+        TransitionKind::Wipe | TransitionKind::WipeLeft | TransitionKind::SmoothLeft => "wipe-l",
+        TransitionKind::WipeRight | TransitionKind::SmoothRight => "wipe-r",
+        TransitionKind::WipeUp | TransitionKind::SmoothUp => "wipe-u",
+        TransitionKind::WipeDown | TransitionKind::SmoothDown => "wipe-d",
+        TransitionKind::WipeTl => "wipe-tl",
+        TransitionKind::WipeTr => "wipe-tr",
+        TransitionKind::WipeBl => "wipe-bl",
+        TransitionKind::WipeBr => "wipe-br",
+        TransitionKind::CoverLeft => "cover-l",
+        TransitionKind::CoverRight => "cover-r",
+        TransitionKind::CoverUp => "cover-u",
+        TransitionKind::CoverDown => "cover-d",
+        TransitionKind::RevealLeft => "reveal-l",
+        TransitionKind::RevealRight => "reveal-r",
+        TransitionKind::RevealUp => "reveal-u",
+        TransitionKind::RevealDown => "reveal-d",
+        TransitionKind::CircleOpen => "circle-open",
+        TransitionKind::CircleClose => "circle-close",
+        TransitionKind::Radial => "radial",
+        TransitionKind::Pixelize => "pixel",
+        TransitionKind::HorzOpen => "horz-open",
+        TransitionKind::VertOpen => "vert-open",
+    }
+}
+
+#[component]
+fn MixPreview(class: &'static str) -> Element {
+    rsx! {
+        span { class: "mix-preview mix-{class}",
+            i { class: "a" }
+            i { class: "b" }
+        }
+    }
+}
+
+fn ask_text(title: &str, fallback: &str) -> String {
+    web_sys::window()
+        .and_then(|w| w.prompt_with_message(title).ok().flatten())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn live_note(save: WorkspaceSave, library: &[MediaItem], result: Result<Vec<String>, String>) {
+    match result {
+        Ok(notes) => {
+            apply_monitor_look(&save.engine.peek(), library, playhead_now());
+            let text = notes
+                .iter()
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if text.contains("no following") {
+                show_toast().warn(text);
+            } else if !text.is_empty() {
+                show_toast().success(text);
+            }
+        }
+        Err(err) => show_toast().error(err),
+    }
+}
+
+#[component]
+fn AssetView(tab: AssetTab) -> Element {
+    let save = use_context::<WorkspaceSave>();
+    let clock = use_context::<Clock>();
+    let target_track = use_context::<Signal<String>>();
+    let selected_clip = use_context::<Signal<Option<String>>>();
+    let library = use_context::<Signal<Vec<MediaItem>>>();
+    let mut tab_sig = use_context::<Signal<AssetTab>>();
+
+    let at = move || playhead_now().max(*clock.current.peek());
+    let sel = move || selected_clip.peek().clone();
+    let track = move || target_track.peek().clone();
+
     match tab {
         AssetTab::Media => rsx! { MediaPanel {} },
         AssetTab::Text => rsx! {
             div { class: "card-list",
-                button { class: "card",
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        let text = ask_text("Title", "Title");
+                        live_note(save, &library.peek(), tools::add_graphic_at(save, at(), Graphic::title(text), 4.0));
+                    },
                     b { "Title" }
-                    span { "Large heading overlay" }
+                    span { "Large heading on the picture" }
                 }
-                button { class: "card",
-                    b { "Subtitle" }
-                    span { "Secondary line of text" }
-                }
-                button { class: "card",
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        let text = ask_text("Lower third", "Name");
+                        live_note(save, &library.peek(), tools::add_graphic_at(save, at(), Graphic::lower_third(text), 4.0));
+                    },
                     b { "Lower third" }
                     span { "Name and title card" }
+                }
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        let text = ask_text("Card", "Card");
+                        live_note(save, &library.peek(), tools::add_graphic_at(save, at(), Graphic::card(text), 3.0));
+                    },
+                    b { "Card" }
+                    span { "Full-frame graphic" }
                 }
             }
         },
@@ -585,41 +719,114 @@ fn asset_view(tab: AssetTab) -> Element {
         },
         AssetTab::Audio => rsx! {
             div { class: "card-list",
-                button { class: "card",
-                    b { "Voiceover" }
-                    span { "Sarvam Bulbul TTS" }
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        live_note(save, &library.peek(), tools::set_volume_at(save, sel().as_deref(), &track(), at(), 0.7));
+                    },
+                    b { "Volume" }
+                    span { "Drop selected audio to 70%" }
                 }
-                button { class: "card",
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        live_note(save, &library.peek(), tools::set_fade_at(save, sel().as_deref(), &track(), at(), 0.8));
+                    },
+                    b { "Fade" }
+                    span { "0.8s fade in and out" }
+                }
+                button {
+                    class: "card",
+                    onclick: move |_| live_note(save, &library.peek(), tools::duck_at(save)),
+                    b { "Duck" }
+                    span { "Lower music under speech" }
+                }
+                button {
+                    class: "card",
+                    onclick: move |_| tab_sig.set(AssetTab::Media),
                     b { "Music" }
-                    span { "Import a soundtrack" }
-                }
-                button { class: "card",
-                    b { "Duck music" }
-                    span { "Lower bed under speech" }
+                    span { "Import a soundtrack in Media" }
                 }
             }
         },
         AssetTab::Elements => rsx! {
             div { class: "card-list",
-                button { class: "card",
-                    b { "Stickers" }
-                    span { "Emojis and shapes" }
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        live_note(save, &library.peek(), tools::add_graphic_at(save, at(), Graphic::shape(), 3.0));
+                    },
+                    b { "Shapes" }
+                    span { "Rects, circles, lines" }
                 }
-                button { class: "card",
-                    b { "Transitions" }
-                    span { "Cuts, dissolves, slides" }
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        live_note(save, &library.peek(), tools::add_graphic_at(save, at(), Graphic::sticker("★"), 3.0));
+                    },
+                    b { "Stickers" }
+                    span { "Emojis and badges" }
+                }
+            }
+        },
+        AssetTab::Transitions => rsx! {
+            div { class: "mix-panel",
+                div { class: "mix-group", "Clip fade" }
+                div { class: "mix-grid",
+                    button {
+                        class: "mix-tile",
+                        title: "0.8s from black at the clip start",
+                        onclick: move |_| {
+                            live_note(save, &library.peek(), tools::set_fade_ends(save, sel().as_deref(), &track(), at(), 0.8, 0.0));
+                        },
+                        MixPreview { class: "fadein" }
+                        b { "Fade in" }
+                    }
+                    button {
+                        class: "mix-tile",
+                        title: "0.8s to black at the clip end",
+                        onclick: move |_| {
+                            live_note(save, &library.peek(), tools::set_fade_ends(save, sel().as_deref(), &track(), at(), 0.0, 0.8));
+                        },
+                        MixPreview { class: "fadeout" }
+                        b { "Fade out" }
+                    }
+                }
+                for group in ["Cut", "Dissolve", "Wipe", "Slide", "Shape"] {
+                    div { class: "mix-group", "{group}" }
+                    div { class: "mix-grid",
+                        for kind in TransitionKind::ALL.iter().copied().filter(|k| k.group() == group) {
+                            button {
+                                class: "mix-tile",
+                                title: kind.hint(),
+                                onclick: move |_| {
+                                    live_note(save, &library.peek(), tools::set_transition_at(save, sel().as_deref(), &track(), at(), kind));
+                                },
+                                MixPreview { class: mix_preview_class(kind) }
+                                b { "{kind.label()}" }
+                            }
+                        }
+                    }
                 }
             }
         },
         AssetTab::Visuals => rsx! {
             div { class: "card-list",
-                button { class: "card",
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        live_note(save, &library.peek(), tools::set_grade_at(save, sel().as_deref(), &track(), at(), Grade::punchy()));
+                    },
                     b { "Color" }
-                    span { "Grade and exposure" }
+                    span { "Punchy grade on the clip" }
                 }
-                button { class: "card",
+                button {
+                    class: "card",
+                    onclick: move |_| {
+                        live_note(save, &library.peek(), tools::set_fx_at(save, sel().as_deref(), &track(), at(), Fx::film()));
+                    },
                     b { "Effects" }
-                    span { "Blur, grain, vignette" }
+                    span { "Grain and vignette" }
                 }
             }
         },
@@ -873,6 +1080,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
         }
         let now = *clock.current.read();
         sync_monitor(&library.read(), &tracks.read(), now, false);
+        apply_monitor_look(&save.engine.read(), &library.read(), now);
     });
 
     rsx! {
@@ -949,7 +1157,16 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                             paint_clock();
                         },
                     }
+                    video {
+                        class: "preview-video-b off",
+                        preload: "auto",
+                        playsinline: true,
+                        muted: true,
+                    }
                     img { class: "preview-image off", alt: "" }
+                    div { class: "preview-vignette off" }
+                    div { class: "preview-grain off" }
+                    div { class: "preview-gfx" }
                     div { class: "monitor-blank",
                         span { class: "monitor-meta", "{size}" }
                     }
@@ -967,7 +1184,7 @@ fn Timeline() -> Element {
     let mut target_track = use_context::<Signal<String>>();
     let mut edit_mode = use_context::<Signal<EditMode>>();
     let mut edit_tool = use_context::<Signal<EditTool>>();
-    let mut selected_clip = use_signal(|| None::<String>);
+    let mut selected_clip = use_context::<Signal<Option<String>>>();
     let mut drag = use_context::<Signal<Option<DragSession>>>();
     let mut pps = use_context::<Signal<f64>>();
     let mut suppress_seek = use_context::<Signal<bool>>();
@@ -1246,6 +1463,8 @@ fn Timeline() -> Element {
                             let hidden = track.hidden;
                             let mute_id = track_id.clone();
                             let hide_id = track_id.clone();
+                            let add_id = track_id.clone();
+                            let add_kind = track.kind;
                             rsx! {
                                 div {
                                     class: "{head_class}",
@@ -1255,6 +1474,30 @@ fn Timeline() -> Element {
                                     onclick: move |_| target_track.set(select_id.clone()),
                                     span { class: "th-name", "{track.name}" }
                                     div { class: "th-tools",
+                                        button {
+                                            class: "th-btn",
+                                            title: match add_kind {
+                                                TrackKindUi::Video => "Add video track",
+                                                TrackKindUi::Audio => "Add audio track",
+                                                TrackKindUi::Caption => "Add caption track",
+                                            },
+                                            onclick: move |evt| {
+                                                evt.stop_propagation();
+                                                add_track_after(
+                                                    &mut tracks,
+                                                    &mut target_track,
+                                                    add_kind,
+                                                    &add_id,
+                                                    save,
+                                                );
+                                                crate::toast::show_toast().success(match add_kind {
+                                                    TrackKindUi::Video => "Added a video track",
+                                                    TrackKindUi::Audio => "Added an audio track",
+                                                    TrackKindUi::Caption => "Added a caption track",
+                                                });
+                                            },
+                                            "+"
+                                        }
                                         button {
                                             class: if hidden { "th-btn on" } else { "th-btn" },
                                             title: "Hide",
@@ -1435,14 +1678,26 @@ fn Timeline() -> Element {
                                                     || track.kind == TrackKindUi::Audio;
                                                 let selected = selected_clip.read().as_deref() == Some(clip.id.as_str());
                                                 let lifted = lifted_id.as_deref() == Some(clip.id.as_str());
-                                                let clip_class = if lifted {
-                                                    format!("nle-clip {kind_class} lifted")
-                                                } else if clip.disabled {
-                                                    format!("nle-clip {kind_class} dim")
-                                                } else if selected {
-                                                    format!("nle-clip {kind_class} on")
-                                                } else {
-                                                    format!("nle-clip {kind_class}")
+                                                let mix = !clip.transition.is_empty()
+                                                    && clip.transition != "cut";
+                                                let clip_class = {
+                                                    let mut c = format!("nle-clip {kind_class}");
+                                                    if lifted {
+                                                        c.push_str(" lifted");
+                                                    }
+                                                    if clip.disabled {
+                                                        c.push_str(" dim");
+                                                    }
+                                                    if selected {
+                                                        c.push_str(" on");
+                                                    }
+                                                    if mix {
+                                                        c.push_str(" mix");
+                                                    }
+                                                    if !clip.graphic.is_empty() {
+                                                        c.push_str(" gfx-clip");
+                                                    }
+                                                    c
                                                 };
                                                 let tiles = film_tiles(width);
                                                 let clip_id = clip.id.clone();
@@ -1462,7 +1717,11 @@ fn Timeline() -> Element {
                                                     div {
                                                         class: "{clip_class}",
                                                         style: "left: {left}px; width: {width}px",
-                                                        title: "{name}",
+                                                        title: if mix {
+                                                            format!("{name} · {}", clip.transition)
+                                                        } else {
+                                                            name.clone()
+                                                        },
                                                         onmousedown: move |evt| {
                                                             evt.stop_propagation();
                                                             selected_clip.set(Some(clip_id.clone()));
@@ -1610,6 +1869,16 @@ fn add_track(
     kind: TrackKindUi,
     save: WorkspaceSave,
 ) {
+    add_track_after(tracks, target_track, kind, "", save);
+}
+
+fn add_track_after(
+    tracks: &mut Signal<Vec<EditorTrack>>,
+    target_track: &mut Signal<String>,
+    kind: TrackKindUi,
+    after_id: &str,
+    save: WorkspaceSave,
+) {
     let name = next_track_name(&tracks.read(), kind);
     let id = uuid::Uuid::now_v7().to_string();
     let track = EditorTrack {
@@ -1620,10 +1889,19 @@ fn add_track(
         hidden: false,
         clips: Vec::new(),
     };
-    match kind {
-        TrackKindUi::Video | TrackKindUi::Caption => tracks.write().insert(0, track),
-        TrackKindUi::Audio => tracks.write().push(track),
-    }
+    let mut list = tracks.write();
+    let fallback = match kind {
+        TrackKindUi::Video | TrackKindUi::Caption => 0,
+        TrackKindUi::Audio => list.len(),
+    };
+    let at = list
+        .iter()
+        .position(|t| t.id == after_id)
+        .map(|i| i + 1)
+        .unwrap_or(fallback);
+    let at = at.min(list.len());
+    list.insert(at, track);
+    drop(list);
     target_track.set(id);
     persist(save);
 }
@@ -2522,6 +2800,16 @@ fn IconShapes() -> Element {
             rect { x: "3", y: "3", width: "8", height: "8", rx: "1" }
             circle { cx: "17", cy: "8", r: "4" }
             path { d: "M8 21 4 14h8l-4 7Zm8-1h5v-5" }
+        }
+    }
+}
+
+fn IconTransition() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
+            rect { x: "3", y: "6", width: "9", height: "12", rx: "1" }
+            rect { x: "12", y: "6", width: "9", height: "12", rx: "1" }
+            path { d: "M12 6v12" }
         }
     }
 }
