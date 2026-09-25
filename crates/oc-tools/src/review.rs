@@ -9,6 +9,7 @@ pub struct Spoken {
     pub media: MediaId,
     pub start: f64,
     pub end: f64,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,9 +43,12 @@ pub fn review_cut(timeline: &Timeline, speech: &[Spoken], request: &str) -> CutR
     }
     if let Some(words_at) = first_speech_time(&videos, speech) {
         lines.push(format!("first words at {words_at:.1}s"));
-        if words_at > 3.5 {
+        if wants_hook(request) && !wants_slow_open(request) && words_at > 3.5 {
             issues.push(format!("hook is late: first words at {words_at:.1}s"));
         }
+    }
+    for note in leftover_speech(&videos, speech, request) {
+        issues.push(note);
     }
     for hole in holes(&videos) {
         issues.push(hole);
@@ -200,6 +204,77 @@ fn clip_has_speech(clip: &Clip, speech: &[Spoken], tl0: f64, tl1: f64) -> bool {
     })
 }
 
+fn wants_hook(request: &str) -> bool {
+    let t = request.to_ascii_lowercase();
+    t.contains("hook") || t.contains("reel") || t.contains("short") || t.contains("tiktok")
+}
+
+fn wants_slow_open(request: &str) -> bool {
+    let t = request.to_ascii_lowercase();
+    t.contains("slow")
+        || t.contains("silent")
+        || t.contains("no hook")
+        || t.contains("music open")
+        || t.contains("product")
+}
+
+fn leftover_speech(clips: &[&Clip], speech: &[Spoken], request: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    let keep_silence = {
+        let t = request.to_ascii_lowercase();
+        t.contains("silence") || t.contains("b-roll") || t.contains("broll") || t.contains("music")
+    };
+    for clip in clips {
+        let Some(media) = clip.media_id else { continue };
+        let src_in = clip.source_in.as_seconds();
+        let src_out = clip.source_out().as_seconds();
+        let inside: Vec<&Spoken> = speech
+            .iter()
+            .filter(|s| s.media == media && s.end > src_in + 0.05 && s.start < src_out - 0.05)
+            .collect();
+        if inside.is_empty() {
+            if !keep_silence && clip.duration.as_seconds() > 1.5 {
+                notes.push(format!(
+                    "silence kept {:.1}–{:.1}s",
+                    clip.start.as_seconds(),
+                    clip.end().as_seconds()
+                ));
+            }
+            continue;
+        }
+        let filler_time: f64 = inside
+            .iter()
+            .filter(|s| line_is_filler(&s.text))
+            .map(|s| {
+                let a = s.start.max(src_in);
+                let b = s.end.min(src_out);
+                (b - a).max(0.0)
+            })
+            .sum();
+        if filler_time > 0.45 {
+            notes.push(format!(
+                "filler kept {:.1}–{:.1}s",
+                clip.start.as_seconds(),
+                clip.end().as_seconds()
+            ));
+        }
+    }
+    notes
+}
+
+fn line_is_filler(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    t.split_whitespace().all(|w| {
+        matches!(
+            w.trim_matches(|c: char| !c.is_alphanumeric()),
+            "um" | "uh" | "uhm" | "hmm" | "mm" | "yeah" | "yep" | "ok" | "okay" | "so" | "like"
+        )
+    })
+}
+
 fn target_range(request: &str) -> Option<(f64, f64)> {
     let lower = request.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -286,6 +361,7 @@ mod tests {
             media,
             start: 20.0,
             end: 28.0,
+            text: "late line".into(),
         }];
         let review = review_cut(&tl, &speech, "make a 30s reel");
         assert!(review.issues, "{}", review.text);
@@ -305,11 +381,43 @@ mod tests {
         tl.tracks.push(v1);
         tl.tracks.push(v2);
         let speech = vec![
-            Spoken { media: a, start: 0.0, end: 6.0 },
-            Spoken { media: b, start: 0.0, end: 4.0 },
+            Spoken { media: a, start: 0.0, end: 6.0, text: "hello there friend".into() },
+            Spoken { media: b, start: 0.0, end: 4.0, text: "other person talks".into() },
         ];
         let review = review_cut(&tl, &speech, "cut this");
         assert!(review.text.contains("stacked"), "{}", review.text);
+    }
+
+    #[test]
+    fn filler_and_silence_are_sent_back() {
+        let media = MediaId::new();
+        let tl = tl_with(vec![
+            video_clip(media, 0.0, 3.0, 0.0),
+            video_clip(media, 3.0, 3.0, 40.0),
+        ]);
+        let speech = vec![Spoken {
+            media,
+            start: 0.0,
+            end: 3.0,
+            text: "um uh like".into(),
+        }];
+        let review = review_cut(&tl, &speech, "cut this");
+        assert!(review.text.contains("filler kept"), "{}", review.text);
+        assert!(review.text.contains("silence kept"), "{}", review.text);
+    }
+
+    #[test]
+    fn slow_open_is_allowed() {
+        let media = MediaId::new();
+        let tl = tl_with(vec![video_clip(media, 0.0, 8.0, 0.0)]);
+        let speech = vec![Spoken {
+            media,
+            start: 6.0,
+            end: 8.0,
+            text: "the line starts late".into(),
+        }];
+        let review = review_cut(&tl, &speech, "slow open, then the line");
+        assert!(!review.text.contains("hook is late"), "{}", review.text);
     }
 
     #[test]
@@ -320,6 +428,7 @@ mod tests {
             media,
             start: 2.2,
             end: 6.0,
+            text: "the hook line is here".into(),
         }];
         let review = review_cut(&tl, &speech, "trim the open");
         assert!(!review.issues, "{}", review.text);

@@ -1,7 +1,7 @@
 //! MCP tool list so any LLM provider can call the same edits as the UI.
 
 use crate::ops::{AssembleItem, AssembleStyle, ExportPreset, Op, TimeRange, TimelineEditMode};
-use oc_timeline::{Fx, Grade, Graphic, GraphicKind, TransitionKind};
+use oc_timeline::{AudioFx, Fx, Grade, Graphic, GraphicKind, Lut, TransitionKind};
 use crate::registry::tools;
 use crate::ToolGroup;
 use oc_time::{Duration, Time};
@@ -110,14 +110,106 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "set_grade".into(),
-            description: "Color grade on a clip (exposure, contrast, saturation, temperature)."
+            description: "Color on a clip: exposure, contrast, saturation, temperature, \
+                 lift (shadows), gamma (mids), gain (highlights), lut (none, film, cool, warm, teal_orange, mono)."
                 .into(),
-            input_schema: object(&[("clip_id", str_prop("Clip id"), true)]),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("lift", num_prop("Shadows -1..1"), false),
+                ("gamma", num_prop("Mids -1..1"), false),
+                ("gain", num_prop("Highlights -1..1"), false),
+                ("lut", str_prop("none, film, cool, warm, teal_orange, mono"), false),
+            ]),
         },
         McpTool {
             name: "set_fx".into(),
             description: "Blur, grain, vignette on a clip.".into(),
             input_schema: object(&[("clip_id", str_prop("Clip id"), true)]),
+        },
+        McpTool {
+            name: "set_transform".into(),
+            description: "Kdenlive Transform: zoom and pan a video clip. \
+                 scale 1 is the full frame, 1.18 is a punch-in. x and y pan in pixels."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("scale", num_prop("Zoom, 1 = fit"), false),
+                ("x", num_prop("Pan X pixels"), false),
+                ("y", num_prop("Pan Y pixels"), false),
+                ("rotation", num_prop("Degrees"), false),
+            ]),
+        },
+        McpTool {
+            name: "cover".into(),
+            description: "Lay another picture over a timeline time, audio muted. \
+                 Use a silent range or a second camera to hide a jump cut."
+                .into(),
+            input_schema: object(&[
+                ("media_id", str_prop("Media id"), true),
+                ("at", num_prop("Timeline start seconds"), true),
+                ("source_in", num_prop("Source in-point seconds"), true),
+                ("duration", num_prop("Seconds on screen"), true),
+            ]),
+        },
+        McpTool {
+            name: "set_move".into(),
+            description: "Move zoom and pan across the clip, from the current transform to end_scale, end_x, end_y."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("end_scale", num_prop("Zoom at the tail"), true),
+                ("end_x", num_prop("Pan X at the tail"), false),
+                ("end_y", num_prop("Pan Y at the tail"), false),
+            ]),
+        },
+        McpTool {
+            name: "set_speed_ramp".into(),
+            description: "Speed at the head and at the tail. 1 is normal. Use for a ramp, not a jump cut."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("speed", num_prop("Start speed"), true),
+                ("end_speed", num_prop("End speed"), true),
+            ]),
+        },
+        McpTool {
+            name: "set_stabilize".into(),
+            description: "Stabilize a shaky video clip."
+                .into(),
+            input_schema: object(&[("clip_id", str_prop("Clip id"), true)]),
+        },
+        McpTool {
+            name: "set_crop".into(),
+            description: "Keep a region of the frame. x, y, w, h are fractions from 0 to 1."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("x", num_prop("Left 0-1"), true),
+                ("y", num_prop("Top 0-1"), true),
+                ("w", num_prop("Width 0-1"), true),
+                ("h", num_prop("Height 0-1"), true),
+            ]),
+        },
+        McpTool {
+            name: "set_audio".into(),
+            description: "Normalize loudness, reduce noise, EQ, or compress. Music is only a file the user imported."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("normalize", str_prop("true or false"), false),
+                ("denoise", str_prop("true or false"), false),
+                ("compressor", str_prop("true or false"), false),
+                ("low", num_prop("Low shelf dB"), false),
+                ("mid", num_prop("Mid dB"), false),
+                ("high", num_prop("High shelf dB"), false),
+            ]),
+        },
+        McpTool {
+            name: "finish_reel".into(),
+            description: "After the cut is the right length: grade, vignette, punch-in on jumps, \
+                 fade open and close, captions, vertical frame for a reel, and a cover when one exists."
+                .into(),
+            input_schema: object(&[]),
         },
         McpTool {
             name: "set_fade".into(),
@@ -599,7 +691,61 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 contrast: number(&call.arguments, "contrast").unwrap_or(0.14) as f32,
                 saturation: number(&call.arguments, "saturation").unwrap_or(0.12) as f32,
                 temperature: number(&call.arguments, "temperature").unwrap_or(0.06) as f32,
+                lift: number(&call.arguments, "lift").unwrap_or(0.0) as f32,
+                gamma: number(&call.arguments, "gamma").unwrap_or(0.0) as f32,
+                gain: number(&call.arguments, "gain").unwrap_or(0.0) as f32,
+                lut: lut_from(call.arguments.get("lut").and_then(Value::as_str).unwrap_or("none")),
             },
+        }),
+        "set_move" => Ok(Op::SetMove {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            end_x: number(&call.arguments, "end_x").unwrap_or(0.0) as f32,
+            end_y: number(&call.arguments, "end_y").unwrap_or(0.0) as f32,
+            end_scale: number(&call.arguments, "end_scale").unwrap_or(1.12) as f32,
+        }),
+        "set_speed_ramp" => Ok(Op::SetSpeedRamp {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            speed: number(&call.arguments, "speed").unwrap_or(1.0) as f32,
+            end_speed: number(&call.arguments, "end_speed").unwrap_or(1.0) as f32,
+        }),
+        "set_stabilize" => Ok(Op::SetStabilize {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            on: call
+                .arguments
+                .get("on")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        }),
+        "set_crop" => Ok(Op::SetCrop {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            x: number(&call.arguments, "x").unwrap_or(0.0) as f32,
+            y: number(&call.arguments, "y").unwrap_or(0.0) as f32,
+            w: number(&call.arguments, "w").unwrap_or(1.0) as f32,
+            h: number(&call.arguments, "h").unwrap_or(1.0) as f32,
+        }),
+        "set_audio" => Ok(Op::SetAudio {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            audio: AudioFx {
+                normalize: flag(&call.arguments, "normalize"),
+                denoise: flag(&call.arguments, "denoise"),
+                compressor: flag(&call.arguments, "compressor"),
+                low: number(&call.arguments, "low").unwrap_or(0.0) as f32,
+                mid: number(&call.arguments, "mid").unwrap_or(0.0) as f32,
+                high: number(&call.arguments, "high").unwrap_or(0.0) as f32,
+            },
+        }),
+        "set_transform" => Ok(Op::SetTransform {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            x: number(&call.arguments, "x").unwrap_or(0.0) as f32,
+            y: number(&call.arguments, "y").unwrap_or(0.0) as f32,
+            scale: number(&call.arguments, "scale").unwrap_or(1.0) as f32,
+            rotation: number(&call.arguments, "rotation").unwrap_or(0.0) as f32,
+        }),
+        "cover" => Ok(Op::Cover {
+            media_id: media_id(&call.arguments, "media_id")?,
+            at: seconds(&call.arguments, "at").unwrap_or(Time::ZERO),
+            source_in: seconds(&call.arguments, "source_in").unwrap_or(Time::ZERO),
+            duration: Duration::from_seconds(number(&call.arguments, "duration").unwrap_or(0.9)),
         }),
         "set_fx" => Ok(Op::SetFx {
             clip_id: clip_id(&call.arguments, "clip_id")?,
@@ -827,6 +973,26 @@ fn track_id(args: &Value, key: &str) -> Result<TrackId, String> {
     Uuid::parse_str(raw)
         .map(TrackId::from_uuid)
         .map_err(|_| format!("bad {key}"))
+}
+
+fn flag(args: &Value, key: &str) -> bool {
+    match args.get(key) {
+        Some(Value::Bool(v)) => *v,
+        Some(Value::String(s)) => s == "true" || s == "1" || s == "yes",
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0) > 0.0,
+        _ => false,
+    }
+}
+
+fn lut_from(raw: &str) -> Lut {
+    match raw {
+        "film" => Lut::Film,
+        "cool" => Lut::Cool,
+        "warm" => Lut::Warm,
+        "teal_orange" | "teal" => Lut::TealOrange,
+        "mono" | "bw" | "black_white" => Lut::Mono,
+        _ => Lut::None,
+    }
 }
 
 fn number(args: &Value, key: &str) -> Result<f64, String> {

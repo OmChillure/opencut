@@ -1,6 +1,7 @@
 use oc_time::{Duration, Time};
 use oc_timeline::{
-    AspectRatio, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook, Fx, Grade, Graphic,
+    AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook, Crop, Fx,
+    Grade, Graphic,
     MarkerId, MediaId, PlaceMode, Timeline, TimelineError, Track, TrackId, TrackKind,
     Transform, TransitionKind, UndoStack,
 };
@@ -273,6 +274,51 @@ pub enum Op {
     SetVolume {
         clip_id: ClipId,
         volume: f32,
+    },
+    /// Kdenlive Transform / Shotcut Size-Position-Rotate: pan, zoom, rotation.
+    SetTransform {
+        clip_id: ClipId,
+        x: f32,
+        y: f32,
+        scale: f32,
+        rotation: f32,
+    },
+    /// Picture on a higher track over `at`, with its own audio muted.
+    /// Same idea as a Kdenlive clip on V2 covering a jump.
+    Cover {
+        media_id: MediaId,
+        at: Time,
+        source_in: Time,
+        duration: Duration,
+    },
+    /// Move scale and pan from the clip's transform to this pose.
+    SetMove {
+        clip_id: ClipId,
+        end_x: f32,
+        end_y: f32,
+        end_scale: f32,
+    },
+    /// Speed at the start is `speed`; `end_speed` is the speed at the tail.
+    SetSpeedRamp {
+        clip_id: ClipId,
+        speed: f32,
+        end_speed: f32,
+    },
+    SetStabilize {
+        clip_id: ClipId,
+        on: bool,
+    },
+    /// Keep a fraction of the frame. x,y,w,h are 0–1.
+    SetCrop {
+        clip_id: ClipId,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    SetAudio {
+        clip_id: ClipId,
+        audio: AudioFx,
     },
     AddGraphic {
         graphic: Graphic,
@@ -615,6 +661,131 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
                 fade_in.as_seconds(),
                 fade_out.as_seconds()
             )
+        }
+        Op::SetTransform {
+            clip_id,
+            x,
+            y,
+            scale,
+            rotation,
+        } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            match &mut clip.kind {
+                ClipKind::Video { transform } => {
+                    *transform = Transform {
+                        x: *x,
+                        y: *y,
+                        scale: scale.clamp(0.25, 4.0),
+                        rotation: *rotation,
+                    };
+                }
+                _ => {
+                    return Err(OpError::Message(
+                        "transform is for video clips".into(),
+                    ));
+                }
+            }
+            format!(
+                "transform {clip_id} scale {:.2} pan {:.0},{:.0}",
+                scale, x, y
+            )
+        }
+        Op::Cover {
+            media_id,
+            at,
+            source_in,
+            duration,
+        } => {
+            let track_id = overlay_track(timeline);
+            let mut picture = clip_for_media(*media_id, *at, *duration, TrackKind::Video, *source_in);
+            if let ClipKind::Video { transform } = &mut picture.kind {
+                transform.scale = 1.28;
+            }
+            let id = timeline.place_clip(track_id, picture, PlaceMode::Normal)?;
+            let audio_track = resolve_track(timeline, None, TrackKind::Audio);
+            let mut bed = clip_for_media(*media_id, *at, *duration, TrackKind::Audio, *source_in);
+            if let ClipKind::Audio { volume, .. } = &mut bed.kind {
+                *volume = 0.0;
+            }
+            let _ = timeline.place_clip(audio_track, bed, PlaceMode::Normal);
+            format!(
+                "cover {id} from {media_id} at {:.2}s (src {:.2}s)",
+                at.as_seconds(),
+                source_in.as_seconds()
+            )
+        }
+        Op::SetMove {
+            clip_id,
+            end_x,
+            end_y,
+            end_scale,
+        } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            let start = match &clip.kind {
+                ClipKind::Video { transform } => *transform,
+                _ => {
+                    return Err(OpError::Message("move is for video clips".into()));
+                }
+            };
+            clip.look.move_to = Some(Transform {
+                x: *end_x,
+                y: *end_y,
+                scale: end_scale.clamp(0.25, 4.0),
+                rotation: start.rotation,
+            });
+            format!("move {clip_id} to scale {end_scale:.2}")
+        }
+        Op::SetSpeedRamp {
+            clip_id,
+            speed,
+            end_speed,
+        } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            let speed = speed.clamp(0.25, 4.0);
+            let end_speed = end_speed.clamp(0.25, 4.0);
+            clip.speed = speed;
+            clip.look.speed_to = Some(end_speed);
+            format!("speed {speed:.2} → {end_speed:.2} on {clip_id}")
+        }
+        Op::SetStabilize { clip_id, on } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            clip.look.stabilize = *on;
+            format!("stabilize {on} on {clip_id}")
+        }
+        Op::SetCrop {
+            clip_id,
+            x,
+            y,
+            w,
+            h,
+        } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            let w = w.clamp(0.05, 1.0);
+            let h = h.clamp(0.05, 1.0);
+            clip.look.crop = Some(Crop {
+                x: x.clamp(0.0, 1.0 - w),
+                y: y.clamp(0.0, 1.0 - h),
+                w,
+                h,
+            });
+            format!("crop {clip_id}")
+        }
+        Op::SetAudio { clip_id, audio } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            clip.look.audio = *audio;
+            format!("audio fx on {clip_id}")
         }
         Op::SetVolume { clip_id, volume } => {
             let clip = timeline
@@ -1065,6 +1236,59 @@ fn cut_ranges(timeline: &mut Timeline, ranges: &[TimeRange]) -> Result<usize> {
 
 /// Pick keep-takes from timestamped speech so one long source can become a short.
 #[must_use]
+/// Excerpts for a timed short. A quoted line in the request becomes the open.
+pub fn excerpts_for_request(cues: &[(Time, Time, &str)], request: &str, target_s: f64) -> Vec<Excerpt> {
+    let quote = quoted_line(request);
+    if let Some(q) = quote {
+        let needle = q.to_ascii_lowercase();
+        if let Some(i) = cues.iter().position(|(_, _, text)| {
+            text.to_ascii_lowercase().contains(needle.trim())
+        }) {
+            return excerpts_from(cues, i, target_s);
+        }
+    }
+    pick_reel_excerpts(cues, target_s)
+}
+
+fn quoted_line(request: &str) -> Option<&str> {
+    let bytes = request.as_bytes();
+    for (open, close) in [(b'"', b'"'), (b'\'', b'\'')] {
+        if let Some(a) = bytes.iter().position(|c| *c == open) {
+            if let Some(rel) = bytes[a + 1..].iter().position(|c| *c == close) {
+                let s = request.get(a + 1..a + 1 + rel)?.trim();
+                if s.len() >= 8 {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn excerpts_from(cues: &[(Time, Time, &str)], start_idx: usize, target_s: f64) -> Vec<Excerpt> {
+    let target = target_s.clamp(20.0, 75.0);
+    let mut used = 0.0;
+    let mut out = Vec::new();
+    for (start, end, text) in cues.iter().skip(start_idx) {
+        if end <= start || is_filler(text) {
+            continue;
+        }
+        let dur = (*end - *start).as_seconds();
+        if dur < 0.4 {
+            continue;
+        }
+        out.push(Excerpt {
+            source_in: *start,
+            duration: *end - *start,
+        });
+        used += dur;
+        if used >= target {
+            break;
+        }
+    }
+    out
+}
+
 pub fn pick_reel_excerpts(cues: &[(Time, Time, &str)], target_s: f64) -> Vec<Excerpt> {
     let target = target_s.clamp(20.0, 75.0);
     let takes = merge_speech_takes(cues);

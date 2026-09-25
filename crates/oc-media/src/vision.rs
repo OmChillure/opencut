@@ -305,33 +305,35 @@ async fn probe(input: &Path) -> Result<Probe, crate::MediaError> {
 }
 
 async fn scene_cuts(input: &Path) -> Result<Vec<f64>, crate::MediaError> {
-    let out = Command::new("ffprobe")
+    // Low-res, 2 fps. A full-frame scene pass is what made a long file feel stuck.
+    let out = Command::new("ffmpeg")
         .args([
-            "-v",
-            "error",
-            "-show_frames",
-            "-of",
-            "csv=p=0",
+            "-hide_banner",
+            "-i",
+            &path_str(input),
+            "-vf",
+            "scale=320:-1,fps=2,select='gt(scene,0.30)',showinfo",
+            "-an",
             "-f",
-            "lavfi",
-            &format!(
-                "movie={},select=gt(scene\\,0.28)",
-                path_str(input).replace('\\', "\\\\").replace(':', "\\:")
-            ),
+            "null",
+            "-",
         ])
         .output()
         .await
         .map_err(|e| crate::MediaError::Probe(e.to_string()))?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = String::from_utf8_lossy(&out.stderr);
     let mut times = Vec::new();
     for line in text.lines() {
-        // frame,video,0,1,... pts_time is often field 5 or we scan for a float
-        for part in line.split(',') {
-            if let Ok(t) = part.parse::<f64>() {
-                if t > 0.05 && t < 86_400.0 {
-                    times.push(t);
-                    break;
-                }
+        let Some(rest) = line.split("pts_time:").nth(1) else {
+            continue;
+        };
+        let num: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if let Ok(t) = num.parse::<f64>() {
+            if t > 0.05 && t < 86_400.0 {
+                times.push(t);
             }
         }
     }

@@ -54,6 +54,12 @@ pub(crate) async fn call_tool(
         tracing::info!(project = %project_id, tool = name, chars = out.len(), "inspect");
         return Ok(out);
     }
+    if name == "finish_reel" {
+        return Ok(
+            "The host finishes the picture when the review is clean, using this ask. Keep cutting until then."
+                .into(),
+        );
+    }
     let op = op_from_mcp(&call).map_err(|e| {
         tracing::error!(project = %project_id, tool = name, "bad tool: {e}");
         e
@@ -95,6 +101,170 @@ pub(crate) async fn queue_export(
     .map_err(|e| e.to_string())?;
     tracing::info!(project = %project_id, job = %id, ?preset, "export queued");
     Ok(())
+}
+
+/// Build a timed short from the transcript in one pass. None when this ask still needs the model.
+pub(crate) async fn cut_short_now(db: &Db, project_id: Uuid, request: &str) -> Option<String> {
+    if !oc_core::wants_picture_finish(request) {
+        return None;
+    }
+    let transcripts = oc_db::list_transcripts_for_project(db, project_id)
+        .await
+        .ok()?;
+    let speech = speech_by_media(&transcripts);
+    let (id, spoken) = speech
+        .iter()
+        .max_by_key(|(_, s)| s.cues.len())
+        .filter(|(_, s)| !s.cues.is_empty())?;
+    let cues: Vec<(Time, Time, &str)> = spoken
+        .cues
+        .iter()
+        .map(|c| (c.start, c.end, c.text.as_str()))
+        .collect();
+    let target = asked_seconds(request).unwrap_or(60.0);
+    let excerpts = oc_core::excerpts_for_request(&cues, request, target);
+    if excerpts.is_empty() {
+        return None;
+    }
+    let mut project = oc_db::get_project(db, project_id).await.ok()?;
+    let mut undo = UndoStack::new();
+    apply(&mut project.timeline, &mut undo, Op::ClearTimeline).ok()?;
+    let media = MediaId::from_uuid(*id);
+    let mut at = 0.0;
+    for ex in &excerpts {
+        apply(
+            &mut project.timeline,
+            &mut undo,
+            Op::PlaceMedia {
+                media_id: media,
+                track_id: None,
+                start: Time::from_seconds(at),
+                duration: ex.duration,
+                source_in: ex.source_in,
+                kind: TrackKind::Video,
+                mode: oc_core::TimelineEditMode::Normal,
+            },
+        )
+        .ok()?;
+        at += ex.duration.as_seconds();
+    }
+    oc_db::save_timeline(db, project_id, &project.timeline)
+        .await
+        .ok()?;
+    let note = apply_finish(db, project_id, request, true).await.ok()?;
+    Some(format!(
+        "Cut a {at:.0}s short from the transcript in one pass. {note}"
+    ))
+}
+
+fn asked_seconds(request: &str) -> Option<f64> {
+    let lower = request.to_ascii_lowercase();
+    let mut num = String::new();
+    for ch in lower.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+        } else if !num.is_empty() {
+            break;
+        }
+    }
+    let n: f64 = num.parse().ok()?;
+    let rest = lower.split_once(&num)?.1.trim_start();
+    if rest.starts_with("min") {
+        Some(n * 60.0)
+    } else if rest.starts_with("sec") || rest.starts_with('s') {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Grade, punch-in, fades, captions, vertical frame, and a cover when the cut is a reel.
+pub(crate) async fn apply_finish(
+    db: &Db,
+    project_id: Uuid,
+    request: &str,
+    force: bool,
+) -> Result<String, String> {
+    if !force && !oc_core::wants_picture_finish(request) {
+        return Ok(String::new());
+    }
+    let mut project = oc_db::get_project(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if oc_core::already_finished(&project.timeline) {
+        return Ok(String::new());
+    }
+    let transcripts = oc_db::list_transcripts_for_project(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let speech = speech_by_media(&transcripts);
+    let looks = look_by_media(
+        &oc_db::list_analysis_for_project(db, project_id)
+            .await
+            .unwrap_or_default(),
+    );
+    let lines = spoken_lines(&speech);
+    let covers = cover_shots(&looks, &speech);
+    let ops = oc_core::finish_reel(&project.timeline, &lines, &covers, request);
+    if ops.is_empty() {
+        return Ok(String::new());
+    }
+    let mut undo = UndoStack::new();
+    let mut notes = Vec::new();
+    for op in ops {
+        let applied = apply(&mut project.timeline, &mut undo, op).map_err(|e| e.to_string())?;
+        notes.push(applied.note);
+    }
+    oc_db::save_timeline(db, project_id, &project.timeline)
+        .await
+        .map_err(|e| e.to_string())?;
+    tracing::info!(project = %project_id, ops = notes.len(), "picture finish");
+    Ok(format!("finish: {}", notes.join("; ")))
+}
+
+fn spoken_lines(speech: &HashMap<Uuid, Speech>) -> Vec<oc_core::SpokenLine> {
+    speech
+        .iter()
+        .flat_map(|(id, s)| {
+            let media = MediaId::from_uuid(*id);
+            s.cues.iter().map(move |c| oc_core::SpokenLine {
+                media,
+                start: c.start.as_seconds(),
+                end: c.end.as_seconds(),
+                text: c.text.clone(),
+            })
+        })
+        .collect()
+}
+
+fn cover_shots(
+    looks: &HashMap<Uuid, oc_db::AnalysisRow>,
+    speech: &HashMap<Uuid, Speech>,
+) -> Vec<oc_core::CoverShot> {
+    let mut out = Vec::new();
+    for (id, row) in looks {
+        let picture = shot_looks(row);
+        let cues: Vec<(f64, f64, &str)> = speech
+            .get(id)
+            .map(|s| {
+                s.cues
+                    .iter()
+                    .map(|c| (c.start.as_seconds(), c.end.as_seconds(), c.text.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for brief in oc_media::brief_shots(&picture, &cues) {
+            if brief.role != oc_media::ShotRole::Silence || brief.end - brief.start < 1.0 {
+                continue;
+            }
+            out.push(oc_core::CoverShot {
+                media: MediaId::from_uuid(*id),
+                start: brief.start,
+                end: brief.end,
+            });
+        }
+    }
+    out
 }
 
 pub(crate) fn speech_by_media(rows: &[oc_db::TranscriptCueRow]) -> HashMap<Uuid, Speech> {
@@ -140,6 +310,7 @@ pub(crate) fn spoken(speech: &HashMap<Uuid, Speech>) -> Vec<oc_core::Spoken> {
                 media,
                 start: c.start.as_seconds(),
                 end: c.end.as_seconds(),
+                text: c.text.clone(),
             })
         })
         .collect()

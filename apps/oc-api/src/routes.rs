@@ -438,7 +438,10 @@ async fn run_chat(
          Call list_bin and list_timeline first. For a long file, call get_media. \
          It returns a shot list: start-end, look, subject (person, product, street, …), \
          speech|silence|filler, and the words. Place excerpts on those times. \
-         Drop filler and long silence unless asked to keep them. \
+         A reel, vlog, interview, ad, or documentary gets a different finish once the review is clean. \
+         Drop filler and long silence or the review will say filler kept or silence kept. \
+         A late hook is a problem only when they asked for a reel, short, or hook. \
+         Music and a second camera exist only if the user imported them. \
          After tools, a cut review lists fix: lines (length, late hook, jump cut, stacked talk). \
          Fix those with tools before you say the cut is done. Do not assume the \
          bin is empty. Never describe an edit you did not make with tools.",
@@ -460,7 +463,17 @@ async fn run_chat(
     if mcp_servers.is_empty() {
         tracing::warn!(project = %id, "no opencut MCP server — TOOL-line fallback only");
     }
-    for turn_i in 0..8 {
+    if let Some(text) = edit::cut_short_now(&state.db, id, &last_user).await {
+        let project = oc_db::get_project(&state.db, id)
+            .await
+            .map_err(|e| e.to_string())?;
+        tracing::info!(project = %id, "fast short, no model loop");
+        finish_chat(&tx, &text, &[], &project.timeline).await;
+        drop(ev_tx);
+        let _ = pump.await;
+        return Ok(());
+    }
+    for turn_i in 0..3 {
         let reply = match oc_providers::complete_stream(
             &body.provider,
             &body.model,
@@ -483,7 +496,14 @@ async fn run_chat(
         match reply {
             LlmReply::Text(t) => {
                 let review = fresh_review(&state, id, &last_user).await;
-                if review.issues && turn_i + 1 < 8 {
+                if !review.issues {
+                    match edit::apply_finish(&state.db, id, &last_user, false).await {
+                        Ok(note) if !note.is_empty() => notes.push(note),
+                        Ok(_) => {}
+                        Err(err) => tracing::warn!(project = %id, "picture finish skipped: {err}"),
+                    }
+                }
+                if review.issues && turn_i + 1 < 3 {
                     tracing::info!(project = %id, "cut review rejected a finished reply");
                     turns.push(ChatTurn {
                         role: "assistant".into(),
@@ -513,6 +533,7 @@ async fn run_chat(
                         call.arguments.clone(),
                         None,
                         "pending",
+                        None,
                     )
                     .await;
                     tracing::info!(tool = %call.name, "host tool");
@@ -542,6 +563,10 @@ async fn run_chat(
                             (false, msg)
                         }
                     };
+                    let timeline = oc_db::get_project(&state.db, id)
+                        .await
+                        .ok()
+                        .map(|p| p.timeline);
                     emit_host_tool(
                         &tx,
                         &tool_id,
@@ -549,6 +574,7 @@ async fn run_chat(
                         call.arguments,
                         Some(result),
                         if ok { "done" } else { "error" },
+                        timeline.as_ref(),
                     )
                     .await;
                 }
@@ -595,6 +621,7 @@ async fn emit_host_tool(
     args: serde_json::Value,
     result: Option<String>,
     status: &str,
+    timeline: Option<&oc_core::Timeline>,
 ) {
     push(
         tx,
@@ -605,6 +632,7 @@ async fn emit_host_tool(
             "args": args,
             "result": result,
             "status": status,
+            "timeline": timeline,
         }),
     )
     .await;

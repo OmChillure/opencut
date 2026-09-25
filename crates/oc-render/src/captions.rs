@@ -66,6 +66,30 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
         }
     }
     out.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    shorten_cues(out)
+}
+
+/// A caption stays two short lines. A full sentence is split across the cue.
+fn shorten_cues(cues: Vec<BurnedCue>) -> Vec<BurnedCue> {
+    let mut out = Vec::new();
+    for cue in cues {
+        let words: Vec<&str> = cue.text.split_whitespace().collect();
+        if words.len() <= 7 {
+            out.push(cue);
+            continue;
+        }
+        let groups: Vec<&[&str]> = words.chunks(6).collect();
+        let span = (cue.end - cue.start).max(0.4);
+        let step = span / groups.len() as f64;
+        for (i, group) in groups.iter().enumerate() {
+            let i = i as f64;
+            out.push(BurnedCue {
+                start: cue.start + step * i,
+                end: cue.start + step * (i + 1.0),
+                text: group.join(" "),
+            });
+        }
+    }
     out
 }
 

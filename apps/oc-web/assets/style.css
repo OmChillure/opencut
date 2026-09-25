@@ -447,10 +447,22 @@ button:disabled { opacity: 0.45; cursor: default; }
 .gfx.sticker { font-size: clamp(36px, 10cqw, 72px); text-shadow: none; }
 .gfx.caption {
   align-self: end;
-  margin-bottom: 8%;
-  font-size: clamp(13px, 3cqw, 20px);
-  font-weight: 500;
-  max-width: 80%;
+  justify-self: center;
+  margin: 0 8% 10%;
+  max-width: 84%;
+  box-sizing: border-box;
+  font-size: clamp(11px, 2.1cqh, 18px);
+  line-height: 1.25;
+  font-weight: 600;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 4px 8px;
+  border-radius: 4px;
 }
 .monitor-blank {
   position: absolute;
@@ -1199,7 +1211,25 @@ button:disabled { opacity: 0.45; cursor: default; }
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
   font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.tool-caret { color: var(--faint); width: 10px; }
+.tool-line {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.thought-body {
+  margin-top: 4px;
+  white-space: pre-wrap;
 }
 .tool-k {
   color: var(--faint);

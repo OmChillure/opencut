@@ -97,7 +97,7 @@ pub fn compile(
         std::fs::write(&path, to_srt(&captions)).map_err(RenderError::Io)?;
         let lab = next_label();
         fc.push_str(&format!(
-            "[{vcur}]subtitles={}:force_style='Fontsize=18,Outline=1,Alignment=2'[{lab}];",
+            "[{vcur}]subtitles={}:force_style='Fontsize=13,Outline=1,Shadow=0,Alignment=2,MarginL=48,MarginR=48,MarginV=36,WrapStyle=0'[{lab}];",
             escape_path(&path)
         ));
         vcur = lab;
@@ -263,9 +263,57 @@ fn picture_branch(
     let idx = *index_of.get(&id).ok_or(RenderError::UnknownMedia(id))?;
     let sin = clip.source_in.as_seconds();
     let dur = clip.duration.as_seconds().max(0.04);
+    let speed = if clip.speed.is_finite() && clip.speed > 0.05 {
+        f64::from(clip.speed)
+    } else {
+        1.0
+    };
+    let speed_end = f64::from(clip.look.speed_to.unwrap_or(clip.speed)).clamp(0.25, 4.0);
+    let speed = speed.clamp(0.25, 4.0);
+    let src_dur = dur * (speed + speed_end) * 0.5;
     let mut chain = format!(
-        "[{idx}:v]trim=start={sin:.4}:duration={dur:.4},setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p"
+        "[{idx}:v]trim=start={sin:.4}:duration={src_dur:.4},setpts=PTS-STARTPTS"
     );
+    if (speed - 1.0).abs() > 0.02 || (speed_end - speed).abs() > 0.02 {
+        chain.push_str(&format!(
+            ",setpts='PTS/({speed:.4}+({speed_end:.4}-{speed:.4})*T/{dur:.4})'"
+        ));
+    }
+    if clip.look.stabilize {
+        chain.push_str(",deshake");
+    }
+    if let Some(crop) = clip.look.crop {
+        let w = crop.w.clamp(0.05, 1.0);
+        let h = crop.h.clamp(0.05, 1.0);
+        let x = crop.x.clamp(0.0, 1.0 - w);
+        let y = crop.y.clamp(0.0, 1.0 - h);
+        chain.push_str(&format!(
+            ",crop=iw*{w:.4}:ih*{h:.4}:iw*{x:.4}:ih*{y:.4}"
+        ));
+    }
+    chain.push_str(&format!(
+        ",scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p"
+    ));
+    if let ClipKind::Video { transform } = &clip.kind {
+        if let Some(end) = clip.look.move_to {
+            let frames = (dur * fps).max(1.0);
+            let z0 = transform.scale.clamp(0.25, 4.0);
+            let z1 = end.scale.clamp(0.25, 4.0);
+            chain.push_str(&format!(
+                ",zoompan=z='{z0:.4}+({z1:.4}-{z0:.4})*on/{frames:.1}':x='(iw-iw/zoom)/2+({:.2}+({:.2}-{:.2})*on/{frames:.1})':y='(ih-ih/zoom)/2+({:.2}+({:.2}-{:.2})*on/{frames:.1})':d=1:s={width}x{height}:fps={fps}",
+                transform.x, end.x, transform.x, transform.y, end.y, transform.y
+            ));
+        } else {
+            let z = transform.scale;
+            if (z - 1.0).abs() > 0.01 || transform.x.abs() > 0.5 || transform.y.abs() > 0.5 {
+                let z = z.clamp(0.25, 4.0);
+                chain.push_str(&format!(
+                    ",scale=iw*{z:.4}:ih*{z:.4},crop={width}:{height}:(in_w-{width})/2+({:.2}):(in_h-{height})/2+({:.2})",
+                    transform.x, transform.y
+                ));
+            }
+        }
+    }
     chain.push_str(&eq_filters(&clip.look.grade, &clip.look.fx));
     let fi = clip.look.fade_in.as_seconds();
     let fo = clip.look.fade_out.as_seconds();
@@ -294,6 +342,15 @@ fn eq_filters(grade: &oc_timeline::Grade, fx: &oc_timeline::Fx) -> String {
             let t = grade.temperature.clamp(-1.0, 1.0);
             s.push_str(&format!(",colorbalance=rs={t:.3}:bs={:.3}", -t));
         }
+        if grade.lift.abs() > 1e-3 || grade.gamma.abs() > 1e-3 || grade.gain.abs() > 1e-3 {
+            let lift = grade.lift.clamp(-1.0, 1.0);
+            let gamma = grade.gamma.clamp(-1.0, 1.0);
+            let gain = grade.gain.clamp(-1.0, 1.0);
+            s.push_str(&format!(
+                ",colorbalance=rs={lift:.3}:gs={lift:.3}:bs={lift:.3}:rm={gamma:.3}:gm={gamma:.3}:bm={gamma:.3}:rh={gain:.3}:gh={gain:.3}:bh={gain:.3}"
+            ));
+        }
+        s.push_str(lut_filter(grade.lut));
     }
     if fx.grain > 0.02 {
         let alls = (fx.grain * 28.0).clamp(1.0, 40.0);
@@ -306,6 +363,41 @@ fn eq_filters(grade: &oc_timeline::Grade, fx: &oc_timeline::Fx) -> String {
     if fx.blur > 0.02 {
         let r = (fx.blur * 6.0).clamp(0.5, 8.0);
         s.push_str(&format!(",gblur=sigma={r:.2}"));
+    }
+    s
+}
+
+fn lut_filter(lut: oc_timeline::Lut) -> &'static str {
+    use oc_timeline::Lut;
+    match lut {
+        Lut::None => "",
+        Lut::Film => ",eq=saturation=0.9:contrast=1.05,colorbalance=rs=0.04:bs=-0.03",
+        Lut::Cool => ",colorbalance=bs=0.08:bh=0.06:rs=-0.04",
+        Lut::Warm => ",colorbalance=rs=0.08:rh=0.05:bs=-0.04",
+        Lut::TealOrange => ",colorbalance=bs=0.07:rs=0.06:rm=0.04:bh=-0.02",
+        Lut::Mono => ",hue=s=0",
+    }
+}
+
+fn audio_fx(fx: &oc_timeline::AudioFx) -> String {
+    let mut s = String::new();
+    if fx.denoise {
+        s.push_str(",afftdn=nr=12:nf=-25");
+    }
+    if fx.low.abs() > 0.05 {
+        s.push_str(&format!(",equalizer=f=120:t=q:w=1:g={:.2}", fx.low.clamp(-12.0, 12.0)));
+    }
+    if fx.mid.abs() > 0.05 {
+        s.push_str(&format!(",equalizer=f=1000:t=q:w=1:g={:.2}", fx.mid.clamp(-12.0, 12.0)));
+    }
+    if fx.high.abs() > 0.05 {
+        s.push_str(&format!(",equalizer=f=8000:t=q:w=1:g={:.2}", fx.high.clamp(-12.0, 12.0)));
+    }
+    if fx.compressor {
+        s.push_str(",acompressor=threshold=-18dB:ratio=3:attack=20:release=200");
+    }
+    if fx.normalize {
+        s.push_str(",dynaudnorm=f=150:g=15");
     }
     s
 }
@@ -517,7 +609,8 @@ fn stitch_audio(
             let fi = clip.look.fade_in.as_seconds();
             let fo = clip.look.fade_out.as_seconds();
             let mut chain = format!(
-                "[{idx}:a]atrim=start={sin:.4}:duration={dur:.4},asetpts=PTS-STARTPTS+{start:.4}/TB,volume={volume:.3}"
+                "[{idx}:a]atrim=start={sin:.4}:duration={dur:.4},asetpts=PTS-STARTPTS+{start:.4}/TB,volume={volume:.3}{}"
+                , audio_fx(&clip.look.audio)
             );
             if fi > 0.04 {
                 chain.push_str(&format!(",afade=t=in:st={start:.3}:d={fi:.3}"));

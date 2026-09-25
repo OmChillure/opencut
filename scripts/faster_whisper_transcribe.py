@@ -45,8 +45,9 @@ def load_model():
     from faster_whisper import WhisperModel
 
     name = model_dir()
-    print(f"loading whisper {name} (cpu int8)…", file=sys.stderr, flush=True)
-    model = WhisperModel(name, device="cpu", compute_type="int8")
+    threads = os.cpu_count() or 4
+    print(f"loading whisper {name} (cpu int8, {threads} threads)…", file=sys.stderr, flush=True)
+    model = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=threads)
     print("whisper ready", file=sys.stderr, flush=True)
     return model
 

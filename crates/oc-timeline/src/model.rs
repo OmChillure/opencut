@@ -358,7 +358,7 @@ impl TransitionKind {
     }
 }
 
-/// Lift / gamma-style grade. 0 = unchanged. Range roughly -1..1.
+/// Lift / gamma / gain plus a preset LUT. 0 = unchanged. Range roughly -1..1.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Grade {
     #[serde(default)]
@@ -369,6 +369,30 @@ pub struct Grade {
     pub saturation: f32,
     #[serde(default)]
     pub temperature: f32,
+    /// Shadows. Kdenlive lift.
+    #[serde(default)]
+    pub lift: f32,
+    /// Midtones. Kdenlive gamma.
+    #[serde(default)]
+    pub gamma: f32,
+    /// Highlights. Kdenlive gain.
+    #[serde(default)]
+    pub gain: f32,
+    #[serde(default)]
+    pub lut: Lut,
+}
+
+/// Named looks. Applied as filter chains, not a loaded .cube file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lut {
+    #[default]
+    None,
+    Film,
+    Cool,
+    Warm,
+    TealOrange,
+    Mono,
 }
 
 impl Grade {
@@ -379,6 +403,53 @@ impl Grade {
             contrast: 0.14,
             saturation: 0.12,
             temperature: 0.06,
+            lut: Lut::Film,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn interview() -> Self {
+        Self {
+            exposure: 0.03,
+            contrast: 0.06,
+            saturation: 0.02,
+            temperature: 0.0,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn ad() -> Self {
+        Self {
+            exposure: 0.06,
+            contrast: 0.2,
+            saturation: 0.08,
+            temperature: -0.02,
+            gain: 0.06,
+            lut: Lut::TealOrange,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn vlog() -> Self {
+        Self {
+            exposure: 0.05,
+            contrast: 0.1,
+            saturation: 0.1,
+            temperature: 0.04,
+            lut: Lut::Warm,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn documentary() -> Self {
+        Self {
+            contrast: 0.05,
+            saturation: -0.04,
+            ..Self::default()
         }
     }
 
@@ -388,6 +459,10 @@ impl Grade {
             && self.contrast.abs() < 1e-4
             && self.saturation.abs() < 1e-4
             && self.temperature.abs() < 1e-4
+            && self.lift.abs() < 1e-4
+            && self.gamma.abs() < 1e-4
+            && self.gain.abs() < 1e-4
+            && self.lut == Lut::None
     }
 }
 
@@ -492,6 +567,48 @@ pub struct ClipLook {
     pub fx: Fx,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphic: Option<Graphic>,
+    /// End pose. When set, scale and pan move across the clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_to: Option<Transform>,
+    /// End speed. With `Clip::speed`, this is a ramp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_to: Option<f32>,
+    /// Fraction of the frame kept. None = full frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<Crop>,
+    #[serde(default)]
+    pub stabilize: bool,
+    #[serde(default)]
+    pub audio: AudioFx,
+}
+
+/// Rectangle inside the frame, each edge 0–1.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Crop {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Loudness, noise, EQ, and compression. Music is never generated here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AudioFx {
+    #[serde(default)]
+    pub normalize: bool,
+    #[serde(default)]
+    pub denoise: bool,
+    #[serde(default)]
+    pub compressor: bool,
+    /// dB at ~120 Hz.
+    #[serde(default)]
+    pub low: f32,
+    /// dB at ~1 kHz.
+    #[serde(default)]
+    pub mid: f32,
+    /// dB at ~8 kHz.
+    #[serde(default)]
+    pub high: f32,
 }
 
 impl ClipLook {

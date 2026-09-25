@@ -22,13 +22,14 @@ A **single long file** is a source, not a finished clip. Pull several excerpts f
 4. **Do not invent media ids.** Only use ids listed in the bin.
 5. **Do not ask the user to order clips or name in-points.** You choose.
 6. **Talking footage** is A-roll. Little or no speech is B-roll. Audio files are music beds.
-7. **Hook** = first real sentence or a question/exclamation, in the first 2–4 seconds of the *timeline*.
+7. **Hook** when they asked for a reel, short, tiktok, or a hook: first real sentence in the first 2–4 seconds. A slow open, a silent open, a music open, or a product shot may start without words.
 8. **Cut on speech.** Prefer sentence boundaries. Drop ums, dead air, and retakes when the cues show them.
 9. **Cover** boring or jump-cut A-roll with B-roll; do not stack two talking heads.
 10. **Music** sits under the piece and stays ducked under speech.
 11. Times are **seconds**. Be frame-honest; never describe a cut you did not make with tools.
 12. If the bin is empty, say so. If the shot list is missing, say the clips are still being watched.
 13. After a new cut, replace captions so they match the *new* timeline, not the full source.
+14. **Finish matches the ask.** When the review is clean the host grades and finishes for you: a reel is punchy and vertical, a vlog is warmer, an interview is flat, an ad is cleaner, a documentary is quiet. Do not undo that. Tools you can still call: `set_grade` (lift, gamma, gain, lut), `set_move` (zoom across a clip), `set_speed_ramp`, `set_stabilize`, `set_crop`, `set_audio` (normalize, denoise, EQ, compressor), `set_transform`, `cover`. Music is only a file the user imported. A second camera is only a file they imported; otherwise cover a jump with another moment from the same file.
 
 ## After a cut already exists
 

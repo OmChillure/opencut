@@ -1349,6 +1349,20 @@ fn incoming_preview_css(kind: oc_core::TransitionKind, mix: f64) -> (f64, String
     }
 }
 
+fn caption_line(text: &str, into: f64, span: f64) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() <= 7 {
+        return words.join(" ");
+    }
+    let groups = words.len().div_ceil(6).max(1);
+    let idx = ((into / span.max(0.01)) * groups as f64).floor() as usize;
+    words
+        .chunks(6)
+        .nth(idx.min(groups - 1))
+        .map(|group| group.join(" "))
+        .unwrap_or_default()
+}
+
 pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
@@ -1360,6 +1374,9 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
     let mut kind = oc_core::TransitionKind::Cut;
     let mut vignette = 0.0_f32;
     let mut grain = 0.0_f32;
+    let mut zoom = 1.0_f32;
+    let mut pan_x = 0.0_f32;
+    let mut pan_y = 0.0_f32;
     let mut volume = 1.0_f64;
     let mut graphics: Vec<(String, String)> = Vec::new();
     let mut next_url = String::new();
@@ -1376,7 +1393,10 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
             let local = (t - clip.start).as_seconds();
             let fade = clip.look.fade_gain(local, clip.duration.as_seconds());
             match &clip.kind {
-                oc_core::ClipKind::Video { .. } => {
+                oc_core::ClipKind::Video { transform } => {
+                    zoom = transform.scale;
+                    pan_x = transform.x;
+                    pan_y = transform.y;
                     filter = css_filter(clip.look.grade, clip.look.fx);
                     opacity = fade;
                     vignette = clip.look.fx.vignette;
@@ -1433,7 +1453,9 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
                 oc_core::ClipKind::Caption { style: _, cues } => {
                     let local_t = oc_core::Time::from_ticks((t - clip.start).as_ticks());
                     if let Some(cue) = cues.iter().find(|c| local_t >= c.start && local_t < c.end) {
-                        graphics.push(("caption".into(), cue.text.clone()));
+                        let span = (cue.end - cue.start).as_seconds().max(0.3);
+                        let into = (local_t - cue.start).as_seconds().clamp(0.0, span);
+                        graphics.push(("caption".into(), caption_line(&cue.text, into, span)));
                     }
                 }
             }
@@ -1441,7 +1463,17 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
     }
 
     if let Some(video) = preview_video() {
-        let (a, transform, clip_path, extra_filter) = mix_preview_css(kind, mix, opacity, &filter);
+        let (a, mix_tf, clip_path, extra_filter) = mix_preview_css(kind, mix, opacity, &filter);
+        let transform = if (zoom - 1.0).abs() > 0.01 || pan_x.abs() > 0.5 || pan_y.abs() > 0.5 {
+            let punch = format!("scale({zoom:.3}) translate({pan_x:.1}px,{pan_y:.1}px)");
+            if mix_tf == "none" {
+                punch
+            } else {
+                format!("{punch} {mix_tf}")
+            }
+        } else {
+            mix_tf
+        };
         let _ = video.set_attribute(
             "style",
             &format!(
