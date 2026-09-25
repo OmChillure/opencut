@@ -7,6 +7,7 @@ mod toast;
 mod tools;
 
 use dioxus::prelude::*;
+use wasm_bindgen::JsCast;
 use media::{
     Clock, DragSession, DragSource, EditMode, EditTool, EditorTrack, MediaItem, MediaKind,
     TimelineClip, TrackKindUi, advance_playhead, clip_duration, commit_drag,
@@ -126,6 +127,30 @@ impl Aspect {
         }
     }
 }
+
+#[derive(Clone)]
+struct HeldImport {
+    id: String,
+    name: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct CtxHeld(Signal<Vec<HeldImport>>);
+
+#[derive(Clone, Copy)]
+struct CtxProject(Signal<String>);
+#[derive(Clone, Copy)]
+struct CtxTargetTrack(Signal<String>);
+#[derive(Clone, Copy)]
+struct CtxActive(Signal<Option<String>>);
+#[derive(Clone, Copy)]
+struct CtxSelected(Signal<Option<String>>);
+#[derive(Clone, Copy)]
+struct CtxZoom(Signal<f64>);
+#[derive(Clone, Copy)]
+struct CtxTimelineH(Signal<f64>);
 
 #[derive(Clone, Copy)]
 pub(crate) struct WorkspaceSave {
@@ -254,6 +279,7 @@ fn Workspace(id: String) -> Element {
     let persist_q = use_signal(Vec::<Vec<Op>>::new);
     let persist_busy = use_signal(|| false);
     let selected_clip = use_signal(|| None::<String>);
+    let held = use_signal(Vec::<HeldImport>::new);
     let clock = Clock {
         current,
         duration,
@@ -272,24 +298,43 @@ fn Workspace(id: String) -> Element {
     use_context_provider(|| aspect);
     use_context_provider(|| library);
     use_context_provider(|| tracks);
-    use_context_provider(|| active);
-    use_context_provider(|| project_id);
+    use_context_provider(|| CtxActive(active));
+    use_context_provider(|| CtxProject(project_id));
+    use_context_provider(|| CtxHeld(held));
     use_context_provider(|| clock);
     use_context_provider(|| edit_mode);
     use_context_provider(|| edit_tool);
-    use_context_provider(|| target_track);
+    use_context_provider(|| CtxTargetTrack(target_track));
     use_context_provider(|| drag);
-    use_context_provider(|| pps);
+    use_context_provider(|| CtxZoom(pps));
     use_context_provider(|| suppress_seek);
-    use_context_provider(|| tl_h);
+    use_context_provider(|| CtxTimelineH(tl_h));
     use_context_provider(|| tl_drag);
     use_context_provider(|| save);
-    use_context_provider(|| selected_clip);
+    use_context_provider(|| CtxSelected(selected_clip));
 
     use_effect(move || {
         if !auth::is_signed_in() {
             nav.replace(Route::Login {});
         }
+    });
+    use_effect(move || {
+        let held = held;
+        let Some(win) = web_sys::window() else {
+            return;
+        };
+        let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::BeforeUnloadEvent| {
+            if held.peek().is_empty() {
+                return;
+            }
+            event.prevent_default();
+            event.set_return_value(
+                "Imported files are only in this browser tab and will be removed.",
+            );
+        }) as Box<dyn FnMut(web_sys::BeforeUnloadEvent)>);
+        let handler: &js_sys::Function = closure.as_ref().unchecked_ref();
+        win.set_onbeforeunload(Some(handler));
+        closure.forget();
     });
 
     use_future(move || async move {
@@ -490,13 +535,25 @@ fn drag_chip(drag: Signal<Option<DragSession>>) -> Element {
 
 #[component]
 fn Header(name: Signal<String>) -> Element {
-    let project_id = use_context::<Signal<String>>();
+    let project_id = use_context::<CtxProject>().0;
     let save = use_context::<WorkspaceSave>();
+    let held = use_context::<CtxHeld>().0;
     let aspect = use_context::<Signal<Aspect>>();
+    let library = use_context::<Signal<Vec<MediaItem>>>();
+    let tracks = use_context::<Signal<Vec<EditorTrack>>>();
+    let unsaved = !held.read().is_empty();
     rsx! {
         header { class: "header",
             div { class: "header-left",
-                Link { to: Route::Projects {}, class: "logo", title: "Projects",
+                button {
+                    class: "logo",
+                    title: "Projects",
+                    onclick: move |_| {
+                        if !confirm_leave(held) {
+                            return;
+                        }
+                        navigator().replace(Route::Projects {});
+                    },
                     IconScissors {}
                 }
                 input {
@@ -529,6 +586,13 @@ fn Header(name: Signal<String>) -> Element {
                         });
                     },
                     "Delete"
+                }
+                button {
+                    class: if unsaved { "btn btn-primary" } else { "btn btn-ghost" },
+                    disabled: !unsaved,
+                    title: "Store imported files so they survive leaving this project",
+                    onclick: move |_| save_held_imports(held, library, tracks, save),
+                    "Save progress"
                 }
                 button {
                     class: "btn btn-primary",
@@ -669,8 +733,8 @@ fn live_note(save: WorkspaceSave, library: &[MediaItem], result: Result<Vec<Stri
 fn AssetView(tab: AssetTab) -> Element {
     let save = use_context::<WorkspaceSave>();
     let clock = use_context::<Clock>();
-    let target_track = use_context::<Signal<String>>();
-    let selected_clip = use_context::<Signal<Option<String>>>();
+    let target_track = use_context::<CtxTargetTrack>().0;
+    let selected_clip = use_context::<CtxSelected>().0;
     let library = use_context::<Signal<Vec<MediaItem>>>();
     let mut tab_sig = use_context::<Signal<AssetTab>>();
 
@@ -851,12 +915,12 @@ fn AssetView(tab: AssetTab) -> Element {
 fn MediaPanel() -> Element {
     let mut library = use_context::<Signal<Vec<MediaItem>>>();
     let mut tracks = use_context::<Signal<Vec<EditorTrack>>>();
-    let mut active = use_context::<Signal<Option<String>>>();
-    let project_id = use_context::<Signal<String>>();
+    let mut active = use_context::<CtxActive>().0;
     let clock = use_context::<Clock>();
-    let target_track = use_context::<Signal<String>>();
+    let target_track = use_context::<CtxTargetTrack>().0;
     let edit_mode = use_context::<Signal<EditMode>>();
     let mut drag = use_context::<Signal<Option<DragSession>>>();
+    let mut held = use_context::<CtxHeld>().0;
     let save = use_context::<WorkspaceSave>();
 
     rsx! {
@@ -875,54 +939,22 @@ fn MediaPanel() -> Element {
                                 for file in evt.files() {
                                     let name = file.name();
                                     let Ok(bytes) = file.read_bytes().await else { continue };
-                                    let pid = project_id.peek().clone();
                                     let ctype = MediaKind::mime(&name).to_string();
-                                    let media_id = match crate::api::upload_media(
-                                        &pid,
-                                        &name,
-                                        &ctype,
-                                        bytes.to_vec(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(id) => id,
-                                        Err(err) => {
-                                            crate::toast::try_toast()
-                                                .map(|t| t.error(format!("Import failed: {err}")));
-                                            uuid::Uuid::now_v7().to_string()
-                                        }
-                                    };
-                                    let Some(mut item) =
-                                        item_from_bytes_id(name, &bytes, media_id.clone())
-                                    else {
+                                    let id = uuid::Uuid::now_v7().to_string();
+                                    let Some(item) = item_from_bytes_id(name.clone(), &bytes, id.clone()) else {
                                         continue;
                                     };
-                                    item.url = crate::api::media_file_url(&pid, &item.id);
                                     if matches!(item.kind, MediaKind::Video | MediaKind::Image)
                                         && active.read().is_none()
                                     {
                                         active.set(Some(item.url.clone()));
                                     }
-                                    let pid2 = pid.clone();
-                                    let sync = item.clone();
-                                    let file_bytes = bytes.to_vec();
                                     library.write().push(item);
-                                    spawn(async move {
-                                        let _ = crate::api::register_media(
-                                            &pid2,
-                                            &sync.id,
-                                            &sync.name,
-                                            &sync.content_type,
-                                            sync.duration,
-                                        )
-                                        .await;
-                                        let _ = crate::api::put_media_bytes(
-                                            &pid2,
-                                            &sync.id,
-                                            &sync.content_type,
-                                            file_bytes,
-                                        )
-                                        .await;
+                                    held.write().push(HeldImport {
+                                        id,
+                                        name,
+                                        content_type: ctype,
+                                        bytes: bytes.to_vec(),
                                     });
                                 }
                             });
@@ -1189,14 +1221,14 @@ fn Timeline() -> Element {
     let library = use_context::<Signal<Vec<MediaItem>>>();
     let mut tracks = use_context::<Signal<Vec<EditorTrack>>>();
     let clock = use_context::<Clock>();
-    let mut target_track = use_context::<Signal<String>>();
+    let mut target_track = use_context::<CtxTargetTrack>().0;
     let mut edit_mode = use_context::<Signal<EditMode>>();
     let mut edit_tool = use_context::<Signal<EditTool>>();
-    let mut selected_clip = use_context::<Signal<Option<String>>>();
+    let mut selected_clip = use_context::<CtxSelected>().0;
     let mut drag = use_context::<Signal<Option<DragSession>>>();
-    let mut pps = use_context::<Signal<f64>>();
+    let mut pps = use_context::<CtxZoom>().0;
     let mut suppress_seek = use_context::<Signal<bool>>();
-    let mut tl_h = use_context::<Signal<f64>>();
+    let mut tl_h = use_context::<CtxTimelineH>().0;
     let mut tl_drag = use_context::<Signal<Option<(f64, f64)>>>();
     let save = use_context::<WorkspaceSave>();
     let mut view_h = use_signal(|| 280.0_f64);
@@ -1852,6 +1884,72 @@ fn Timeline() -> Element {
     }
 }
 
+fn confirm_leave(held: Signal<Vec<HeldImport>>) -> bool {
+    if held.peek().is_empty() {
+        return true;
+    }
+    let n = held.peek().len();
+    let msg = format!(
+        "{n} imported file(s) are only in this browser tab. Leave without saving and they will be removed."
+    );
+    web_sys::window()
+        .and_then(|w| w.confirm_with_message(&msg).ok())
+        .unwrap_or(false)
+}
+
+fn save_held_imports(
+    mut held: Signal<Vec<HeldImport>>,
+    mut library: Signal<Vec<MediaItem>>,
+    mut tracks: Signal<Vec<EditorTrack>>,
+    save: WorkspaceSave,
+) {
+    let batch = held.peek().clone();
+    if batch.is_empty() {
+        return;
+    }
+    let pid = page_project_id().unwrap_or_else(|| save.project_id.peek().clone());
+    spawn(async move {
+        let mut failed = 0usize;
+        for file in batch {
+            match crate::api::upload_media(&pid, &file.name, &file.content_type, file.bytes).await {
+                Ok(server_id) => {
+                    if let Some(item) = library.write().iter_mut().find(|item| item.id == file.id) {
+                        item.id = server_id.clone();
+                    }
+                    let mut changed = false;
+                    for track in tracks.write().iter_mut() {
+                        for clip in track.clips.iter_mut() {
+                            if clip.media_id == file.id {
+                                clip.media_id = server_id.clone();
+                                changed = true;
+                            }
+                        }
+                    }
+                    held.write().retain(|row| row.id != file.id);
+                    if changed {
+                        persist(save);
+                    }
+                }
+                Err(err) => {
+                    failed += 1;
+                    show_toast().error(format!("Save failed for {}: {err}", file.name));
+                }
+            }
+        }
+        if failed == 0 {
+            show_toast().success("Progress saved. Imported files are stored.");
+        }
+    });
+}
+
+fn page_project_id() -> Option<String> {
+    let path = web_sys::window()?.location().pathname().ok()?;
+    let id = path.trim_matches('/').strip_suffix("/workspace")?;
+    let id = id.trim_matches('/');
+    uuid::Uuid::parse_str(id).ok()?;
+    Some(id.to_string())
+}
+
 fn seek_to_time(clock: Clock, time: f64) {
     crate::media::seek_to(clock, time);
 }
@@ -1980,7 +2078,7 @@ fn AiSidebar(
 
     let save = use_context::<WorkspaceSave>();
     let clock = use_context::<Clock>();
-    let target_track = use_context::<Signal<String>>();
+    let target_track = use_context::<CtxTargetTrack>().0;
     let mut picker_open = use_signal(|| false);
     let mut providers = use_signal(Vec::<api::AiProvider>::new);
     let mut provider_id = use_signal(|| "xai".to_string());

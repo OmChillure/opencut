@@ -5,6 +5,7 @@ mod state;
 
 use anyhow::Context;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -18,6 +19,14 @@ use crate::routes::{
     register_media, request_upload, transcribe_media, update_project,
 };
 use crate::state::AppState;
+
+fn max_upload_bytes() -> usize {
+    std::env::var("OPENCUT_MAX_UPLOAD_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/v1/projects/{id}/media/{media_id}/bytes",
-            axum::routing::put(put_media_bytes),
+            axum::routing::put(put_media_bytes).layer(DefaultBodyLimit::max(max_upload_bytes())),
         )
         .route(
             "/v1/projects/{id}/media/{media_id}/file",

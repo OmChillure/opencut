@@ -1,7 +1,6 @@
 //! AI integrations. Object storage lives in `oc-db`.
 
 mod acp;
-mod anthropic;
 mod catalog;
 mod compat;
 mod llm;

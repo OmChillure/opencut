@@ -1,6 +1,9 @@
+mod shots;
+mod subject;
 mod vision;
 
-pub use vision::{VisualDigest, analyze_local};
+pub use shots::{ShotBrief, ShotRole, brief_shots, format_shot_list};
+pub use vision::{ShotLook, VisualDigest, analyze_local, analyze_path, picture_ranges};
 
 use oc_time::{Duration, FrameRate};
 use oc_timeline::{MediaId, ProjectId};

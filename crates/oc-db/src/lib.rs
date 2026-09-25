@@ -425,6 +425,16 @@ pub async fn claim_job(pool: &Db) -> Result<Option<JobRow>, DbError> {
     Ok(row)
 }
 
+pub async fn job_finished(pool: &Db, id: Uuid) -> Result<bool, DbError> {
+    let row = query_as::<(String,)>(
+        "select status from jobs where id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some("done" | "failed") | None))
+}
+
 pub async fn finish_job(pool: &Db, id: Uuid, error: Option<&str>) -> Result<(), DbError> {
     let status = if error.is_some() { "failed" } else { "done" };
     query("update jobs set status = $2, error = $3, updated_at = now() where id = $1")
@@ -434,6 +444,16 @@ pub async fn finish_job(pool: &Db, id: Uuid, error: Option<&str>) -> Result<(), 
         .execute(pool)
         .await?;
     Ok(())
+}
+
+pub async fn has_transcript(pool: &Db, media_id: Uuid) -> Result<bool, DbError> {
+    let row = query_as::<(Uuid,)>(
+        "select id from transcripts where media_id = $1 limit 1",
+    )
+    .bind(media_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
 }
 
 pub async fn insert_transcript(
@@ -512,6 +532,7 @@ pub struct AnalysisRow {
     pub colorful: bool,
     pub has_video: bool,
     pub has_audio: bool,
+    pub raw: Option<serde_json::Value>,
 }
 
 pub async fn upsert_media_analysis(
@@ -560,7 +581,7 @@ pub async fn list_analysis_for_project(
     project_id: Uuid,
 ) -> Result<Vec<AnalysisRow>, DbError> {
     let rows = query_as::<AnalysisRow>(
-        "select a.media_id, a.look, a.motion, a.scenes, a.brightness, a.colorful, a.has_video, a.has_audio
+        "select a.media_id, a.look, a.motion, a.scenes, a.brightness, a.colorful, a.has_video, a.has_audio, a.raw
          from media_analysis a
          join media m on m.id = a.media_id
          where m.project_id = $1",

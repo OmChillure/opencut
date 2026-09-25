@@ -100,10 +100,6 @@ pub fn format_tc_short(secs: f64) -> String {
     }
 }
 
-pub fn trim_in(tracks: &mut [EditorTrack], clip_id: &str, new_start: f64) {
-    trim_in_mode(tracks, clip_id, new_start, false);
-}
-
 pub fn trim_in_mode(tracks: &mut [EditorTrack], clip_id: &str, new_start: f64, ripple: bool) {
     let Some((ti, ci)) = locate_clip(tracks, clip_id) else {
         return;
@@ -132,10 +128,6 @@ pub fn trim_in_mode(tracks: &mut [EditorTrack], clip_id: &str, new_start: f64, r
     if ripple {
         shift_after(&mut tracks[ti], clip_id, -delta);
     }
-}
-
-pub fn trim_out(tracks: &mut [EditorTrack], clip_id: &str, new_end: f64) {
-    trim_out_mode(tracks, clip_id, new_end, false);
 }
 
 pub fn trim_out_mode(tracks: &mut [EditorTrack], clip_id: &str, new_end: f64, ripple: bool) {
@@ -241,17 +233,6 @@ fn empty_track(id: &str, name: &str, kind: TrackKindUi) -> EditorTrack {
         hidden: false,
         clips: Vec::new(),
     }
-}
-
-pub fn default_tracks() -> Vec<EditorTrack> {
-    vec![
-        empty_track("v3", "V3", TrackKindUi::Video),
-        empty_track("v2", "V2", TrackKindUi::Video),
-        empty_track("v1", "V1", TrackKindUi::Video),
-        empty_track("a1", "A1", TrackKindUi::Audio),
-        empty_track("a2", "A2", TrackKindUi::Audio),
-        empty_track("a3", "A3", TrackKindUi::Audio),
-    ]
 }
 
 pub fn base_lane_height(kind: TrackKindUi) -> f64 {
@@ -889,17 +870,6 @@ fn push_clip(track: &mut EditorTrack, media_id: String, start: f64, duration: f6
     });
 }
 
-/// Razor the target track at `at`. Same as Kdenlive Shift+R on the active track.
-pub fn razor_at(tracks: &mut [EditorTrack], track_id: &str, at: f64) {
-    if let Some(track) = tracks.iter_mut().find(|track| track.id == track_id) {
-        split_track_at(track, at);
-        return;
-    }
-    for track in tracks.iter_mut() {
-        split_track_at(track, at);
-    }
-}
-
 fn split_track_at(track: &mut EditorTrack, at: f64) {
     let mut next = Vec::with_capacity(track.clips.len() + 1);
     for clip in track.clips.drain(..) {
@@ -1031,14 +1001,6 @@ impl MediaKind {
             _ => "application/octet-stream",
         }
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Video => "Video",
-            Self::Audio => "Audio",
-            Self::Image => "Image",
-        }
-    }
 }
 
 pub fn blob_url(bytes: &[u8], mime: &str) -> Option<String> {
@@ -1049,10 +1011,6 @@ pub fn blob_url(bytes: &[u8], mime: &str) -> Option<String> {
     opts.set_type(mime);
     let blob = Blob::new_with_u8_array_sequence_and_options(&parts, &opts).ok()?;
     Url::create_object_url_with_blob(&blob).ok()
-}
-
-pub fn item_from_bytes(name: String, bytes: &[u8]) -> Option<MediaItem> {
-    item_from_bytes_id(name, bytes, Uuid::now_v7().to_string())
 }
 
 pub fn item_from_bytes_id(name: String, bytes: &[u8], id: String) -> Option<MediaItem> {
@@ -1701,17 +1659,6 @@ pub fn paint_playhead(now: f64) {
     }
 }
 
-pub fn play_preview(play: bool) {
-    let Some(video) = preview_video() else {
-        return;
-    };
-    if play {
-        let _ = video.play();
-    } else {
-        video.pause();
-    }
-}
-
 pub fn seek_to(mut clock: Clock, time: f64) {
     let t = time.max(0.0);
     set_playhead(t);
@@ -1723,23 +1670,6 @@ pub fn seek_to(mut clock: Clock, time: f64) {
 pub fn seek_by(clock: Clock, delta: f64) {
     let now = *clock.current.read();
     seek_to(clock, now + delta);
-}
-
-pub fn seek_ratio(clock: Clock, ratio: f64) {
-    let dur = *clock.duration.read();
-    if dur <= 0.0 {
-        return;
-    }
-    seek_to(clock, ratio.clamp(0.0, 1.0) * dur);
-}
-
-pub fn format_tc(secs: f64) -> String {
-    let total = secs.max(0.0);
-    let h = (total / 3600.0) as u32;
-    let m = ((total % 3600.0) / 60.0) as u32;
-    let s = (total % 60.0) as u32;
-    let f = (total.fract() * 30.0) as u32;
-    format!("{h:02}:{m:02}:{s:02}:{f:02}")
 }
 
 #[cfg(test)]
@@ -1876,11 +1806,4 @@ pub fn format_clock(secs: f64) -> String {
     let m = (total / 60.0) as u32;
     let s = (total % 60.0) as u32;
     format!("{m:02}:{s:02}")
-}
-
-pub fn ruler_marks(duration: f64) -> Vec<String> {
-    let span = if duration > 0.0 { duration } else { 10.0 };
-    (0..6)
-        .map(|i| format_clock(span * i as f64 / 5.0))
-        .collect()
 }

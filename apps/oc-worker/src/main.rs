@@ -2,7 +2,7 @@ use anyhow::Context;
 use std::path::Path;
 use oc_core::{CaptionCue, Op, UndoStack, apply};
 use oc_db::Db;
-use oc_voice::transcribe_local;
+use oc_voice::transcribe_path;
 use oc_db::R2;
 use serde::Deserialize;
 use tokio::time::{Duration, sleep};
@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     oc_db::migrate(&db).await.ok();
     let r2 = R2::from_env().await.ok();
     if r2.is_none() {
-        tracing::warn!("R2 not configured — transcribe jobs will fail");
+        tracing::info!("R2 not configured — understand runs on local files only");
     }
     if oc_voice::groq_stt_configured() {
         tracing::info!("understand = ffmpeg look + Groq Whisper (free, ~8h audio/day)");
@@ -115,6 +115,49 @@ async fn handle(
     }
 }
 
+struct OpenedMedia {
+    path: std::path::PathBuf,
+    /// Temp directory to delete after the job. `None` when the file is already local.
+    cleanup: Option<std::path::PathBuf>,
+}
+
+async fn open_media(r2: Option<&R2>, key: &str) -> anyhow::Result<OpenedMedia> {
+    if oc_db::is_r2_object_key(key) {
+        let r2 = r2.context("R2 required")?;
+        let bytes = r2.get_bytes(key).await?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("oc-src-{stamp}"));
+        tokio::fs::create_dir_all(&dir).await?;
+        let name = key.rsplit('/').next().unwrap_or("media.bin");
+        let path = dir.join(name);
+        tokio::fs::write(&path, &bytes).await?;
+        return Ok(OpenedMedia {
+            path,
+            cleanup: Some(dir),
+        });
+    }
+    if let Some(path) = oc_db::local_media_path(key) {
+        if path.is_file() {
+            return Ok(OpenedMedia {
+                path,
+                cleanup: None,
+            });
+        }
+        anyhow::bail!("local media missing: {}", path.display());
+    }
+    let path = std::path::PathBuf::from(key);
+    if path.is_file() {
+        return Ok(OpenedMedia {
+            path,
+            cleanup: None,
+        });
+    }
+    anyhow::bail!("media not found: {key}");
+}
+
 async fn transcribe(
     db: &Db,
     r2: Option<&R2>,
@@ -122,27 +165,27 @@ async fn transcribe(
 ) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     tracing::info!(media = %p.media_id, key = %p.r2_key, "transcribe start");
-    if !oc_db::is_r2_object_key(&p.r2_key) {
-        oc_db::set_media_status(db, p.media_id, "ready").await?;
-        anyhow::bail!("clip not in R2 yet (workspace-only). Re-import or wait for upload.");
-    }
-    let r2 = r2.context("R2 required")?;
-    let bytes = match r2.get_bytes(&p.r2_key).await {
-        Ok(b) => b,
+    let opened = match open_media(r2, &p.r2_key).await {
+        Ok(opened) => opened,
         Err(e) => {
             oc_db::set_media_status(db, p.media_id, "ready").await?;
-            anyhow::bail!("R2 missing object {}: {e}", p.r2_key);
+            return Err(e);
         }
     };
-    tracing::info!(
-        media = %p.media_id,
-        bytes = bytes.len(),
-        ms = t0.elapsed().as_millis(),
-        "r2 download"
-    );
-    let filename = p.r2_key.rsplit('/').next().unwrap_or("audio.bin");
+    let result = understand_file(db, &p, &opened.path, t0).await;
+    if let Some(dir) = &opened.cleanup {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    result
+}
 
-    match oc_media::analyze_local(&bytes, filename).await {
+async fn understand_file(
+    db: &Db,
+    p: &TranscribePayload,
+    path: &Path,
+    t0: std::time::Instant,
+) -> anyhow::Result<()> {
+    match oc_media::analyze_path(path).await {
         Ok(look) => {
             let raw = serde_json::to_value(&look).unwrap_or(serde_json::json!({}));
             if let Err(e) = oc_db::upsert_media_analysis(
@@ -164,6 +207,7 @@ async fn transcribe(
                 tracing::info!(
                     look = %look.look,
                     scenes = look.scenes,
+                    shots = look.shots.len(),
                     ms = t0.elapsed().as_millis(),
                     "look saved — chat can proceed"
                 );
@@ -172,8 +216,14 @@ async fn transcribe(
         Err(e) => tracing::warn!("local look failed: {e}"),
     }
 
+    if oc_db::has_transcript(db, p.media_id).await.unwrap_or(false) {
+        tracing::info!(media = %p.media_id, "speech already stored — look refreshed");
+        oc_db::set_media_status(db, p.media_id, "ready").await?;
+        return Ok(());
+    }
+
     tracing::info!(media = %p.media_id, "whisper start");
-    let transcript = match transcribe_local(&bytes, filename).await {
+    let transcript = match transcribe_path(path).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(media = %p.media_id, "whisper skipped: {e}");

@@ -4,8 +4,9 @@ Think, then act. Match the tools to **this** request — do not run a stock vlog
 
 ## 1. Inventory
 
-Call `list_bin` and `list_timeline` first. For a long file, call `get_media` or `list_cues`
-so you have timestamped sentences. Do not guess. Do not ask the user to paste clips.
+Call `list_bin` and `list_timeline` first. For a long file, call `get_media`.
+Read the shot list (`start-end`, look, `speech` / `silence` / `filler`, words).
+`list_cues` is the raw transcript if you still need a line the shot list cut off.
 
 From those tools (not filenames):
 

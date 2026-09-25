@@ -8,12 +8,13 @@ use axum::response::Response;
 use futures_util::StreamExt;
 use oc_core::{
     MediaId, Op, Project, ProjectId, Timeline, UndoStack, apply, is_director_request, mcp_tools,
+    review_cut,
 };
 use oc_core::time::TICKS_PER_SECOND;
 use oc_providers::{ChatEvent, ChatTurn, LlmReply};
 use oc_media::{ObjectKind, object_key};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -111,10 +112,10 @@ pub async fn delete_project(
     let keys = oc_db::delete_project(&state.db, id).await?;
     let mut r2_deleted = 0u32;
     if let Some(r2) = &state.r2 {
-        for key in &keys {
+        for key in keys.iter().filter(|key| oc_db::is_r2_object_key(key)) {
             match r2.delete_object(key).await {
                 Ok(()) => r2_deleted += 1,
-                Err(err) => tracing::warn!(key, "{err}"),
+                Err(err) => tracing::warn!(key, "R2 delete skipped: {err}"),
             }
         }
         for kind in [
@@ -249,6 +250,73 @@ fn line(value: &serde_json::Value) -> String {
     format!("{value}\n")
 }
 
+async fn wait_for_understand(state: &AppState, tx: &mpsc::Sender<String>, jobs: &[Uuid]) {
+    let secs = std::env::var("OPENCUT_UNDERSTAND_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(180);
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut last_note = Instant::now();
+    loop {
+        let pending = jobs.len()
+            - futures(jobs, state).await;
+        if pending == 0 {
+            push(
+                tx,
+                serde_json::json!({"type":"status","text":"Shot list is ready."}),
+            )
+            .await;
+            return;
+        }
+        if Instant::now() >= deadline {
+            push(
+                tx,
+                serde_json::json!({
+                    "type": "status",
+                    "text": "Shot list is still running. Cutting with what is ready — ask again if the bin has no shots yet."
+                }),
+            )
+            .await;
+            return;
+        }
+        if last_note.elapsed() >= Duration::from_secs(8) {
+            push(
+                tx,
+                serde_json::json!({
+                    "type": "status",
+                    "text": format!("Still watching clips ({pending} left) before cutting.")
+                }),
+            )
+            .await;
+            last_note = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn futures(jobs: &[Uuid], state: &AppState) -> usize {
+    let mut done = 0;
+    for id in jobs {
+        if oc_db::job_finished(&state.db, *id).await.unwrap_or(false) {
+            done += 1;
+        }
+    }
+    done
+}
+
+async fn fresh_review(state: &AppState, id: Uuid, request: &str) -> oc_core::CutReview {
+    let timeline = oc_db::get_project(&state.db, id)
+        .await
+        .map(|p| p.timeline)
+        .unwrap_or_default();
+    let rows = oc_db::list_transcripts_for_project(&state.db, id)
+        .await
+        .unwrap_or_default();
+    let speech = speech_by_media(&rows);
+    review_cut(&timeline, &edit::spoken(&speech), request)
+}
+
 async fn push(tx: &mpsc::Sender<String>, value: serde_json::Value) {
     let _ = tx.send(line(&value)).await;
 }
@@ -287,14 +355,14 @@ async fn run_chat(
         .iter()
         .rev()
         .find(|m| m.role == "user")
-        .map(|m| m.content.as_str())
-        .unwrap_or("");
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
     tracing::info!(
         project = %id,
         media = media.len(),
         transcripts = transcripts.len(),
         looks = looks.len(),
-        director = is_director_request(last_user),
+        director = is_director_request(&last_user),
         user = %last_user.chars().take(120).collect::<String>(),
         "chat context"
     );
@@ -303,27 +371,39 @@ async fn run_chat(
             speech.contains_key(&m.id) || looks.contains_key(&m.id)
         });
         let needs_scan = media.iter().any(|m| {
-            !m.content_type.starts_with("image/")
-                && !speech.contains_key(&m.id)
-                && !looks.contains_key(&m.id)
+            if m.content_type.starts_with("image/") {
+                return false;
+            }
+            let stale = looks.get(&m.id).is_some_and(|l| {
+                l.has_video && crate::edit::shot_looks(l).is_empty()
+            });
+            stale || (!speech.contains_key(&m.id) && !looks.contains_key(&m.id))
         });
         if needs_scan {
             push(
                 &tx,
-                serde_json::json!({"type":"status","text":"Watching clips locally (ffmpeg + Whisper)"}),
+                serde_json::json!({"type":"status","text":"Watching clips before the cut (shot list, then words)"}),
             )
             .await;
+            let mut jobs = Vec::new();
             for row in &media {
                 if row.content_type.starts_with("image/") {
                     continue;
                 }
-                if speech.contains_key(&row.id) || looks.contains_key(&row.id) {
+                let stale_look = looks.get(&row.id).is_some_and(|l| {
+                    l.has_video && crate::edit::shot_looks(l).is_empty()
+                });
+                if (speech.contains_key(&row.id) || looks.contains_key(&row.id)) && !stale_look
+                {
                     continue;
                 }
-                if !oc_db::is_r2_object_key(&row.r2_key) {
+                let on_disk = oc_db::local_media_path(&row.r2_key)
+                    .is_some_and(|p| p.is_file())
+                    || std::path::Path::new(&row.r2_key).is_file();
+                if !oc_db::is_r2_object_key(&row.r2_key) && !on_disk {
                     continue;
                 }
-                let _ = oc_db::enqueue_job(
+                if let Ok(job) = oc_db::enqueue_job(
                     &state.db,
                     "transcribe",
                     serde_json::json!({
@@ -332,18 +412,19 @@ async fn run_chat(
                         "r2_key": row.r2_key,
                     }),
                 )
-                .await;
+                .await
+                {
+                    jobs.push(job);
+                }
             }
-            if !understood {
-                tracing::info!(
-                    project = %id,
-                    "scan queued — not blocking chat on whisper"
-                );
+            if !jobs.is_empty() {
+                wait_for_understand(&state, &tx, &jobs).await;
+            } else if !understood {
                 push(
                     &tx,
                     serde_json::json!({
                         "type": "status",
-                        "text": "Hearing clips in the background (ffmpeg look first, Whisper after). Keep talking — don't wait."
+                        "text": "No file on disk to watch yet. Re-import the clip."
                     }),
                 )
                 .await;
@@ -354,8 +435,12 @@ async fn run_chat(
     let system = format!(
         "You are the picture editor for project '{}'. Do what the user asked — \
          reel, trim, recut, captions, silence, whatever. There is no default cut. \
-         Call list_bin and list_timeline first. For a long file, call get_media or \
-         list_cues and place excerpts with source_in + duration. Do not assume the \
+         Call list_bin and list_timeline first. For a long file, call get_media. \
+         It returns a shot list: start-end, look, subject (person, product, street, …), \
+         speech|silence|filler, and the words. Place excerpts on those times. \
+         Drop filler and long silence unless asked to keep them. \
+         After tools, a cut review lists fix: lines (length, late hook, jump cut, stacked talk). \
+         Fix those with tools before you say the cut is done. Do not assume the \
          bin is empty. Never describe an edit you did not make with tools.",
         project.name
     );
@@ -397,6 +482,23 @@ async fn run_chat(
         };
         match reply {
             LlmReply::Text(t) => {
+                let review = fresh_review(&state, id, &last_user).await;
+                if review.issues && turn_i + 1 < 8 {
+                    tracing::info!(project = %id, "cut review rejected a finished reply");
+                    turns.push(ChatTurn {
+                        role: "assistant".into(),
+                        content: t,
+                    });
+                    turns.push(ChatTurn {
+                        role: "user".into(),
+                        content: format!(
+                            "{}\nThose fix: lines are still open. Correct them with tools. \
+                             Do not describe the cut as done.",
+                            review.text
+                        ),
+                    });
+                    continue;
+                }
                 text = t;
                 break;
             }
@@ -454,11 +556,15 @@ async fn run_chat(
                     role: "assistant".into(),
                     content: format!("Called tools:\n{batch}"),
                 });
+                let review = fresh_review(&state, id, &last_user).await;
                 turns.push(ChatTurn {
                     role: "user".into(),
-                    content: "Tool results above. If the timeline does not match the request, \
-                              keep using tools. If it does, reply in 2–4 sentences."
-                        .into(),
+                    content: format!(
+                        "Tool results above.\n{review}\n\
+                         If a line starts with \"fix:\", correct it with tools unless the user asked for it. \
+                         If the cut matches the request, reply in 2–4 sentences.",
+                        review = review.text
+                    ),
                 });
             }
         }
@@ -559,7 +665,6 @@ pub async fn put_media_bytes(
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&media.content_type)
         .to_string();
-    let project_id = ProjectId::from_uuid(id);
     let key = store_media_bytes(&state, id, media_id, &media, &ctype, body.to_vec()).await?;
     oc_db::set_media_r2_key(&state.db, media_id, &key).await?;
     if !ctype.starts_with("image/") {

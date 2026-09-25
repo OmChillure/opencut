@@ -131,6 +131,28 @@ pub(crate) fn look_by_media(rows: &[oc_db::AnalysisRow]) -> HashMap<Uuid, oc_db:
     rows.iter().cloned().map(|r| (r.media_id, r)).collect()
 }
 
+pub(crate) fn spoken(speech: &HashMap<Uuid, Speech>) -> Vec<oc_core::Spoken> {
+    speech
+        .iter()
+        .flat_map(|(id, s)| {
+            let media = MediaId::from_uuid(*id);
+            s.cues.iter().map(move |c| oc_core::Spoken {
+                media,
+                start: c.start.as_seconds(),
+                end: c.end.as_seconds(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn shot_looks(row: &oc_db::AnalysisRow) -> Vec<oc_media::ShotLook> {
+    row.raw
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<oc_media::VisualDigest>(v.clone()).ok())
+        .map(|d| d.shots)
+        .unwrap_or_default()
+}
+
 pub(crate) fn run_inspect(
     inspect: Inspect,
     timeline: &Timeline,
@@ -177,15 +199,33 @@ pub(crate) fn run_inspect(
                     s.hook_in.as_seconds(),
                     s.cues.len()
                 ));
-                out.push_str(&format_cues(&s.cues, 80));
             } else {
                 out.push_str("speech: none yet\n");
             }
+            let picture = looks.get(&id).map(shot_looks).unwrap_or_default();
             if let Some(l) = looks.get(&id) {
                 out.push_str(&format!(
-                    "look {} motion={:.2} scenes={}\n",
-                    l.look, l.motion, l.scenes
+                    "look {} motion={:.2} scenes={} shots={}\n",
+                    l.look,
+                    l.motion,
+                    l.scenes,
+                    picture.len()
                 ));
+            }
+            let cue_refs: Vec<(f64, f64, &str)> = speech
+                .get(&id)
+                .map(|s| {
+                    s.cues
+                        .iter()
+                        .map(|c| (c.start.as_seconds(), c.end.as_seconds(), c.text.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let briefs = oc_media::brief_shots(&picture, &cue_refs);
+            if !briefs.is_empty() {
+                out.push_str(&oc_media::format_shot_list(&briefs, 48));
+            } else if let Some(s) = speech.get(&id) {
+                out.push_str(&format_cues(&s.cues, 80));
             }
             out
         }

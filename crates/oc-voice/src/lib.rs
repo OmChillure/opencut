@@ -10,7 +10,7 @@ use thiserror::Error;
 
 pub use grok_stt::configured as grok_stt_configured;
 pub use groq_stt::configured as groq_stt_configured;
-pub use local::{LocalSttError, transcribe_local};
+pub use local::{LocalSttError, transcribe_local, transcribe_path};
 pub use punctuate::restore_punctuation;
 
 const DEFAULT_BASE: &str = "https://api.sarvam.ai";

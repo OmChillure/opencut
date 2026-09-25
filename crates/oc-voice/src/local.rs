@@ -47,12 +47,24 @@ pub async fn transcribe_local(bytes: &[u8], filename: &str) -> Result<Transcript
         .filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or("bin");
     let input = dir.join(format!("in.{ext}"));
-    let wav = dir.join("audio.wav");
     tokio::fs::write(&input, bytes).await?;
+    let result = transcribe_path(&input).await;
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    result
+}
 
-    tracing::info!(file = %filename, bytes = bytes.len(), "stt extract audio");
+/// Transcribe a file already on disk. Does not delete `input`.
+pub async fn transcribe_path(input: &Path) -> Result<Transcript, LocalSttError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("oc-stt-{stamp}"));
+    tokio::fs::create_dir_all(&dir).await?;
+    let wav = dir.join("audio.wav");
+    tracing::info!(file = %input.display(), "stt extract audio");
     let t0 = Instant::now();
-    extract_wav(&input, &wav).await?;
+    extract_wav(input, &wav).await?;
     tracing::info!(ms = t0.elapsed().as_millis(), "stt wav ready");
     let t1 = Instant::now();
     let transcript = transcribe_cloud_or_local(&wav, &dir).await?;

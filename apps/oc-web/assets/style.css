@@ -68,6 +68,8 @@ button:disabled { opacity: 0.45; cursor: default; }
   display: grid;
   place-items: center;
   color: var(--text);
+  padding: 0;
+  cursor: pointer;
 }
 .logo svg { width: 20px; height: 20px; }
 .project-name {

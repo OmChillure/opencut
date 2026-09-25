@@ -7,6 +7,19 @@ use tokio::process::Command;
 const W: usize = 160;
 const H: usize = 90;
 
+/// One picture range inside a source. `look` is this shot, not the whole file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShotLook {
+    pub start: f64,
+    pub end: f64,
+    pub look: String,
+    /// What is in frame: person, product, street, screen, interior, landscape, object.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject: String,
+    #[serde(default)]
+    pub motion: f32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisualDigest {
     pub look: String,
@@ -16,6 +29,9 @@ pub struct VisualDigest {
     pub colorful: bool,
     pub has_video: bool,
     pub has_audio: bool,
+    /// Scene ranges with a look each. Missing on rows saved before shot lists.
+    #[serde(default)]
+    pub shots: Vec<ShotLook>,
 }
 
 impl Default for VisualDigest {
@@ -28,6 +44,7 @@ impl Default for VisualDigest {
             colorful: false,
             has_video: false,
             has_audio: false,
+            shots: Vec::new(),
         }
     }
 }
@@ -53,7 +70,7 @@ pub async fn analyze_local(bytes: &[u8], filename: &str) -> Result<VisualDigest,
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("oc-look-{stamp}"));
+    let dir = std::env::temp_dir().join(format!("oc-look-in-{stamp}"));
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| crate::MediaError::Ffmpeg(e.to_string()))?;
@@ -66,46 +83,175 @@ pub async fn analyze_local(bytes: &[u8], filename: &str) -> Result<VisualDigest,
     tokio::fs::write(&input, bytes)
         .await
         .map_err(|e| crate::MediaError::Ffmpeg(e.to_string()))?;
+    let digest = analyze_path(&input).await;
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    digest
+}
 
-    let probe = probe(&input).await.unwrap_or_default();
+/// Scene cuts plus one look per kept range. Reads `input` in place.
+pub async fn analyze_path(input: &Path) -> Result<VisualDigest, crate::MediaError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("oc-look-{stamp}"));
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| crate::MediaError::Ffmpeg(e.to_string()))?;
+
+    let probe = probe(input).await.unwrap_or_default();
     if !probe.has_video {
         let _ = tokio::fs::remove_dir_all(&dir).await;
+        let end = probe.duration_s.max(0.0);
+        let look = if probe.has_audio {
+            "audio-only"
+        } else {
+            "unknown"
+        };
         return Ok(VisualDigest {
-            look: if probe.has_audio {
-                "audio-only".into()
-            } else {
-                "unknown".into()
-            },
+            look: look.into(),
             has_audio: probe.has_audio,
+            shots: if end > 0.05 {
+                vec![ShotLook {
+                    start: 0.0,
+                    end,
+                    look: look.into(),
+                    subject: String::new(),
+                    motion: 0.0,
+                }]
+            } else {
+                Vec::new()
+            },
             ..VisualDigest::default()
         });
     }
 
-    let scene_times = scene_cuts(&input).await.unwrap_or_default();
+    let scene_times = scene_cuts(input).await.unwrap_or_default();
     let duration = probe.duration_s.max(1.0);
-    let mut samples: Vec<f64> = scene_times.iter().take(6).copied().collect();
-    for p in [0.12, 0.38, 0.62, 0.88] {
-        samples.push(duration * p);
-    }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    samples.dedup_by(|a, b| (*a - *b).abs() < 0.35);
-    samples.truncate(8);
+    let ranges = picture_ranges(&scene_times, duration);
 
     let mut frames = Vec::new();
-    for (i, t) in samples.iter().enumerate() {
+    let mut shots = Vec::new();
+    for (i, (start, end, motion)) in ranges.iter().enumerate() {
+        let at = (start + end) * 0.5;
         let raw = dir.join(format!("f{i}.rgb"));
-        if grab_rgb(&input, *t, &raw).await.is_ok() {
-            if let Ok(bytes) = tokio::fs::read(&raw).await {
-                if let Some(stats) = FrameStats::from_rgb(&bytes) {
-                    frames.push(stats);
-                }
-            }
+        let stats = if grab_rgb(input, at, &raw).await.is_ok() {
+            tokio::fs::read(&raw)
+                .await
+                .ok()
+                .and_then(|bytes| FrameStats::from_rgb(&bytes))
+        } else {
+            None
+        };
+        let look = stats
+            .as_ref()
+            .map(|s| look_label(s, *motion))
+            .unwrap_or("unknown");
+        if let Some(stats) = stats {
+            frames.push(stats);
         }
+        shots.push(ShotLook {
+            start: *start,
+            end: *end,
+            look: look.into(),
+            subject: String::new(),
+            motion: *motion,
+        });
     }
 
-    let digest = fold_frames(frames, scene_times.len(), duration, probe.has_audio);
+    if let Err(e) = crate::subject::label_subjects(input, &mut shots).await {
+        tracing::warn!("subject look skipped: {e}");
+    }
+
+    let mut digest = fold_frames(frames, scene_times.len(), duration, probe.has_audio);
+    digest.shots = shots;
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(digest)
+}
+
+/// Merge scene cuts into at most 24 ranges, none shorter than 1.2s.
+/// Each tuple is `(start, end, motion)` where motion is absorbed cuts / duration.
+pub fn picture_ranges(cuts: &[f64], duration: f64) -> Vec<(f64, f64, f32)> {
+    let duration = if duration.is_finite() {
+        duration.max(0.04)
+    } else {
+        0.04
+    };
+    struct Span {
+        start: f64,
+        end: f64,
+        cuts: u32,
+    }
+    let mut spans = Vec::new();
+    let mut prev = 0.0;
+    for t in cuts {
+        if !t.is_finite() || *t <= prev + 0.05 || *t >= duration - 0.05 {
+            continue;
+        }
+        spans.push(Span {
+            start: prev,
+            end: *t,
+            cuts: 0,
+        });
+        prev = *t;
+    }
+    spans.push(Span {
+        start: prev,
+        end: duration,
+        cuts: 0,
+    });
+
+    fn absorb(into: &mut Span, gone: &Span) {
+        into.cuts += gone.cuts + 1;
+    }
+
+    let min = 1.2;
+    let mut i = 0;
+    while i < spans.len() {
+        let len = spans[i].end - spans[i].start;
+        if len < min && spans.len() > 1 {
+            if i == 0 {
+                let gone = spans.remove(0);
+                spans[0].start = gone.start;
+                absorb(&mut spans[0], &gone);
+            } else {
+                let gone = spans.remove(i);
+                spans[i - 1].end = gone.end;
+                absorb(&mut spans[i - 1], &gone);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    while spans.len() > 24 {
+        let idx = spans
+            .iter()
+            .enumerate()
+            .min_by(|a, b| {
+                let la = a.1.end - a.1.start;
+                let lb = b.1.end - b.1.start;
+                la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        if idx == 0 {
+            let gone = spans.remove(0);
+            spans[0].start = gone.start;
+            absorb(&mut spans[0], &gone);
+        } else {
+            let gone = spans.remove(idx);
+            spans[idx - 1].end = gone.end;
+            absorb(&mut spans[idx - 1], &gone);
+        }
+    }
+    spans
+        .into_iter()
+        .map(|s| {
+            let dur = (s.end - s.start).max(0.05);
+            let motion = (s.cuts as f32 / dur as f32).min(4.0);
+            (s.start, s.end, motion)
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -278,6 +424,25 @@ impl FrameStats {
     }
 }
 
+fn look_label(s: &FrameStats, motion: f32) -> &'static str {
+    let colorful = s.sat > 0.22;
+    if s.luma < 38.0 {
+        "dark"
+    } else if s.edges > 28.0 && s.sat < 0.18 {
+        "graphic"
+    } else if (s.center_luma - s.luma).abs() < 12.0 && s.edges < 12.0 {
+        "wide"
+    } else if s.edges > 16.0 && s.center_luma > s.luma {
+        "close"
+    } else if colorful && s.luma > 90.0 {
+        "bright-wide"
+    } else if motion > 0.6 {
+        "action"
+    } else {
+        "interior"
+    }
+}
+
 fn fold_frames(frames: Vec<FrameStats>, scene_n: usize, duration: f64, has_audio: bool) -> VisualDigest {
     if frames.is_empty() {
         return VisualDigest {
@@ -295,29 +460,21 @@ fn fold_frames(frames: Vec<FrameStats>, scene_n: usize, duration: f64, has_audio
     let center = frames.iter().map(|f| f.center_luma).sum::<f32>() / n;
     let motion = (scene_n as f32 / duration as f32).min(4.0);
     let colorful = sat > 0.22;
-    let look = if luma < 38.0 {
-        "dark"
-    } else if edges > 28.0 && sat < 0.18 {
-        "graphic"
-    } else if (center - luma).abs() < 12.0 && edges < 12.0 {
-        "wide"
-    } else if edges > 16.0 && center > luma {
-        "close"
-    } else if colorful && luma > 90.0 {
-        "bright-wide"
-    } else if motion > 0.6 {
-        "action"
-    } else {
-        "interior"
+    let fake = FrameStats {
+        luma,
+        sat,
+        edges,
+        center_luma: center,
     };
     VisualDigest {
-        look: look.into(),
+        look: look_label(&fake, motion).into(),
         motion,
         scenes: scene_n as u32,
         brightness: luma / 255.0,
         colorful,
         has_video: true,
         has_audio,
+        shots: Vec::new(),
     }
 }
 
@@ -334,5 +491,32 @@ mod tests {
         let buf = vec![10u8; W * H * 3];
         let s = FrameStats::from_rgb(&buf).unwrap();
         assert!(s.luma < 20.0);
+        assert_eq!(look_label(&s, 0.0), "dark");
+    }
+
+    #[test]
+    fn picture_ranges_keep_scene_times_and_cap() {
+        let cuts = [2.0, 3.0, 10.0, 10.4, 30.0];
+        let ranges = picture_ranges(&cuts, 40.0);
+        assert!(ranges.len() <= 24);
+        assert!((ranges[0].0 - 0.0).abs() < 1e-6);
+        assert!((ranges.last().unwrap().1 - 40.0).abs() < 1e-6);
+        for w in ranges.windows(2) {
+            assert!((w[0].1 - w[1].0).abs() < 1e-6);
+            assert!(w[0].1 - w[0].0 >= 1.2 - 1e-6);
+        }
+        let tight: Vec<f64> = (1..40).map(|i| i as f64 * 2.0).collect();
+        let capped = picture_ranges(&tight, 90.0);
+        assert_eq!(capped.len(), 24);
+        assert!((capped[0].0).abs() < 1e-6);
+        assert!((capped.last().unwrap().1 - 90.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn old_digest_json_has_no_shots() {
+        let raw = r#"{"look":"wide","motion":0.1,"scenes":2,"brightness":0.4,"colorful":false,"has_video":true,"has_audio":true}"#;
+        let d: VisualDigest = serde_json::from_str(raw).unwrap();
+        assert!(d.shots.is_empty());
+        assert_eq!(d.look, "wide");
     }
 }

@@ -77,8 +77,10 @@ pub fn mcp_tools() -> Vec<McpTool> {
         McpTool {
             name: "get_media".into(),
             description:
-                "Details for one media id: duration, timestamped speech cues, look. \
-                 Call this (or list_cues) before cutting a long file."
+                "Shot list for one media id: each range has a look (wide/close/action), \
+                 a subject (person, product, street, screen, interior, landscape), \
+                 and a role (speech, silence, filler) plus the words in that range. \
+                 Call this before cutting a long file. Place excerpts on those times."
                     .into(),
             input_schema: object(&[("media_id", str_prop("Media id from list_bin"), true)]),
         },

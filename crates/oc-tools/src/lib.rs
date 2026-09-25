@@ -4,6 +4,7 @@ mod intent;
 mod mcp;
 mod ops;
 mod registry;
+mod review;
 
 pub use intent::{Intent, is_director_request, parse_intent};
 pub use mcp::{inspect_from_mcp, Inspect, McpCall, McpTool, mcp_tools, op_from_mcp};
@@ -13,6 +14,7 @@ pub use ops::{
 };
 pub use oc_timeline::PlaceMode;
 pub use registry::{actions, modes, tool, tools, track_actions};
+pub use review::{CutReview, Spoken, review_cut};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -97,15 +97,18 @@ pub async fn put_media_bytes(
     content_type: &str,
     bytes: Vec<u8>,
 ) -> Result<(), String> {
-    reqwest::Client::new()
+    let res = reqwest::Client::new()
         .put(format!("{API}/v1/projects/{project_id}/media/{media_id}/bytes"))
         .header("content-type", content_type)
         .body(bytes)
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
         .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("upload {status}: {body}"));
+    }
     Ok(())
 }
 
@@ -468,7 +471,7 @@ pub async fn upload_media(
     bytes: Vec<u8>,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
-    let res: UploadResponse = client
+    let pending = client
         .post(format!("{API}/v1/projects/{project_id}/media/upload"))
         .json(&serde_json::json!({
             "filename": filename,
@@ -476,12 +479,15 @@ pub async fn upload_media(
         }))
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
         .map_err(|e| e.to_string())?;
+    if !pending.status().is_success() {
+        let status = pending.status();
+        let body = pending.text().await.unwrap_or_default();
+        return Err(format!(
+            "upload {status} for project {project_id}: {body}"
+        ));
+    }
+    let res: UploadResponse = pending.json().await.map_err(|e| e.to_string())?;
     let media_id = value_to_id(res.media_id);
     if let Some(url) = res.upload_url {
         if client
