@@ -238,6 +238,130 @@ async fn emit(events: Option<&EventSink>, ev: ChatEvent) {
     }
 }
 
+/// One ACP process for a whole chat. Later turns send only the new text.
+pub struct DirectorSession {
+    inner: SessionInner,
+    chars: usize,
+    started: bool,
+}
+
+enum SessionInner {
+    Acp {
+        client: AcpClient,
+        session_id: String,
+    },
+    /// CLI has no memory. The caller must resend context.
+    Stateless,
+}
+
+impl DirectorSession {
+    pub async fn open(
+        provider: &str,
+        model: &str,
+        mcp_servers: &[Value],
+        events: Option<EventSink>,
+    ) -> Result<Self, LlmError> {
+        let id = ProviderId::parse(provider)
+            .ok_or_else(|| LlmError::Message(format!("unknown provider {provider}")))?;
+        if !id.connected() {
+            return Err(LlmError::Message(id.login_hint().into()));
+        }
+        let (bin, args) = acp_launch(id, model);
+        let acp_missing = matches!(id, ProviderId::Claude | ProviderId::Openai)
+            && bin != "npx"
+            && !std::path::Path::new(&bin).is_file()
+            && !which(&bin);
+        if acp_missing {
+            return Ok(Self {
+                inner: SessionInner::Stateless,
+                chars: 0,
+                started: false,
+            });
+        }
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
+        match AcpClient::connect(&bin, &args, events.clone()).await {
+            Ok(mut client) => match client
+                .open_session(&cwd, Some(model), mcp_servers, events.as_ref())
+                .await
+            {
+                Ok(session_id) => Ok(Self {
+                    inner: SessionInner::Acp {
+                        client,
+                        session_id,
+                    },
+                    chars: 0,
+                    started: false,
+                }),
+                Err(err) => {
+                    tracing::warn!("acp session/new failed: {err}");
+                    Ok(Self {
+                        inner: SessionInner::Stateless,
+                        chars: 0,
+                        started: false,
+                    })
+                }
+            },
+            Err(err) => {
+                tracing::warn!("acp connect failed: {err}");
+                Ok(Self {
+                    inner: SessionInner::Stateless,
+                    chars: 0,
+                    started: false,
+                })
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn remembers(&self) -> bool {
+        matches!(self.inner, SessionInner::Acp { .. })
+    }
+
+    #[must_use]
+    pub fn prompt_chars(&self) -> usize {
+        self.chars
+    }
+
+    pub async fn turn(
+        &mut self,
+        message: &str,
+        events: Option<&EventSink>,
+    ) -> Result<LlmReply, LlmError> {
+        self.chars += message.len();
+        self.started = true;
+        let text = match &mut self.inner {
+            SessionInner::Acp {
+                client,
+                session_id,
+            } => client.continue_prompt(session_id, message, events).await?,
+            SessionInner::Stateless => {
+                return Err(LlmError::Message(
+                    "no ACP session — use complete_stream".into(),
+                ));
+            }
+        };
+        Ok(parse_tool_reply(text))
+    }
+}
+
+/// Rules, tool list, and the opening turns. Sent once.
+pub fn opening_prompt(
+    system: &str,
+    turns: &[ChatTurn],
+    tools: &[McpTool],
+    mcp_attached: bool,
+) -> String {
+    build_prompt(system, turns, tools, mcp_attached)
+}
+
+/// Later rounds. The session already has the rules and the earlier turns.
+#[must_use]
+pub fn followup_prompt(delta: &str) -> String {
+    delta.to_string()
+}
+
 fn build_prompt(system: &str, turns: &[ChatTurn], tools: &[McpTool], mcp_attached: bool) -> String {
     let mut out = String::new();
     // Every provider goes through here — Grok, Claude, Codex, and any added later.
@@ -327,6 +451,23 @@ async fn codex_print(prompt: &str) -> Result<String, LlmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn followup_is_only_the_new_turn() {
+        let opening = opening_prompt(
+            "Project demo.",
+            &[ChatTurn {
+                role: "user".into(),
+                content: "Make a 1 minute cinematic short.".into(),
+            }],
+            &[],
+            true,
+        );
+        let follow = followup_prompt("fix: length 80s is outside 55–68s");
+        assert!(follow.len() < opening.len());
+        assert_eq!(follow, "fix: length 80s is outside 55–68s");
+        assert!(!follow.contains("Project demo."));
+    }
 
     #[test]
     fn parses_tool_lines() {

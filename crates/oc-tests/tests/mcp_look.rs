@@ -29,6 +29,11 @@ fn catalog_lists_look_tools() {
         "list_cues",
         "place_clip",
         "clear_timeline",
+        "set_mix",
+        "set_curves",
+        "set_mask",
+        "set_speed_keys",
+        "add_generator",
     ] {
         assert!(names.contains(&need.to_string()), "missing {need} in {names:?}");
     }
@@ -98,6 +103,123 @@ fn parse_place_clip_excerpt() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn parse_mixer_curves_mask_remap_and_generator() {
+    let mix = op_from_mcp(&call(
+        "set_mix",
+        json!({ "gain_db": -3.0, "pan": 0.5 }),
+    ))
+    .unwrap();
+    match mix {
+        Op::SetMix { track_id: None, mix } => {
+            assert!((mix.gain_db + 3.0).abs() < 1e-3);
+            assert!((mix.pan - 0.5).abs() < 1e-3);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let curves = op_from_mcp(&call(
+        "set_curves",
+        json!({ "clip_id": clip(), "channel": "red", "mid": 0.7 }),
+    ))
+    .unwrap();
+    match curves {
+        Op::SetCurves { curves, .. } => {
+            assert!(curves.all.is_empty());
+            assert_eq!(curves.red.len(), 3);
+            assert!((curves.red[1].y - 0.7).abs() < 1e-3);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let mask = op_from_mcp(&call(
+        "set_mask",
+        json!({ "clip_id": clip(), "shape": "ellipse", "invert": true }),
+    ))
+    .unwrap();
+    match mask {
+        Op::SetMask { mask: Some(shape), .. } => {
+            assert_eq!(shape.shape, oc_core::MaskShape::Ellipse);
+            assert!(shape.invert);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let cleared = op_from_mcp(&call(
+        "set_mask",
+        json!({ "clip_id": clip(), "clear": true }),
+    ))
+    .unwrap();
+    assert!(matches!(cleared, Op::SetMask { mask: None, .. }));
+
+    let keys = op_from_mcp(&call(
+        "set_speed_keys",
+        json!({ "clip_id": clip(), "keys": [{"at": 0, "speed": 1}, {"at": 0.4, "speed": 2.5}, {"at": 1, "speed": 1}] }),
+    ))
+    .unwrap();
+    match keys {
+        Op::SetSpeedKeys { keys, .. } => assert_eq!(keys.len(), 3),
+        other => panic!("{other:?}"),
+    }
+
+    let bars = op_from_mcp(&call(
+        "add_generator",
+        json!({ "kind": "color_bars", "at": 2.0, "duration": 4.0 }),
+    ))
+    .unwrap();
+    match bars {
+        Op::AddGenerator {
+            generator: oc_core::Generator::ColorBars,
+            at,
+            duration,
+        } => {
+            assert!((at.as_seconds() - 2.0).abs() < 1e-6);
+            assert!((duration.as_seconds() - 4.0).abs() < 1e-6);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+#[test]
+fn grade_defaults_are_zero_and_transition_keeps_duration() {
+    let grade = op_from_mcp(&call("set_grade", json!({ "clip_id": clip(), "lut": "film" }))).unwrap();
+    match grade {
+        Op::SetGrade { grade, .. } => {
+            assert_eq!(grade.exposure, 0.0);
+            assert_eq!(grade.contrast, 0.0);
+            assert_eq!(grade.saturation, 0.0);
+            assert_eq!(grade.temperature, 0.0);
+            assert_eq!(grade.lut, oc_core::Lut::Film);
+        }
+        other => panic!("{other:?}"),
+    }
+    let fx = op_from_mcp(&call("set_fx", json!({ "clip_id": clip() }))).unwrap();
+    match fx {
+        Op::SetFx { fx, .. } => {
+            assert_eq!(fx.blur, 0.0);
+            assert_eq!(fx.grain, 0.0);
+            assert_eq!(fx.vignette, 0.0);
+        }
+        other => panic!("{other:?}"),
+    }
+    let mix = op_from_mcp(&call(
+        "set_transition",
+        json!({ "clip_id": clip(), "kind": "dissolve", "duration": 0.4 }),
+    ))
+    .unwrap();
+    match mix {
+        Op::SetTransition { duration, .. } => assert_eq!(duration, Some(0.4)),
+        other => panic!("{other:?}"),
+    }
+    let batched = op_from_mcp(&call(
+        "set_grade",
+        json!({ "all": true, "exposure": 0.1 }),
+    ))
+    .unwrap();
+    assert!(matches!(batched, Op::StyleClips { all: true, .. }));
 }
 
 #[test]

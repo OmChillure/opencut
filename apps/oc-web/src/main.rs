@@ -3,6 +3,7 @@ mod auth;
 mod bind;
 mod media;
 mod pages;
+mod studio;
 mod toast;
 mod tools;
 
@@ -15,8 +16,8 @@ use media::{
     item_from_bytes_id, lane_height, next_track_name, paint_clock, paint_playhead, place_clip,
     playhead_now, preview_video, reset_tick_clock, ruler_marks_nle, scroll_left,
     apply_monitor_look,
-    seek_by, max_timeline_h, set_media_duration, sync_monitor, timeline_end,
-    timeline_viewport_h, timeline_viewport_w, update_drag, wave_bars,
+    seek_by, max_timeline_h, program_end, set_media_duration, set_playhead, sync_monitor, timeline_end,
+    timeline_viewport_h, timeline_viewport_w, update_drag,
     capture_pointer, clamp_pps, video_duration_from_src,
 };
 use oc_core::{
@@ -160,6 +161,7 @@ pub(crate) struct WorkspaceSave {
     pub aspect: Signal<Aspect>,
     pub persist_q: Signal<Vec<Vec<Op>>>,
     pub persist_busy: Signal<bool>,
+    pub undo: Signal<oc_core::UndoStack>,
 }
 
 fn persist(save: WorkspaceSave) {
@@ -283,6 +285,7 @@ fn Workspace(id: String) -> Element {
     let mut tl_drag = use_signal(|| None::<(f64, f64)>);
     let persist_q = use_signal(Vec::<Vec<Op>>::new);
     let persist_busy = use_signal(|| false);
+    let mut undo = use_signal(oc_core::UndoStack::new);
     let selected_clip = use_signal(|| None::<String>);
     let held = use_signal(Vec::<HeldImport>::new);
     let clock = Clock {
@@ -297,6 +300,7 @@ fn Workspace(id: String) -> Element {
         aspect,
         persist_q,
         persist_busy,
+        undo,
     };
 
     use_context_provider(|| tab);
@@ -362,6 +366,7 @@ fn Workspace(id: String) -> Element {
                     target_track.set(track.id.to_string());
                 }
                 engine.set(project.timeline);
+                undo.set(tools::load_undo(&pid));
             }
             Err(_) => {
                 if let Some(track) = engine.peek().first_track(TrackKind::Video) {
@@ -401,29 +406,53 @@ fn Workspace(id: String) -> Element {
                 reset_tick_clock();
                 continue;
             }
-            let span = timeline_end(&tracks.peek()).max(*clock.duration.peek()).max(0.1);
-            let before = playhead_now();
-            sync_monitor(&library.peek(), &tracks.peek(), before, true);
-            apply_monitor_look(&engine.peek(), &library.peek(), playhead_now().max(before));
-            let now = if let Some(shot) = crate::media::clip_under(
-                &tracks.peek(),
-                &library.peek(),
-                playhead_now().max(before),
-            ) {
-                if shot.kind == MediaKind::Video {
-                    playhead_now()
-                } else {
-                    advance_playhead(span)
-                }
-            } else {
-                advance_playhead(span)
-            };
-            paint_playhead(now);
-            if now >= span - 0.001 {
+            let end = crate::media::program_end(&tracks.peek());
+            if end <= 0.05 {
+                let mut playing = clock.playing;
+                playing.set(false);
+                continue;
+            }
+            let before = playhead_now().min(end);
+            if before >= end - 0.02 {
+                set_playhead(end);
+                paint_playhead(end);
+                sync_monitor(&library.peek(), &tracks.peek(), end, false);
                 let mut playing = clock.playing;
                 playing.set(false);
                 let mut current = clock.current;
-                current.set(now);
+                current.set(end);
+                continue;
+            }
+            sync_monitor(&library.peek(), &tracks.peek(), before, true);
+            apply_monitor_look(&engine.peek(), &library.peek(), playhead_now().max(before).min(end));
+            let under = crate::media::clip_under(
+                &tracks.peek(),
+                &library.peek(),
+                playhead_now().max(before).min(end),
+            );
+            let now = match under {
+                Some(shot) if shot.kind == MediaKind::Video => playhead_now().min(end),
+                Some(_) => advance_playhead(end),
+                None => {
+                    let mut playing = clock.playing;
+                    playing.set(false);
+                    let parked = playhead_now().min(end);
+                    set_playhead(parked);
+                    sync_monitor(&library.peek(), &tracks.peek(), parked, false);
+                    paint_playhead(parked);
+                    let mut current = clock.current;
+                    current.set(parked);
+                    continue;
+                }
+            };
+            paint_playhead(now);
+            if now >= end - 0.02 {
+                set_playhead(end);
+                paint_playhead(end);
+                let mut playing = clock.playing;
+                playing.set(false);
+                let mut current = clock.current;
+                current.set(end);
             }
         }
     });
@@ -576,46 +605,13 @@ fn Header(name: Signal<String>) -> Element {
             }
             div { class: "header-right",
                 button {
-                    class: "btn-ghost",
-                    title: "Delete this project",
-                    onclick: move |_| {
-                        let pid = project_id.peek().clone();
-                        let title = name.peek().clone();
-                        if !crate::pages::confirm_delete(&title) {
-                            return;
-                        }
-                        let nav = navigator();
-                        nav.replace(Route::Projects {});
-                        spawn(async move {
-                            let _ = api::delete_project(&pid).await;
-                        });
-                    },
-                    "Delete"
-                }
-                button {
                     class: if unsaved { "btn btn-primary" } else { "btn btn-ghost" },
                     disabled: !unsaved,
                     title: "Store imported files so they survive leaving this project",
                     onclick: move |_| save_held_imports(held, library, tracks, save),
                     "Save progress"
                 }
-                button {
-                    class: "btn btn-primary",
-                    onclick: move |_| {
-                        let preset = match *aspect.peek() {
-                            Aspect::Vertical => oc_core::ExportPreset::Vertical1080,
-                            Aspect::Square => oc_core::ExportPreset::Square1080,
-                            _ => oc_core::ExportPreset::Youtube1080,
-                        };
-                        match crate::tools::run_ops(save, vec![oc_core::Op::Export { preset }]) {
-                            Ok(_) => show_toast().success(
-                                "Export queued — worker writes an MP4 under data/exports.",
-                            ),
-                            Err(err) => show_toast().error(err),
-                        }
-                    },
-                    "Export"
-                }
+                studio::ExportPlayer {}
             }
         }
     }
@@ -790,6 +786,7 @@ fn AssetView(tab: AssetTab) -> Element {
         },
         AssetTab::Audio => rsx! {
             div { class: "card-list",
+                studio::Mixer {}
                 button {
                     class: "card",
                     onclick: move |_| {
@@ -821,6 +818,9 @@ fn AssetView(tab: AssetTab) -> Element {
             }
         },
         AssetTab::Elements => rsx! {
+            div {
+                studio::Generators { at: at() }
+            }
             div { class: "card-list",
                 button {
                     class: "card",
@@ -882,6 +882,11 @@ fn AssetView(tab: AssetTab) -> Element {
             }
         },
         AssetTab::Visuals => rsx! {
+            div {
+                studio::CurvesPanel { selected: sel().unwrap_or_default(), track: track(), at: at() }
+                studio::MaskPanel { selected: sel().unwrap_or_default(), track: track(), at: at() }
+                studio::TimeRemap { selected: sel().unwrap_or_default(), track: track(), at: at() }
+            }
             div { class: "card-list",
                 button {
                     class: "card",
@@ -902,6 +907,7 @@ fn AssetView(tab: AssetTab) -> Element {
             }
         },
         AssetTab::Settings => rsx! {
+            studio::UndoHistory {}
             div { class: "card-list",
                 button { class: "card",
                     b { "Frame rate" }
@@ -1180,8 +1186,8 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                                     &src,
                                     video.duration(),
                                 );
-                                let end = timeline_end(&tracks.read());
-                                if end > *clock.duration.peek() {
+                                let end = program_end(&tracks.read());
+                                if end > 0.05 {
                                     let mut duration = clock.duration;
                                     duration.set(end);
                                 }
@@ -1217,6 +1223,8 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                     }
                 }
             }
+            studio::Scopes {}
+            studio::MulticamBank {}
         }
     }
 }
@@ -1240,8 +1248,7 @@ fn Timeline() -> Element {
     let mut view_w = use_signal(|| 800.0_f64);
     let mut trim = use_signal(|| None::<(String, bool)>);
     let now = *clock.current.read();
-    let video_dur = *clock.duration.read();
-    let span = timeline_end(&tracks.read()).max(video_dur).max(8.0);
+    let span = program_end(&tracks.read()).max(8.0);
     let canvas_w = (span * *pps.read() + 160.0).max(*view_w.read());
     let playhead = format!("left: {}px", now * *pps.read());
     let now_label = format_clock(now);
@@ -1285,6 +1292,28 @@ fn Timeline() -> Element {
                 format!("flex: 0 0 {h}px; height: {h}px; max-height: {h}px")
             },
             onkeydown: move |evt| {
+                if evt.modifiers().ctrl() && evt.key() == Key::Character("z".into()) {
+                    if evt.modifiers().shift() {
+                        let _ = tools::redo_edit(save);
+                    } else {
+                        let _ = tools::undo_edit(save);
+                    }
+                    return;
+                }
+                if *edit_tool.peek() == ToolId::Multicam {
+                    if let Key::Character(c) = evt.key() {
+                        if let Some(n) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                            if (1..10).contains(&n) {
+                                let tl = save.engine.peek();
+                                if let Some(track) = tl.tracks.iter().filter(|t| t.kind == TrackKind::Video).nth((n - 1) as usize) {
+                                    let id = track.id.to_string();
+                                    let _ = tools::multicam_at(save, &id, playhead_now().max(*clock.current.peek()));
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
                 match evt.key() {
                     Key::Character(c) if c == "1" => edit_mode.set(EditMode::Normal),
                     Key::Character(c) if c == "2" => edit_mode.set(EditMode::Insert),
@@ -1753,11 +1782,6 @@ fn Timeline() -> Element {
                                                 let clip_dur = clip.duration;
                                                 let grab_name = name.clone();
                                                 let grab_url = url.clone();
-                                                let bars = if is_audio {
-                                                    wave_bars(&name, (tiles as usize * 5).max(12))
-                                                } else {
-                                                    Vec::new()
-                                                };
                                                 rsx! {
                                                     div {
                                                         class: "{clip_class}",
@@ -1795,31 +1819,16 @@ fn Timeline() -> Element {
                                                                 over_timeline: false,
                                                             }));
                                                         },
-                                                        div { class: "nle-strip",
-                                                            if is_audio {
-                                                                div { class: "nle-wave",
-                                                                    for bar in bars.iter() {
-                                                                        span {
-                                                                            class: "nle-bar",
-                                                                            style: "height: {bar}%"
-                                                                        }
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                for _ in 0..tiles {
-                                                                    div { class: "nle-cell",
-                                                                        if is_image {
-                                                                            img { src: "{url}", alt: "" }
-                                                                        } else if is_video {
-                                                                            video {
-                                                                                src: "{url}",
-                                                                                muted: true,
-                                                                                preload: "metadata"
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
+                                                        if is_audio {
+                                                            studio::Waveform { url: url.clone(), bars: (tiles as usize * 5).max(12), seed: name.clone() }
+                                                        } else if is_image {
+                                                            div { class: "nle-strip",
+                                                                img { src: "{url}", alt: "" }
                                                             }
+                                                        } else if is_video {
+                                                            studio::Filmstrip { url: url.clone(), tiles, ends_only: *pps.read() < 24.0 }
+                                                        } else {
+                                                            div { class: "nle-strip" }
                                                         }
                                                         span { class: "nle-name", "{name}" }
                                                         if selected {
@@ -2223,20 +2232,29 @@ fn AiSidebar(
                             }
                         },
                     }
-                    button {
-                        class: "send",
-                        disabled: draft.read().trim().is_empty() || *busy.read(),
-                        onclick: move |_| send_prompt(
-                            draft,
-                            messages,
-                            save,
-                            clock,
-                            target_track,
-                            provider_id,
-                            model_id,
-                            busy,
-                        ),
-                        IconSend {}
+                    if *busy.read() {
+                        button {
+                            class: "send pause",
+                            title: "Stop the chat",
+                            onclick: move |_| stop_chat(messages, busy),
+                            "Pause"
+                        }
+                    } else {
+                        button {
+                            class: "send",
+                            disabled: draft.read().trim().is_empty(),
+                            onclick: move |_| send_prompt(
+                                draft,
+                                messages,
+                                save,
+                                clock,
+                                target_track,
+                                provider_id,
+                                model_id,
+                                busy,
+                            ),
+                            IconSend {}
+                        }
                     }
                 }
             }
@@ -2586,41 +2604,11 @@ fn show_timeline(save: &mut WorkspaceSave, clock: &Clock, timeline: EngineTimeli
     }
 }
 
-async fn seed_source_on_timeline(
-    pid: &str,
-    save: &mut WorkspaceSave,
-    bin: &[(String, String, String, f64, String)],
-    clock: &Clock,
-) {
-    let has_video = save.engine.peek().tracks.iter().any(|track| {
-        track.kind == TrackKind::Video
-            && track
-                .clips
-                .iter()
-                .any(|clip| matches!(clip.kind, oc_core::ClipKind::Video { .. }))
-    });
-    if has_video {
-        return;
-    }
-    let Some((id, _, ctype, dur, _)) = bin.iter().find(|(_, _, ctype, _, _)| ctype.starts_with("video/"))
-    else {
-        return;
-    };
-    let Ok(media_id) = uuid::Uuid::parse_str(id) else {
-        return;
-    };
-    let op = Op::PlaceMedia {
-        media_id: oc_core::MediaId::from_uuid(media_id),
-        track_id: None,
-        start: oc_core::Time::ZERO,
-        duration: oc_core::Duration::from_seconds((*dur).max(0.5)),
-        source_in: oc_core::Time::ZERO,
-        kind: TrackKind::Video,
-        mode: TimelineEditMode::Normal,
-    };
-    if let Ok(timeline) = api::apply_ops(pid, vec![op]).await {
-        show_timeline(save, clock, timeline);
-    }
+fn stop_chat(mut messages: Signal<Vec<ChatMsg>>, mut busy: Signal<bool>) {
+    api::request_chat_stop();
+    clear_status(messages);
+    messages.write().push(ChatMsg::status("Stopped".to_string()));
+    busy.set(false);
 }
 
 fn clear_status(mut messages: Signal<Vec<ChatMsg>>) {
@@ -2667,6 +2655,7 @@ fn send_prompt(
             return;
         }
     }
+    api::clear_chat_stop();
     busy.set(true);
     messages.write().push(ChatMsg::status(format!(
         "Sending to {} · {}…",
@@ -2706,17 +2695,27 @@ fn send_prompt(
                 }
             }
         }
-        seed_source_on_timeline(&pid, &mut save, &bin, &clock).await;
         let reply = api::chat_stream(&pid, &provider, &model, &history, |ev| {
+            if api::chat_stopped() {
+                return;
+            }
             if let Some(tl) = ev.timeline.clone() {
                 show_timeline(&mut save, &clock, tl);
             }
             apply_chat_event(messages, ev);
         })
         .await;
+        if api::chat_stopped() {
+            busy.set(false);
+            return;
+        }
         match reply {
             Ok(resp) => {
-                show_timeline(&mut save, &clock, resp.timeline.clone());
+                let timeline = match api::get_project(&pid).await {
+                    Ok(project) => project.timeline,
+                    Err(_) => resp.timeline.clone(),
+                };
+                show_timeline(&mut save, &clock, timeline);
                 finish_bot_text(
                     messages,
                     if resp.text.trim().is_empty() {

@@ -49,6 +49,40 @@ fn source(id: MediaId, path: PathBuf) -> MediaSource {
 }
 
 #[test]
+fn graph_keeps_voice_across_excerpts() {
+    let mut tl = Timeline::default();
+    let mut undo = UndoStack::new();
+    let track = tl.first_track(TrackKind::Video).unwrap().id;
+    let mid = MediaId::new();
+    let _ = tl.add_clip(track, video_on(mid, 0.0, 4.0)).unwrap();
+    let mut second = video_on(mid, 4.0, 4.0);
+    second.source_in = Time::from_seconds(30.0);
+    let _ = tl.add_clip(track, second).unwrap();
+    let dir = std::env::temp_dir().join("oc-render-voice");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("a.mp4");
+    std::fs::write(&path, b"x").unwrap();
+    let mut media = HashMap::new();
+    media.insert(mid, source(mid, path));
+    let compiled = compile(&tl, &media, ExportPreset::Youtube1080, &dir).unwrap();
+    assert!(
+        compiled.filter.contains("asplit=2"),
+        "same file must feed both excerpts: {}",
+        compiled.filter
+    );
+    assert!(
+        compiled.filter.contains("atrim=start=30.0000"),
+        "second excerpt audio missing: {}",
+        compiled.filter
+    );
+    assert!(
+        compiled.filter.contains("concat=n=2:v=0:a=1"),
+        "excerpts must be joined, not dropped after the first: {}",
+        compiled.filter
+    );
+}
+
+#[test]
 fn graph_uses_xfade_for_dissolve() {
     let mut tl = Timeline::default();
     let mut undo = UndoStack::new();
@@ -63,6 +97,7 @@ fn graph_uses_xfade_for_dissolve() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Dissolve,
+            duration: None,
         },
     )
     .unwrap();
@@ -149,6 +184,7 @@ fn bakes_two_shots_with_ffmpeg() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Dissolve,
+            duration: None,
         },
     )
     .unwrap();

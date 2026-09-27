@@ -173,6 +173,7 @@ mod tests {
             look: look.into(),
             subject: String::new(),
             motion: 0.0,
+            card: None,
         }
     }
 

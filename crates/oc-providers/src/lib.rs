@@ -10,5 +10,5 @@ mod prompts;
 
 pub use catalog::{ModelInfo, ProviderId, ProviderStatus, catalog};
 pub use llm::{ChatEvent, ChatTurn, EventSink, Llm, LlmError, LlmReply, Xai};
-pub use orchestrate::{complete, complete_stream};
-pub use prompts::{shared_prompts, with_shared_prompts};
+pub use orchestrate::{complete, complete_stream, followup_prompt, opening_prompt, DirectorSession};
+pub use prompts::{shared_prompts, style_guide, with_shared_prompts};

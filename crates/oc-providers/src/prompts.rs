@@ -14,6 +14,25 @@ pub fn shared_prompts() -> &'static str {
     CACHE.get_or_init(load)
 }
 
+/// One style guide, only when the request names it. The others stay on disk.
+#[must_use]
+pub fn style_guide(request: &str) -> Option<String> {
+    let lower = request.to_ascii_lowercase();
+    let name = if lower.contains("cinematic") {
+        "cinematic"
+    } else if lower.contains("hype") || lower.contains("tiktok") {
+        "hype"
+    } else if lower.contains("documentary") || lower.contains("doc ") {
+        "documentary"
+    } else if lower.contains("vlog") {
+        "vlog"
+    } else {
+        return None;
+    };
+    let path = prompts_dir().join("styles").join(format!("{name}.md"));
+    std::fs::read_to_string(path).ok()
+}
+
 /// Prepend director briefs to a per-request system string.
 #[must_use]
 pub fn with_shared_prompts(system: &str) -> String {

@@ -580,6 +580,23 @@ pub struct ClipLook {
     pub stabilize: bool,
     #[serde(default)]
     pub audio: AudioFx,
+    /// Curves (avfilter). Empty channels stay a straight line.
+    #[serde(default)]
+    pub curves: Curves,
+    /// Alpha Shapes mask. Outside the shape is transparent so the track below shows through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<AlphaShape>,
+    /// Time Remap keys. Empty keeps `Clip::speed` and `speed_to`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speed_keys: Vec<SpeedKey>,
+    /// Color, bars, noise, or a counter. No media file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<Generator>,
+    /// Overrides `TransitionKind::mix_seconds` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_ease: Option<Ease>,
 }
 
 /// Rectangle inside the frame, each edge 0–1.
@@ -591,7 +608,119 @@ pub struct Crop {
     pub h: f32,
 }
 
-/// Loudness, noise, EQ, and compression. Music is never generated here.
+/// Track fader. Kdenlive's audio mixer: 0 dB is unity, pan is balance (−1 left, +1 right).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Mix {
+    #[serde(default)]
+    pub gain_db: f32,
+    #[serde(default)]
+    pub pan: f32,
+    /// Exclusive unless the caller adds to the existing solos (Shift+click in the mixer).
+    #[serde(default)]
+    pub solo: bool,
+}
+
+impl Default for Mix {
+    fn default() -> Self {
+        Self {
+            gain_db: 0.0,
+            pan: 0.0,
+            solo: false,
+        }
+    }
+}
+
+impl Mix {
+    #[must_use]
+    pub fn linear(self) -> f32 {
+        10f32.powf(self.gain_db.clamp(-60.0, 12.0) / 20.0)
+    }
+
+    /// Constant-power balance. `(left, right)`.
+    #[must_use]
+    pub fn balance(self) -> (f32, f32) {
+        let p = self.pan.clamp(-1.0, 1.0);
+        let angle = (p + 1.0) * 0.5 * std::f32::consts::FRAC_PI_2;
+        (angle.cos(), angle.sin())
+    }
+}
+
+/// One point on a Curves (avfilter) graph. `x` is input luma, `y` is output, both 0–1.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CurvePoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Kdenlive Curves (avfilter): All, R, G, B. Empty channel = straight line.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct Curves {
+    #[serde(default)]
+    pub all: Vec<CurvePoint>,
+    #[serde(default)]
+    pub red: Vec<CurvePoint>,
+    #[serde(default)]
+    pub green: Vec<CurvePoint>,
+    #[serde(default)]
+    pub blue: Vec<CurvePoint>,
+}
+
+impl Curves {
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.all.is_empty() && self.red.is_empty() && self.green.is_empty() && self.blue.is_empty()
+    }
+}
+
+/// Alpha Shapes. Position and size are fractions of the frame; the shape is centered on x, y.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskShape {
+    Rectangle,
+    Ellipse,
+    Triangle,
+    Diamond,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AlphaShape {
+    pub shape: MaskShape,
+    /// Center, 0–1.
+    pub x: f32,
+    pub y: f32,
+    /// Size, 0–1 of the frame.
+    pub w: f32,
+    pub h: f32,
+    /// Feather, 0–1.
+    pub feather: f32,
+    pub invert: bool,
+}
+
+/// Time Remap key. `at` is 0–1 along the clip on the timeline; `speed` is the playback rate there.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpeedKey {
+    pub at: f32,
+    pub speed: f32,
+}
+
+/// Project-bin generators. Kdenlive: Color Clip, Color Bars, White Noise, Counter.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Generator {
+    Color {
+        #[serde(default = "default_color")]
+        color: String,
+    },
+    ColorBars,
+    WhiteNoise,
+    Counter,
+}
+
+fn default_color() -> String {
+    "#000000".into()
+}
+
+/// Loudness, noise, EQ, and compression.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AudioFx {
     #[serde(default)]
@@ -630,13 +759,74 @@ impl ClipLook {
     /// Mix length at a join, clamped to half of each side (Kdenlive Mix / xfade).
     #[must_use]
     pub fn mix_window(&self, clip_dur: f64, next_dur: f64) -> f64 {
-        let raw = self.transition.mix_seconds();
+        let raw = self
+            .transition_seconds
+            .unwrap_or_else(|| self.transition.mix_seconds());
         if raw <= 1e-4 {
             return 0.0;
         }
         let half = clip_dur.min(next_dur).max(0.0) * 0.5;
         raw.min(half).min(clip_dur).max(0.0)
     }
+}
+
+/// How a move eases from the start transform to the end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ease {
+    #[default]
+    Linear,
+    In,
+    Out,
+    InOut,
+}
+
+impl Ease {
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "in" | "ease_in" => Self::In,
+            "out" | "ease_out" => Self::Out,
+            "in_out" | "inout" | "ease" => Self::InOut,
+            _ => Self::Linear,
+        }
+    }
+}
+
+/// One piece the model chose. Rust places it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EditSlot {
+    pub media_id: MediaId,
+    pub source_in: f64,
+    pub duration: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_duration: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ease: Option<Ease>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
+/// The saved plan. Revisions patch slots and rebuild from this.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EditPlan {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub style: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub aspect: String,
+    #[serde(default)]
+    pub letterbox: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music_id: Option<MediaId>,
+    #[serde(default)]
+    pub grade: Grade,
+    pub slots: Vec<EditSlot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -804,6 +994,9 @@ pub struct Track {
     pub hidden: bool,
     #[serde(default)]
     pub locked: bool,
+    /// Mixer strip for this track. Mute stays on `muted`.
+    #[serde(default)]
+    pub mix: Mix,
     #[serde(default)]
     pub clips: Vec<Clip>,
 }
@@ -818,6 +1011,7 @@ impl Track {
             muted: false,
             hidden: false,
             locked: false,
+            mix: Mix::default(),
             clips: Vec::new(),
         }
     }
@@ -855,6 +1049,12 @@ pub struct Timeline {
     pub mark_in: Option<Time>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark_out: Option<Time>,
+    /// Master fader. Solo and pan are unused; gain is the master volume.
+    #[serde(default)]
+    pub master: Mix,
+    /// Last submit_edit plan. Revisions rebuild from this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_plan: Option<EditPlan>,
 }
 
 impl Default for Timeline {
@@ -878,6 +1078,8 @@ impl Timeline {
             markers: Vec::new(),
             mark_in: None,
             mark_out: None,
+            master: Mix::default(),
+            edit_plan: None,
         }
     }
 

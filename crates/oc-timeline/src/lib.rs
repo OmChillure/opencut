@@ -7,11 +7,12 @@ mod undo;
 pub use ids::{ClipId, GroupId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
 pub use edit::PlaceMode;
 pub use model::{
-    AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipKind, ClipLook, Crop, Fx, Grade,
-    Graphic, GraphicKind, Lut, Marker, Timeline, Track, TrackKind, Transform, TransitionKind,
+    AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipKind, ClipLook, Crop,
+    CurvePoint, Curves, Ease, EditPlan, EditSlot, Fx, Generator, Grade, Graphic, GraphicKind, Lut,
+    Marker, MaskShape, Mix, SpeedKey, Timeline, Track, TrackKind, Transform, TransitionKind,
 };
 pub use project::Project;
-pub use undo::{Edit, UndoStack};
+pub use undo::{Edit, UndoEntry, UndoStack};
 
 pub use oc_time::{Duration, FrameRate, Time};
 
@@ -106,5 +107,33 @@ mod tests {
         assert!(tl.first_track(TrackKind::Video).unwrap().clips.is_empty());
         assert!(undo.redo(&mut tl));
         assert_eq!(tl.first_track(TrackKind::Video).unwrap().clips.len(), 1);
+    }
+
+    #[test]
+    fn undo_history_jumps_by_name() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        undo.checkpoint_named(tl.clone(), "add");
+        tl.add_clip(track, video_clip(0.0, 1.0)).unwrap();
+        undo.checkpoint_named(tl.clone(), "mute");
+        tl.track_mut(track).unwrap().muted = true;
+        assert_eq!(undo.labels(), vec!["add".to_string(), "mute".to_string()]);
+        assert!(undo.jump(&mut tl, 1));
+        assert!(!tl.track(track).unwrap().muted);
+        assert_eq!(tl.track(track).unwrap().clips.len(), 1);
+        assert!(undo.jump(&mut tl, 0));
+        assert!(tl.track(track).unwrap().clips.is_empty());
+        assert!(undo.jump(&mut tl, 2));
+        assert!(tl.track(track).unwrap().muted);
+    }
+
+    #[test]
+    fn mixer_unity_is_zero_db() {
+        let tl = Timeline::default();
+        assert!((tl.master.linear() - 1.0).abs() < 1e-4);
+        let (l, r) = tl.master.balance();
+        assert!((l - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4);
+        assert!((r - l).abs() < 1e-4);
     }
 }

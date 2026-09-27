@@ -108,7 +108,7 @@ pub fn render(req: &RenderRequest) -> Result<RenderResult, RenderError> {
         .arg(format!("[{}]", compiled.video_label));
     if let Some(a) = &compiled.audio_label {
         cmd.arg("-map").arg(format!("[{a}]"));
-        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("192k");
+        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("192k").arg("-shortest");
     }
     cmd.arg("-c:v")
         .arg("libx264")

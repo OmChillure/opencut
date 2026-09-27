@@ -1,6 +1,6 @@
 //! One vision pass over shot mid-frames. Optional: Groq, then xAI. No key → subjects stay empty.
 
-use crate::vision::ShotLook;
+use crate::vision::{ShotCard, ShotLook};
 use std::path::Path;
 
 const SUBJECTS: &[&str] = &[
@@ -45,9 +45,14 @@ pub async fn label_subjects(input: &Path, shots: &mut [ShotLook]) -> Result<(), 
     for chunk in jpeg.chunks(4) {
         match ask(&endpoint, chunk).await {
             Ok(lines) => {
-                for (idx, subject) in lines {
+                for (idx, subject, card) in lines {
                     if let Some(shot) = shots.get_mut(idx) {
-                        shot.subject = subject;
+                        if !subject.is_empty() {
+                            shot.subject = subject;
+                        }
+                        if card.is_some() {
+                            shot.card = card;
+                        }
                     }
                 }
             }
@@ -111,16 +116,18 @@ async fn grab_jpeg(input: &Path, at: f64, dest: &Path) -> Result<(), ()> {
     }
 }
 
-async fn ask(endpoint: &Endpoint, frames: &[(usize, Vec<u8>)]) -> Result<Vec<(usize, String)>, String> {
+async fn ask(
+    endpoint: &Endpoint,
+    frames: &[(usize, Vec<u8>)],
+) -> Result<Vec<(usize, String, Option<ShotCard>)>, String> {
     let mut content = vec![serde_json::json!({
         "type": "text",
         "text": format!(
-            "You label video frames for an editor. Images are in order, indexes {}.\n\
-             For each image write one line: INDEX subject\n\
-             subject is exactly one of: {}.\n\
-             person = a human is the subject. product = an object being shown. street = outdoors, road, city.\n\
-             screen = a display. interior = a room. landscape = scenery. object = a thing, no person.\n\
-             people = more than one person. No other words.",
+            "Label these frames. Reply with a JSON array only, one object per image, indexes {}.\n\
+             {{\"i\":0,\"subject\":\"person\",\"scale\":\"CU\",\"camera\":\"static\",\"motion_dir\":\"none\",\"action\":\"six words\",\"mood\":\"calm\",\"palette\":[\"amber\",\"brown\"],\"quality\":7}}\n\
+             subject is one of: {}.\n\
+             scale is ECU, CU, MS, WS, or EWS. camera is static, pan_l, pan_r, tilt, push_in, pull_out, handheld, or drone.\n\
+             motion_dir is l2r, r2l, toward, away, or none. action is at most 6 words. quality is 1-10.",
             frames.iter().map(|(i, _)| i.to_string()).collect::<Vec<_>>().join(", "),
             SUBJECTS.join(", ")
         )
@@ -155,7 +162,33 @@ async fn ask(endpoint: &Endpoint, frames: &[(usize, Vec<u8>)]) -> Result<Vec<(us
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string();
-    Ok(parse_subjects(&text))
+    Ok(parse_cards(&text))
+}
+
+fn parse_cards(text: &str) -> Vec<(usize, String, Option<ShotCard>)> {
+    let start = text.find('[');
+    let end = text.rfind(']');
+    if let (Some(a), Some(b)) = (start, end) {
+        if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&text[a..=b]) {
+            return rows
+                .into_iter()
+                .filter_map(|row| {
+                    let i = row.get("i").and_then(|v| v.as_u64())? as usize;
+                    let subject = row
+                        .get("subject")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let card = serde_json::from_value::<ShotCard>(row).ok();
+                    Some((i, subject, card))
+                })
+                .collect();
+        }
+    }
+    parse_subjects(text)
+        .into_iter()
+        .map(|(i, subject)| (i, subject, None))
+        .collect()
 }
 
 pub fn parse_subjects(text: &str) -> Vec<(usize, String)> {

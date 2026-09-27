@@ -1,9 +1,9 @@
 use oc_time::{Duration, Time};
 use oc_timeline::{
-    AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook, Crop, Fx,
-    Grade, Graphic,
-    MarkerId, MediaId, PlaceMode, Timeline, TimelineError, Track, TrackId, TrackKind,
-    Transform, TransitionKind, UndoStack,
+    AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook,
+    Crop, Curves, Fx, Generator, Grade, Graphic, MarkerId, MediaId, Mix, PlaceMode,
+    SpeedKey, Timeline, TimelineError, Track, TrackId, TrackKind, Transform, TransitionKind,
+    UndoStack,
 };
 use serde::{Deserialize, Serialize};
 
@@ -257,6 +257,8 @@ pub enum Op {
     SetTransition {
         clip_id: ClipId,
         kind: TransitionKind,
+        #[serde(default)]
+        duration: Option<f64>,
     },
     SetGrade {
         clip_id: ClipId,
@@ -297,6 +299,8 @@ pub enum Op {
         end_x: f32,
         end_y: f32,
         end_scale: f32,
+        #[serde(default)]
+        ease: oc_timeline::Ease,
     },
     /// Speed at the start is `speed`; `end_speed` is the speed at the tail.
     SetSpeedRamp {
@@ -325,6 +329,46 @@ pub enum Op {
         start: Time,
         duration: Duration,
         track_id: Option<TrackId>,
+    },
+    /// Kdenlive mixer: track fader, balance, and solo. `None` track is the master fader.
+    SetMix {
+        track_id: Option<TrackId>,
+        mix: Mix,
+    },
+    /// Curves (avfilter) on one clip.
+    SetCurves {
+        clip_id: ClipId,
+        curves: Curves,
+    },
+    /// Alpha Shapes. `None` clears the mask.
+    SetMask {
+        clip_id: ClipId,
+        mask: Option<AlphaShape>,
+    },
+    /// Time Remap. Keys are sorted by `at`.
+    SetSpeedKeys {
+        clip_id: ClipId,
+        keys: Vec<SpeedKey>,
+    },
+    /// Color clip, color bars, white noise, or a counter. No source file.
+    AddGenerator {
+        generator: Generator,
+        at: Time,
+        duration: Duration,
+    },
+    /// One call styles many clips. `all` means every video clip.
+    StyleClips {
+        clip_ids: Vec<ClipId>,
+        all: bool,
+        grade: Option<Grade>,
+        fx: Option<Fx>,
+        transition: Option<TransitionKind>,
+        transition_seconds: Option<f64>,
+    },
+    /// Move each video join onto the nearest beat when it is inside the tolerance.
+    SnapCuts {
+        tolerance_frames: u32,
+        beats: Vec<f64>,
     },
 }
 
@@ -625,11 +669,18 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             let n = clear_timeline(timeline);
             format!("cleared {n} clips")
         }
-        Op::SetTransition { clip_id, kind } => {
+        Op::SetTransition {
+            clip_id,
+            kind,
+            duration,
+        } => {
             let clip = timeline
                 .clip_mut(*clip_id)
                 .ok_or(TimelineError::ClipNotFound(*clip_id))?;
             clip.look.transition = *kind;
+            if let Some(seconds) = duration {
+                clip.look.transition_seconds = Some((*seconds).clamp(0.0, 3.0));
+            }
             format!("{} on {clip_id}", kind.label())
         }
         Op::SetGrade { clip_id, grade } => {
@@ -721,6 +772,7 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             end_x,
             end_y,
             end_scale,
+            ease,
         } => {
             let clip = timeline
                 .clip_mut(*clip_id)
@@ -737,6 +789,7 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
                 scale: end_scale.clamp(0.25, 4.0),
                 rotation: start.rotation,
             });
+            clip.look.move_ease = Some(*ease);
             format!("move {clip_id} to scale {end_scale:.2}")
         }
         Op::SetSpeedRamp {
@@ -828,8 +881,187 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             let id = timeline.place_clip(track_id, clip, PlaceMode::Normal)?;
             format!("graphic {id}")
         }
+        Op::SetMix { track_id, mix } => {
+            let mix = Mix {
+                gain_db: mix.gain_db.clamp(-60.0, 12.0),
+                pan: mix.pan.clamp(-1.0, 1.0),
+                solo: mix.solo,
+            };
+            match track_id {
+                Some(id) => {
+                    let track = timeline
+                        .track_mut(*id)
+                        .ok_or(TimelineError::TrackNotFound(*id))?;
+                    track.mix = mix;
+                    format!("mix {} {:+.1} dB", track.name, mix.gain_db)
+                }
+                None => {
+                    timeline.master.gain_db = mix.gain_db;
+                    format!("master {:+.1} dB", mix.gain_db)
+                }
+            }
+        }
+        Op::SetCurves { clip_id, curves } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            clip.look.curves = curves.clone();
+            format!("curves on {clip_id}")
+        }
+        Op::SetMask { clip_id, mask } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            clip.look.mask = *mask;
+            format!("mask on {clip_id}")
+        }
+        Op::SetSpeedKeys { clip_id, keys } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            let mut keys = keys.clone();
+            for key in &mut keys {
+                key.at = key.at.clamp(0.0, 1.0);
+                key.speed = key.speed.clamp(0.25, 4.0);
+            }
+            keys.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
+            clip.look.speed_keys = keys;
+            format!("time remap on {clip_id}")
+        }
+        Op::AddGenerator {
+            generator,
+            at,
+            duration,
+        } => {
+            let track_id = resolve_track(timeline, None, TrackKind::Video);
+            let mut clip = clip_for_media(MediaId::new(), *at, *duration, TrackKind::Video, Time::ZERO);
+            clip.media_id = None;
+            clip.look.generator = Some(generator.clone());
+            let id = timeline.place_clip(track_id, clip, PlaceMode::Normal)?;
+            if matches!(generator, Generator::WhiteNoise | Generator::Counter) {
+                let audio_track = resolve_track(timeline, None, TrackKind::Audio);
+                let mut bed = clip_for_media(MediaId::new(), *at, *duration, TrackKind::Audio, Time::ZERO);
+                bed.media_id = None;
+                bed.look.generator = Some(generator.clone());
+                if let ClipKind::Audio { volume, .. } = &mut bed.kind {
+                    *volume = if matches!(generator, Generator::WhiteNoise) {
+                        0.25
+                    } else {
+                        0.15
+                    };
+                }
+                let _ = timeline.place_clip(audio_track, bed, PlaceMode::Normal);
+            }
+            let name = match generator {
+                Generator::Color { .. } => "color clip",
+                Generator::ColorBars => "color bars",
+                Generator::WhiteNoise => "white noise",
+                Generator::Counter => "counter",
+            };
+            format!("{name} {id}")
+        }
+        Op::StyleClips {
+            clip_ids,
+            all,
+            grade,
+            fx,
+            transition,
+            transition_seconds,
+        } => {
+            let ids: Vec<ClipId> = if *all {
+                timeline
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == TrackKind::Video)
+                    .flat_map(|t| t.clips.iter())
+                    .filter(|c| matches!(c.kind, ClipKind::Video { .. }))
+                    .map(|c| c.id)
+                    .collect()
+            } else {
+                clip_ids.clone()
+            };
+            let n = ids.len();
+            for id in ids {
+                let Some(clip) = timeline.clip_mut(id) else {
+                    continue;
+                };
+                if let Some(grade) = grade {
+                    clip.look.grade = *grade;
+                }
+                if let Some(fx) = fx {
+                    clip.look.fx = *fx;
+                }
+                if let Some(kind) = transition {
+                    clip.look.transition = *kind;
+                }
+                if let Some(seconds) = transition_seconds {
+                    clip.look.transition_seconds = Some(seconds.clamp(0.0, 3.0));
+                }
+            }
+            format!("styled {n} clips")
+        }
+        Op::SnapCuts {
+            tolerance_frames,
+            beats,
+        } => {
+            let moved = snap_joins(timeline, *tolerance_frames, beats);
+            format!("snapped {moved} cuts to the beat")
+        }
     };
+    undo.label_last(&note);
     Ok(AppliedOp { op, note })
+}
+
+fn snap_joins(timeline: &mut Timeline, tolerance_frames: u32, beats: &[f64]) -> usize {
+    if beats.is_empty() {
+        return 0;
+    }
+    let fps = timeline.frame_rate.as_f64().max(1.0);
+    let tol = f64::from(tolerance_frames.max(1)) / fps;
+    let mut moved = 0;
+    let track_ids: Vec<_> = timeline.tracks.iter().map(|t| t.id).collect();
+    for id in track_ids {
+        let Some(track) = timeline.track_mut(id) else {
+            continue;
+        };
+        if track.kind != TrackKind::Video {
+            continue;
+        }
+        track.clips.sort_by(|a, b| a.start.cmp(&b.start));
+        for i in 1..track.clips.len() {
+            let boundary = track.clips[i].start.as_seconds();
+            let Some(beat) = nearest(beats, boundary) else {
+                continue;
+            };
+            let delta = beat - boundary;
+            if delta.abs() > tol || delta.abs() < 1e-3 {
+                continue;
+            }
+            let prev_dur = track.clips[i - 1].duration.as_seconds() + delta;
+            if prev_dur < 0.2 {
+                continue;
+            }
+            track.clips[i - 1].duration = Duration::from_seconds(prev_dur);
+            for clip in track.clips.iter_mut().skip(i) {
+                let start = (clip.start.as_seconds() + delta).max(0.0);
+                clip.start = Time::from_seconds(start);
+            }
+            moved += 1;
+        }
+    }
+    moved
+}
+
+fn nearest(beats: &[f64], at: f64) -> Option<f64> {
+    beats
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (a - at)
+                .abs()
+                .partial_cmp(&(b - at).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 fn clip_for_media(
@@ -1340,6 +1572,310 @@ pub fn pick_reel_excerpts(cues: &[(Time, Time, &str)], target_s: f64) -> Vec<Exc
         .collect()
 }
 
+/// One analyzed range the director can keep, cover with, or drop.
+#[derive(Clone, Debug)]
+pub struct SourceBeat {
+    pub media: MediaId,
+    pub start: f64,
+    pub end: f64,
+    pub look: String,
+    pub subject: String,
+    /// `speech`, `silence`, or `filler`.
+    pub role: String,
+    pub text: String,
+}
+
+/// A keep. `cover` sits on a higher track at `at`; program picks play in order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PiecePick {
+    pub media: MediaId,
+    pub source_in: f64,
+    pub duration: f64,
+    pub at: f64,
+    pub cover: bool,
+}
+
+/// Taste the scorer cannot read. Those asks stay with the model.
+#[must_use]
+pub fn asks_for_judgment(request: &str) -> bool {
+    let t = request.to_ascii_lowercase();
+    const KEYS: &[&str] = &[
+        "stronger",
+        "weaker",
+        "boring",
+        "flat",
+        "energy",
+        "punchier",
+        "funnier",
+        "emotional",
+        "urgent",
+        "awkward",
+        "vibe",
+        "feels",
+        "feel more",
+        "don't like",
+        "do not like",
+        "too slow",
+        "too fast",
+        "more dynamic",
+        "best line",
+        "the best",
+        "prefer",
+        "weak open",
+        "hate",
+    ];
+    KEYS.iter().any(|k| t.contains(k))
+}
+
+/// A note about a cut that already exists, rather than a new piece.
+#[must_use]
+pub fn revises_existing_cut(request: &str) -> bool {
+    let t = request.to_ascii_lowercase();
+    const KEYS: &[&str] = &[
+        "recut",
+        "redo",
+        "change the",
+        "change this",
+        "instead",
+        "swap",
+        "replace the",
+        "different open",
+        "shorter",
+        "longer",
+        "drop the",
+        "keep the",
+        "again",
+        "open on",
+    ];
+    KEYS.iter().any(|k| t.contains(k))
+}
+
+/// Score speech and shots, open on the strongest beat, then build outward.
+/// Silence is the program only when nothing was said. Other silence can cover a jump.
+#[must_use]
+pub fn choose_piece(beats: &[SourceBeat], request: &str, target_s: f64) -> Vec<PiecePick> {
+    let target = target_s.clamp(8.0, 90.0);
+    let quote = quoted_line(request).map(|q| q.to_ascii_lowercase());
+    let quote = quote.as_deref();
+    let mut pool: Vec<&SourceBeat> = beats
+        .iter()
+        .filter(|b| score_beat(b, quote) >= 3)
+        .collect();
+    let any_speech = pool.iter().any(|b| b.role == "speech");
+    if any_speech {
+        pool.retain(|b| b.role == "speech");
+    } else {
+        pool.retain(|b| b.role == "silence");
+    }
+    if pool.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked: Vec<usize> = (0..pool.len()).collect();
+    ranked.sort_by(|&a, &b| {
+        score_beat(pool[b], quote)
+            .cmp(&score_beat(pool[a], quote))
+            .then_with(|| {
+                pool[a]
+                    .start
+                    .partial_cmp(&pool[b].start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let hook = ranked[0];
+    let hook_media = pool[hook].media;
+    let mut selected = vec![hook];
+    let mut used = beat_dur(pool[hook]);
+    let mut forward: Vec<usize> = (0..pool.len())
+        .filter(|&i| {
+            i != hook && pool[i].media == hook_media && pool[i].start >= pool[hook].end - 0.05
+        })
+        .collect();
+    forward.sort_by(|&a, &b| {
+        pool[a]
+            .start
+            .partial_cmp(&pool[b].start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut back: Vec<usize> = (0..pool.len())
+        .filter(|&i| {
+            i != hook && pool[i].media == hook_media && pool[i].end <= pool[hook].start + 0.05
+        })
+        .collect();
+    back.sort_by(|&a, &b| {
+        pool[b]
+            .start
+            .partial_cmp(&pool[a].start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let others: Vec<usize> = ranked
+        .into_iter()
+        .filter(|&i| pool[i].media != hook_media)
+        .collect();
+    for i in forward.into_iter().chain(others).chain(back) {
+        if used >= target {
+            break;
+        }
+        if overlaps_pick(&pool, &selected, i) {
+            continue;
+        }
+        if uncovered_jump(beats, &pool, &selected, i) {
+            continue;
+        }
+        selected.push(i);
+        used += beat_dur(pool[i]);
+    }
+    let mut picks = Vec::new();
+    let mut at = 0.0;
+    for i in &selected {
+        let beat = pool[*i];
+        let duration = beat_dur(beat);
+        picks.push(PiecePick {
+            media: beat.media,
+            source_in: beat.start,
+            duration,
+            at,
+            cover: false,
+        });
+        at += duration;
+    }
+    let mut covers = Vec::new();
+    for pair in picks.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a.media != b.media {
+            continue;
+        }
+        let gap = b.source_in - (a.source_in + a.duration);
+        if !(0.15..2.5).contains(&gap) {
+            continue;
+        }
+        let Some(cover) = cover_for(beats, a, b) else {
+            continue;
+        };
+        let dur = 0.9_f64.min(cover.end - cover.start).max(0.4);
+        let at_cover = (b.at - dur * 0.5).max(a.at);
+        covers.push(PiecePick {
+            media: cover.media,
+            source_in: cover.start,
+            duration: dur,
+            at: at_cover,
+            cover: true,
+        });
+    }
+    picks.extend(covers);
+    picks
+}
+
+fn beat_dur(beat: &SourceBeat) -> f64 {
+    (beat.end - beat.start).clamp(0.45, 8.0)
+}
+
+fn score_beat(beat: &SourceBeat, quote: Option<&str>) -> i32 {
+    if beat.role == "filler" || (beat.role == "speech" && is_filler(&beat.text)) {
+        return -100;
+    }
+    let dur = beat.end - beat.start;
+    if dur < 0.45 {
+        return -100;
+    }
+    let mut score = 0;
+    if beat.role == "speech" {
+        score += (word_count(&beat.text) as i32).min(16);
+        if beat.text.contains('?') || beat.text.contains('!') {
+            score += 8;
+        }
+        if (1.2..=7.0).contains(&dur) {
+            score += 3;
+        }
+        if let Some(q) = quote {
+            let needle = q.trim();
+            if needle.len() >= 8 && beat.text.to_ascii_lowercase().contains(needle) {
+                score += 100;
+            }
+        }
+    } else if beat.role == "silence" {
+        score += 1;
+        if (1.0..=6.0).contains(&dur) {
+            score += 2;
+        }
+    } else {
+        return -100;
+    }
+    let look = beat.look.to_ascii_lowercase();
+    if look.contains("close") {
+        score += 4;
+    } else if look.contains("action") {
+        score += 3;
+    } else if look.contains("wide") {
+        score += 2;
+    }
+    let subject = beat.subject.to_ascii_lowercase();
+    if subject.contains("person") || subject.contains("people") {
+        score += 2;
+    }
+    score
+}
+
+fn overlaps_pick(pool: &[&SourceBeat], selected: &[usize], i: usize) -> bool {
+    let beat = pool[i];
+    selected.iter().any(|&s| {
+        let other = pool[s];
+        other.media == beat.media && beat.start < other.end - 0.05 && beat.end > other.start + 0.05
+    })
+}
+
+fn uncovered_jump(beats: &[SourceBeat], pool: &[&SourceBeat], selected: &[usize], i: usize) -> bool {
+    let beat = pool[i];
+    selected.iter().any(|&s| {
+        let other = pool[s];
+        if other.media != beat.media {
+            return false;
+        }
+        let left = if other.end <= beat.start { other } else { beat };
+        let right = if other.end <= beat.start { beat } else { other };
+        let gap = right.start - left.end;
+        if !(0.15..2.5).contains(&gap) {
+            return false;
+        }
+        let a = PiecePick {
+            media: left.media,
+            source_in: left.start,
+            duration: left.end - left.start,
+            at: 0.0,
+            cover: false,
+        };
+        let b = PiecePick {
+            media: right.media,
+            source_in: right.start,
+            duration: right.end - right.start,
+            at: 1.0,
+            cover: false,
+        };
+        cover_for(beats, a, b).is_none()
+    })
+}
+
+fn cover_for<'a>(beats: &'a [SourceBeat], a: PiecePick, b: PiecePick) -> Option<&'a SourceBeat> {
+    beats.iter().filter(|c| c.role == "silence").find(|c| {
+        let dur = c.end - c.start;
+        if dur < 0.8 {
+            return false;
+        }
+        let look = c.look.to_ascii_lowercase();
+        let useful = look.contains("close") || look.contains("action") || look.contains("wide");
+        if !useful && c.media == a.media {
+            return false;
+        }
+        if c.media == a.media {
+            let overlaps_a = c.start < a.source_in + a.duration - 0.05 && c.end > a.source_in + 0.05;
+            let overlaps_b = c.start < b.source_in + b.duration - 0.05 && c.end > b.source_in + 0.05;
+            if overlaps_a || overlaps_b {
+                return false;
+            }
+        }
+        true
+    })
+}
+
 #[derive(Clone, Copy)]
 struct SpeechTake {
     start: Time,
@@ -1497,6 +2033,76 @@ mod tests {
         assert_eq!(tl.height, 1920);
         assert!(undo.undo(&mut tl));
         assert_eq!(tl.width, 1920);
+    }
+
+    #[test]
+    fn mixer_curves_mask_remap_and_generator() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        let audio = tl.first_track(TrackKind::Audio).unwrap().id;
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::SetMix {
+                track_id: Some(audio),
+                mix: Mix {
+                    gain_db: -6.0,
+                    pan: -1.0,
+                    solo: true,
+                },
+            },
+        )
+        .unwrap();
+        let track = tl.track(audio).unwrap();
+        assert!((track.mix.gain_db + 6.0).abs() < 1e-3);
+        assert!(track.mix.solo);
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::AddGenerator {
+                generator: Generator::ColorBars,
+                at: Time::ZERO,
+                duration: Duration::from_seconds(3.0),
+            },
+        )
+        .unwrap();
+        let clip = tl
+            .first_track(TrackKind::Video)
+            .unwrap()
+            .clips
+            .last()
+            .unwrap();
+        assert!(matches!(clip.look.generator, Some(Generator::ColorBars)));
+        assert!(clip.media_id.is_none());
+        let id = clip.id;
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::SetCurves {
+                clip_id: id,
+                curves: Curves {
+                    all: vec![oc_timeline::CurvePoint { x: 0.5, y: 0.7 }],
+                    ..Curves::default()
+                },
+            },
+        )
+        .unwrap();
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::SetSpeedKeys {
+                clip_id: id,
+                keys: vec![
+                    oc_timeline::SpeedKey { at: 0.0, speed: 1.0 },
+                    oc_timeline::SpeedKey { at: 1.0, speed: 2.0 },
+                ],
+            },
+        )
+        .unwrap();
+        let clip = tl.find_clip(id).unwrap().1;
+        assert_eq!(clip.look.speed_keys.len(), 2);
+        assert!(!clip.look.curves.all.is_empty());
+        assert_eq!(undo.labels().len(), 4);
     }
 
     #[test]
@@ -1694,6 +2300,78 @@ mod tests {
     }
 
     #[test]
+    fn choose_piece_opens_on_the_strongest_line() {
+        let media = MediaId::new();
+        let beats = vec![
+            beat(media, 1.0, 4.0, "", "speech", "the road was empty"),
+            beat(media, 40.0, 44.0, "close", "speech", "what if we left tonight?"),
+            beat(media, 50.0, 54.0, "wide", "speech", "we made it by dawn"),
+            beat(media, 4.2, 4.8, "close", "filler", "um"),
+        ];
+        let picks = choose_piece(&beats, "make a 1 min short", 30.0);
+        let program: Vec<_> = picks.iter().filter(|p| !p.cover).collect();
+        assert!(program.len() >= 2, "{picks:?}");
+        assert!((program[0].source_in - 40.0).abs() < 0.01);
+        assert!(program.iter().all(|p| (p.source_in - 4.2).abs() > 0.2));
+    }
+
+    #[test]
+    fn choose_piece_uses_a_second_source_and_a_cover() {
+        let a = MediaId::new();
+        let b = MediaId::new();
+        let beats = vec![
+            beat(a, 1.0, 4.0, "close", "speech", "what if we left tonight?"),
+            beat(a, 5.2, 9.0, "wide", "speech", "the train was already gone"),
+            beat(b, 0.0, 3.0, "action", "silence", ""),
+            beat(b, 10.0, 16.0, "close", "speech", "pack the car and go"),
+        ];
+        let picks = choose_piece(&beats, "make a short", 20.0);
+        let program: Vec<_> = picks.iter().filter(|p| !p.cover).copied().collect();
+        assert!(program.iter().any(|p| p.media == b), "{program:?}");
+        assert!(picks.iter().any(|p| p.cover && p.media == b));
+    }
+
+    #[test]
+    fn choose_piece_silent_film_uses_the_shot_list() {
+        let media = MediaId::new();
+        let beats = vec![
+            beat(media, 0.0, 4.0, "wide", "silence", ""),
+            beat(media, 4.0, 7.0, "action", "silence", ""),
+            beat(media, 7.0, 9.0, "close", "silence", ""),
+        ];
+        let picks = choose_piece(&beats, "make a reel", 12.0);
+        assert!(!picks.is_empty());
+        assert!((picks[0].source_in - 7.0).abs() < 0.01, "{picks:?}");
+    }
+
+    #[test]
+    fn judgment_and_revision_leave_the_model_in_charge() {
+        assert!(!asks_for_judgment("make a 1 min short"));
+        assert!(asks_for_judgment("make the hook stronger"));
+        assert!(!revises_existing_cut("make a 1 min short"));
+        assert!(revises_existing_cut("recut the open"));
+    }
+
+    fn beat(
+        media: MediaId,
+        start: f64,
+        end: f64,
+        look: &str,
+        role: &str,
+        text: &str,
+    ) -> SourceBeat {
+        SourceBeat {
+            media,
+            start,
+            end,
+            look: look.into(),
+            subject: String::new(),
+            role: role.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
     fn pick_reel_skips_filler_and_hits_target() {
         let cues = [
             (Time::from_seconds(0.0), Time::from_seconds(0.6), "um"),
@@ -1775,6 +2453,7 @@ mod tests {
             Op::SetTransition {
                 clip_id: id,
                 kind: TransitionKind::Dissolve,
+                duration: None,
             },
         )
         .unwrap();

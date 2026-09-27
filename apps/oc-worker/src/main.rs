@@ -2,7 +2,7 @@ use anyhow::Context;
 use std::path::Path;
 use oc_core::{CaptionCue, Op, UndoStack, apply};
 use oc_db::Db;
-use oc_voice::transcribe_path;
+
 use oc_db::R2;
 use serde::Deserialize;
 use tokio::time::{Duration, sleep};
@@ -185,8 +185,48 @@ async fn understand_file(
     path: &Path,
     t0: std::time::Instant,
 ) -> anyhow::Result<()> {
+    let mut had_speech = oc_db::has_transcript(db, p.media_id).await.unwrap_or(false);
+    if !had_speech {
+        tracing::info!(media = %p.media_id, "whisper start");
+        let transcript = match oc_voice::transcribe_path(path).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(media = %p.media_id, "whisper skipped: {e}");
+                oc_voice::Transcript {
+                    language: None,
+                    full_text: String::new(),
+                    cues: Vec::new(),
+                }
+            }
+        };
+        had_speech = !(transcript.full_text.trim().is_empty() && transcript.cues.is_empty());
+        if !had_speech {
+            tracing::info!(
+                media = %p.media_id,
+                ms = t0.elapsed().as_millis(),
+                "no speech yet — look still runs"
+            );
+        } else {
+            save_transcript(db, p, &transcript).await?;
+            tracing::info!(
+                media = %p.media_id,
+                cues = transcript.cues.len(),
+                ms = t0.elapsed().as_millis(),
+                "whisper saved — cut can start"
+            );
+        }
+    } else {
+        tracing::info!(media = %p.media_id, "speech already stored");
+    }
+
+    let quiet = !had_speech;
     match oc_media::analyze_path(path).await {
-        Ok(look) => {
+        Ok(mut look) => {
+            if quiet {
+                if let Some(music) = music_grid(path).await {
+                    look.music = Some(music);
+                }
+            }
             let raw = serde_json::to_value(&look).unwrap_or(serde_json::json!({}));
             if let Err(e) = oc_db::upsert_media_analysis(
                 db,
@@ -216,42 +256,35 @@ async fn understand_file(
         Err(e) => tracing::warn!("local look failed: {e}"),
     }
 
-    if oc_db::has_transcript(db, p.media_id).await.unwrap_or(false) {
-        tracing::info!(media = %p.media_id, "speech already stored — look refreshed");
-        oc_db::set_media_status(db, p.media_id, "ready").await?;
-        return Ok(());
-    }
+    oc_db::set_media_status(db, p.media_id, "ready").await?;
+    tracing::info!(media = %p.media_id, ms = t0.elapsed().as_millis(), "understand done");
+    Ok(())
+}
 
-    tracing::info!(media = %p.media_id, "whisper start");
-    let transcript = match transcribe_path(path).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(media = %p.media_id, "whisper skipped: {e}");
-            oc_voice::Transcript {
-                language: None,
-                full_text: String::new(),
-                cues: Vec::new(),
-            }
-        }
-    };
-    if transcript.full_text.trim().is_empty() && transcript.cues.is_empty() {
-        tracing::info!(
-            media = %p.media_id,
-            ms = t0.elapsed().as_millis(),
-            "no speech (silent or whisper empty)"
-        );
-        oc_db::set_media_status(db, p.media_id, "ready").await?;
-        return Ok(());
+async fn music_grid(path: &Path) -> Option<oc_media::MusicAnalysis> {
+    let output = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error", "-i", &path.to_string_lossy(), "-ac", "1", "-ar", "22050", "-f", "f32le", "-",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() || output.stdout.len() < 8 {
+        return None;
     }
-    tracing::info!(
-        media = %p.media_id,
-        words = transcript.full_text.split_whitespace().count(),
-        cues = transcript.cues.len(),
-        ms = t0.elapsed().as_millis(),
-        "whisper saved"
-    );
+    let mut samples = Vec::with_capacity(output.stdout.len() / 4);
+    for chunk in output.stdout.chunks_exact(4) {
+        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Some(oc_media::detect_beats(&samples, 22_050))
+}
 
-    let raw = serde_json::to_value(&transcript)?;
+async fn save_transcript(
+    db: &Db,
+    p: &TranscribePayload,
+    transcript: &oc_voice::Transcript,
+) -> anyhow::Result<()> {
+    let raw = serde_json::to_value(transcript)?;
     let cue_rows: Vec<(i64, i64, String, Option<String>)> = transcript
         .cues
         .iter()
@@ -278,7 +311,12 @@ async fn understand_file(
     )
     .await?;
 
-    let cues: Vec<CaptionCue> = transcript.cues.into_iter().map(|c| c.into_timeline()).collect();
+    let cues: Vec<CaptionCue> = transcript
+        .cues
+        .iter()
+        .cloned()
+        .map(|c| c.into_timeline())
+        .collect();
     let mut project = oc_db::get_project(db, p.project_id).await?;
     let mut undo = UndoStack::new();
     apply(

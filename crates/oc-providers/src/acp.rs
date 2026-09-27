@@ -96,10 +96,10 @@ impl AcpClient {
         Ok(client)
     }
 
-    pub async fn prompt(
+    /// `session/new` once. Later turns reuse the id and send only the new text.
+    pub async fn open_session(
         &mut self,
         cwd: &str,
-        message: &str,
         model: Option<&str>,
         mcp_servers: &[Value],
         events: Option<&EventSink>,
@@ -132,6 +132,27 @@ impl AcpClient {
                 )
                 .await;
         }
+        Ok(session_id)
+    }
+
+    pub async fn prompt(
+        &mut self,
+        cwd: &str,
+        message: &str,
+        model: Option<&str>,
+        mcp_servers: &[Value],
+        events: Option<&EventSink>,
+    ) -> Result<String, LlmError> {
+        let session_id = self.open_session(cwd, model, mcp_servers, events).await?;
+        self.continue_prompt(&session_id, message, events).await
+    }
+
+    pub async fn continue_prompt(
+        &mut self,
+        session_id: &str,
+        message: &str,
+        events: Option<&EventSink>,
+    ) -> Result<String, LlmError> {
         tracing::info!(session_id = %session_id, chars = message.len(), "acp session/prompt");
         let prompt_id = self.next_id + 1;
         self.send(

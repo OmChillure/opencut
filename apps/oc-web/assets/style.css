@@ -959,6 +959,56 @@ button:disabled { opacity: 0.45; cursor: default; }
   opacity: 0.85;
   align-self: center;
 }
+.mixer, .scopes, .multicam, .export-play {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+}
+.mixer-strips, .multicam-grid {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+}
+.mixer-strip, .multicam-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 72px;
+  padding: 6px;
+  background: #161616;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  color: inherit;
+  text-align: left;
+}
+.mixer-name, .mixer-db, .mixer-title, .mixer-note {
+  font-size: 11px;
+  color: var(--muted);
+}
+.mixer-flags { display: flex; gap: 4px; flex-wrap: wrap; }
+.mix-flag {
+  min-width: 22px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid #333;
+  background: transparent;
+  color: inherit;
+}
+.mix-flag.on { background: #f0c000; color: #111; }
+.scope-canvas, .export-video {
+  width: 100%;
+  max-width: 320px;
+  background: #000;
+  border-radius: 6px;
+}
+.multicam-cell video {
+  width: 100%;
+  height: 72px;
+  object-fit: cover;
+  background: #000;
+}
+.nle-cell { background: #111; }
 .nle-trim {
   position: absolute;
   top: 0;
@@ -1366,6 +1416,12 @@ button:disabled { opacity: 0.45; cursor: default; }
   color: #fff;
   display: grid;
   place-items: center;
+}
+.send.pause {
+  width: auto;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
 }
 .send:disabled { background: transparent; color: var(--faint); }
 .hint {

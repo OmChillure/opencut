@@ -16,6 +16,7 @@ fn dissolve_sets_outgoing_kind() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Dissolve,
+            duration: None,
         },
     )
     .unwrap();
@@ -35,6 +36,7 @@ fn cut_clears_mix() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Slide,
+            duration: None,
         },
     )
     .unwrap();
@@ -44,6 +46,7 @@ fn cut_clears_mix() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Cut,
+            duration: None,
         },
     )
     .unwrap();
@@ -78,6 +81,7 @@ fn dissolve_without_neighbor_has_zero_mix() {
         Op::SetTransition {
             clip_id: id,
             kind: TransitionKind::Dissolve,
+            duration: None,
         },
     )
     .unwrap();
@@ -98,6 +102,7 @@ fn dissolve_emits_incoming_shot_in_the_mix_window() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Dissolve,
+            duration: None,
         },
     )
     .unwrap();
@@ -133,6 +138,7 @@ fn mix_progress_is_zero_before_window() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Wipe,
+            duration: None,
         },
     )
     .unwrap();
@@ -153,6 +159,7 @@ fn split_does_not_copy_outgoing_mix_onto_the_left() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Dissolve,
+            duration: None,
         },
     )
     .unwrap();
@@ -193,6 +200,7 @@ fn all_mix_kinds_roundtrip_in_ops_json() {
         let op = Op::SetTransition {
             clip_id: oc_core::ClipId::new(),
             kind,
+            duration: None,
         };
         let raw = serde_json::to_string(&op).unwrap();
         let back: Op = serde_json::from_str(&raw).unwrap();
@@ -216,6 +224,7 @@ fn gap_between_clips_is_not_a_mix() {
         Op::SetTransition {
             clip_id: a,
             kind: TransitionKind::Dissolve,
+            duration: None,
         },
     )
     .unwrap();

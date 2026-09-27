@@ -112,6 +112,22 @@ pub async fn put_media_bytes(
     Ok(())
 }
 
+thread_local! {
+    static CHAT_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn request_chat_stop() {
+    CHAT_STOP.with(|cell| cell.set(true));
+}
+
+pub fn clear_chat_stop() {
+    CHAT_STOP.with(|cell| cell.set(false));
+}
+
+pub fn chat_stopped() -> bool {
+    CHAT_STOP.with(|cell| cell.get())
+}
+
 pub async fn chat(
     project_id: &str,
     provider: &str,
@@ -235,6 +251,10 @@ async fn wasm_read_ndjson(
         .map_err(|_| "stream reader".to_string())?;
     let mut pending = String::new();
     loop {
+        if chat_stopped() {
+            let _ = reader.cancel();
+            return Err("stopped".into());
+        }
         let next = JsFuture::from(reader.read()).await.map_err(js_err)?;
         let done = js_sys::Reflect::get(&next, &"done".into())
             .ok()

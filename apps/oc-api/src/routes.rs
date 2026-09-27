@@ -280,6 +280,9 @@ async fn wait_for_understand(state: &AppState, tx: &mpsc::Sender<String>, jobs: 
             .await;
             return;
         }
+        if tx.is_closed() {
+            return;
+        }
         if last_note.elapsed() >= Duration::from_secs(8) {
             push(
                 tx,
@@ -291,7 +294,10 @@ async fn wait_for_understand(state: &AppState, tx: &mpsc::Sender<String>, jobs: 
             .await;
             last_note = Instant::now();
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::select! {
+            _ = tx.closed() => return,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
 }
 
@@ -382,7 +388,10 @@ async fn run_chat(
         if needs_scan {
             push(
                 &tx,
-                serde_json::json!({"type":"status","text":"Watching clips before the cut (shot list, then words)"}),
+                serde_json::json!({
+                    "type": "status",
+                    "text": "Watching clips before the cut (shot list, then words)"
+                }),
             )
             .await;
             let mut jobs = Vec::new();
@@ -432,21 +441,11 @@ async fn run_chat(
         }
     }
     let tools = mcp_tools();
-    let system = format!(
-        "You are the picture editor for project '{}'. Do what the user asked — \
-         reel, trim, recut, captions, silence, whatever. There is no default cut. \
-         Call list_bin and list_timeline first. For a long file, call get_media. \
-         It returns a shot list: start-end, look, subject (person, product, street, …), \
-         speech|silence|filler, and the words. Place excerpts on those times. \
-         A reel, vlog, interview, ad, or documentary gets a different finish once the review is clean. \
-         Drop filler and long silence or the review will say filler kept or silence kept. \
-         A late hook is a problem only when they asked for a reel, short, or hook. \
-         Music and a second camera exist only if the user imported them. \
-         After tools, a cut review lists fix: lines (length, late hook, jump cut, stacked talk). \
-         Fix those with tools before you say the cut is done. Do not assume the \
-         bin is empty. Never describe an edit you did not make with tools.",
-        project.name
-    );
+    let mut system = format!("Project '{}'.", project.name);
+    if let Some(guide) = oc_providers::style_guide(&last_user) {
+        system.push_str("\n\n");
+        system.push_str(&guide);
+    }
     let mut turns = body.messages;
     let mut text = String::new();
     let (ev_tx, ev_rx) = mpsc::channel::<ChatEvent>(64);
@@ -463,28 +462,51 @@ async fn run_chat(
     if mcp_servers.is_empty() {
         tracing::warn!(project = %id, "no opencut MCP server — TOOL-line fallback only");
     }
-    if let Some(text) = edit::cut_short_now(&state.db, id, &last_user).await {
-        let project = oc_db::get_project(&state.db, id)
-            .await
-            .map_err(|e| e.to_string())?;
-        tracing::info!(project = %id, "fast short, no model loop");
-        finish_chat(&tx, &text, &[], &project.timeline).await;
-        drop(ev_tx);
-        let _ = pump.await;
-        return Ok(());
-    }
-    for turn_i in 0..3 {
-        let reply = match oc_providers::complete_stream(
-            &body.provider,
-            &body.model,
-            &system,
-            &turns,
-            &tools,
-            Some(ev_tx.clone()),
-            &mcp_servers,
-        )
-        .await
-        {
+    let mut session = oc_providers::DirectorSession::open(
+        &body.provider,
+        &body.model,
+        &mcp_servers,
+        Some(ev_tx.clone()),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut message = oc_providers::opening_prompt(
+        &system,
+        &turns,
+        &tools,
+        !mcp_servers.is_empty(),
+    );
+    let mut note_rounds = 0_u32;
+    for turn_i in 0..8 {
+        if tx.is_closed() {
+            drop(ev_tx);
+            let _ = pump.await;
+            return Ok(());
+        }
+        let reply = tokio::select! {
+            _ = tx.closed() => {
+                drop(ev_tx);
+                let _ = pump.await;
+                return Ok(());
+            }
+            reply = async {
+                if session.remembers() {
+                    session.turn(&message, Some(&ev_tx)).await
+                } else {
+                    oc_providers::complete_stream(
+                        &body.provider,
+                        &body.model,
+                        &system,
+                        &turns,
+                        &tools,
+                        Some(ev_tx.clone()),
+                        &mcp_servers,
+                    )
+                    .await
+                }
+            } => reply,
+        };
+        let reply = match reply {
             Ok(reply) => reply,
             Err(err) => {
                 tracing::error!(project = %id, "provider failed: {err}");
@@ -496,27 +518,27 @@ async fn run_chat(
         match reply {
             LlmReply::Text(t) => {
                 let review = fresh_review(&state, id, &last_user).await;
-                if !review.issues {
-                    match edit::apply_finish(&state.db, id, &last_user, false).await {
-                        Ok(note) if !note.is_empty() => notes.push(note),
-                        Ok(_) => {}
-                        Err(err) => tracing::warn!(project = %id, "picture finish skipped: {err}"),
+                let director = oc_core::is_director_request(&last_user);
+                let note_blocks = review.notes && director && note_rounds < 2;
+                if (review.issues || note_blocks) && turn_i + 1 < 8 {
+                    if note_blocks {
+                        note_rounds += 1;
                     }
-                }
-                if review.issues && turn_i + 1 < 3 {
                     tracing::info!(project = %id, "cut review rejected a finished reply");
+                    let follow = format!(
+                        "{}\nThose fix: lines are still open. note: lines matter for two rounds. \
+                         Correct them with tools. Do not describe the cut as done.",
+                        review.text
+                    );
                     turns.push(ChatTurn {
                         role: "assistant".into(),
                         content: t,
                     });
                     turns.push(ChatTurn {
                         role: "user".into(),
-                        content: format!(
-                            "{}\nThose fix: lines are still open. Correct them with tools. \
-                             Do not describe the cut as done.",
-                            review.text
-                        ),
+                        content: follow.clone(),
                     });
+                    message = oc_providers::followup_prompt(&follow);
                     continue;
                 }
                 text = t;
@@ -552,7 +574,7 @@ async fn run_chat(
                             {
                                 notes.push(out.clone());
                             }
-                            batch.push_str(&out);
+                            batch.push_str(&compact_tool(&call.name, &out));
                             batch.push('\n');
                             (true, out)
                         }
@@ -578,20 +600,24 @@ async fn run_chat(
                     )
                     .await;
                 }
+                let logged = format!("tools\n{batch}");
                 turns.push(ChatTurn {
                     role: "assistant".into(),
-                    content: format!("Called tools:\n{batch}"),
+                    content: logged.clone(),
                 });
                 let review = fresh_review(&state, id, &last_user).await;
+                let follow = format!(
+                    "{logged}\n{review}\n\
+                     If a line starts with \"fix:\", correct it with tools. \
+                     note: lines matter for two rounds in a full edit. \
+                     If the cut matches the request, reply in 2–4 sentences.",
+                    review = review.text
+                );
                 turns.push(ChatTurn {
                     role: "user".into(),
-                    content: format!(
-                        "Tool results above.\n{review}\n\
-                         If a line starts with \"fix:\", correct it with tools unless the user asked for it. \
-                         If the cut matches the request, reply in 2–4 sentences.",
-                        review = review.text
-                    ),
+                    content: follow.clone(),
                 });
+                message = oc_providers::followup_prompt(&follow);
             }
         }
     }
@@ -612,6 +638,17 @@ async fn run_chat(
     );
     finish_chat(&tx, &text, &notes, &project.timeline).await;
     Ok(())
+}
+
+fn compact_tool(name: &str, result: &str) -> String {
+    let short: String = result
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("ok")
+        .chars()
+        .take(140)
+        .collect();
+    format!("{name}: {short}")
 }
 
 async fn emit_host_tool(
@@ -902,6 +939,35 @@ pub async fn get_media_file(
         StatusCode::NOT_FOUND,
         "media file is not stored — re-import the clip",
     ))
+}
+
+pub async fn get_export(
+    Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    let dir = std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into());
+    let prefix = id.to_string();
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?;
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) || !name.ends_with(".mp4") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+            best = Some((modified, entry.path()));
+        }
+    }
+    let path = best
+        .map(|(_, path)| path)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?;
+    serve_local_file(&path, "video/mp4", headers.get(header::RANGE)).await
 }
 
 async fn serve_local_file(

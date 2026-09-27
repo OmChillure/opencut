@@ -917,6 +917,42 @@ pub fn timeline_end(tracks: &[EditorTrack]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Pull a later picture clip back across a hole so playback cannot skip it.
+pub fn close_editor_gaps(tracks: &mut [EditorTrack]) {
+    for track in tracks {
+        if track.hidden || track.kind != TrackKindUi::Video {
+            continue;
+        }
+        let mut order: Vec<usize> = (0..track.clips.len())
+            .filter(|&i| !track.clips[i].disabled)
+            .collect();
+        order.sort_by(|&a, &b| {
+            track.clips[a]
+                .start
+                .partial_cmp(&track.clips[b].start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cursor = order.first().map(|&i| track.clips[i].start).unwrap_or(0.0);
+        for i in order {
+            if track.clips[i].start > cursor + 0.08 {
+                track.clips[i].start = cursor;
+            }
+            cursor = track.clips[i].end();
+        }
+    }
+}
+
+/// End of the picture the monitor should play. Captions and the source file length do not extend it.
+pub fn program_end(tracks: &[EditorTrack]) -> f64 {
+    tracks
+        .iter()
+        .filter(|track| !track.hidden && track.kind == TrackKindUi::Video)
+        .flat_map(|track| track.clips.iter())
+        .filter(|clip| !clip.disabled)
+        .map(TimelineClip::end)
+        .fold(0.0, f64::max)
+}
+
 pub fn display_tracks(tracks: &[EditorTrack]) -> Vec<EditorTrack> {
     let caps: Vec<_> = tracks
         .iter()
@@ -949,12 +985,13 @@ pub fn set_media_duration(library: &mut [MediaItem], tracks: &mut [EditorTrack],
             .map(|c| (c.start, c.duration))
             .collect();
         bounds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let only = track.clips.iter().filter(|c| c.media_id == id).count() == 1;
         for clip in track.clips.iter_mut() {
             if clip.media_id != id {
                 continue;
             }
-            let looks_placeholder = (clip.duration - 5.0).abs() < 0.05
-                || (old > 0.05 && (clip.duration - old).abs() < 0.05);
+            // A 5s drop before the file length is known. A real excerpt stays as cut.
+            let looks_placeholder = only && (clip.duration - 5.0).abs() < 0.05;
             if !looks_placeholder || clip.source_in > 0.05 {
                 continue;
             }
@@ -1164,7 +1201,7 @@ pub fn following_shot(
                 if join.as_ref().is_none_or(|(s, _)| clip.start < *s) {
                     join = Some((clip.start, clip.id.clone()));
                 }
-            } else if clip.start >= cur_end - 0.05 {
+            } else if clip.start >= cur_end - 0.05 && clip.start - cur_end <= 0.35 {
                 if later.as_ref().is_none_or(|(s, _)| clip.start < *s) {
                     later = Some((clip.start, clip.id.clone()));
                 }
@@ -1766,6 +1803,19 @@ mod tests {
     }
 
     #[test]
+    fn metadata_does_not_stretch_an_excerpt_to_the_file() {
+        let mut library = vec![item("a", "blob:a", 359.0)];
+        let mut tracks = vec![video_track(vec![
+            clip("c1", "a", 0.0, 2.8),
+            clip("c2", "a", 2.8, 6.1),
+        ])];
+        tracks[0].clips[1].source_in = 6.9;
+        set_media_duration(&mut library, &mut tracks, "blob:a", 359.0);
+        assert!((tracks[0].clips[0].duration - 2.8).abs() < 1e-6);
+        assert!((tracks[0].clips[1].duration - 6.1).abs() < 1e-6);
+    }
+
+    #[test]
     fn clip_under_prefers_later_start_when_overlapping() {
         let library = vec![item("a", "blob:a", 40.0), item("b", "blob:b", 8.0)];
         let tracks = vec![video_track(vec![
@@ -1787,6 +1837,16 @@ mod tests {
         assert_eq!(next.media_id, "b");
         assert!((next.start - 4.0).abs() < 1e-6);
         assert!(following_shot(&tracks, &library, 5.0).is_none());
+    }
+
+    #[test]
+    fn following_shot_does_not_skip_a_hole() {
+        let library = vec![item("a", "blob:a", 40.0)];
+        let tracks = vec![video_track(vec![
+            clip("c1", "a", 0.0, 10.0),
+            clip("c2", "a", 30.0, 8.0),
+        ])];
+        assert!(following_shot(&tracks, &library, 8.0).is_none());
     }
 
     #[test]

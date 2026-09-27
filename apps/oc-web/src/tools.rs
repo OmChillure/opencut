@@ -12,16 +12,99 @@ pub fn run_ops(mut save: WorkspaceSave, ops: Vec<Op>) -> Result<Vec<String>, Str
         return Ok(Vec::new());
     }
     let mut timeline = save.engine.peek().clone();
-    let mut undo = UndoStack::new();
+    let mut undo = save.undo.peek().clone();
     let mut notes = Vec::new();
     for op in ops.clone() {
         let applied = apply(&mut timeline, &mut undo, op).map_err(|e| e.to_string())?;
         notes.push(applied.note);
     }
+    save.undo.set(undo.clone());
+    store_undo(&save.project_id.peek(), &undo);
     save.engine.set(timeline.clone());
     save.tracks.set(bind::tracks_from_timeline(&timeline));
     enqueue_persist(save, ops);
     Ok(notes)
+}
+
+fn undo_key(project: &str) -> String {
+    format!("opencut-undo-{project}")
+}
+
+pub fn store_undo(project: &str, stack: &UndoStack) {
+    if project.is_empty() {
+        return;
+    }
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let Ok(Some(storage)) = win.local_storage() else {
+        return;
+    };
+    if let Ok(json) = serde_json::to_string(stack) {
+        let _ = storage.set_item(&undo_key(project), &json);
+    }
+}
+
+pub fn load_undo(project: &str) -> UndoStack {
+    let Some(win) = web_sys::window() else {
+        return UndoStack::new();
+    };
+    let Ok(Some(storage)) = win.local_storage() else {
+        return UndoStack::new();
+    };
+    storage
+        .get_item(&undo_key(project))
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_else(UndoStack::new)
+}
+
+fn restore(mut save: WorkspaceSave, timeline: oc_core::Timeline, undo: UndoStack) {
+    save.undo.set(undo.clone());
+    store_undo(&save.project_id.peek(), &undo);
+    save.engine.set(timeline.clone());
+    save.tracks.set(bind::tracks_from_timeline(&timeline));
+    enqueue_persist(save, vec![Op::SetTimeline { timeline }]);
+}
+
+/// Step back one named change. The history itself is kept, as in Kdenlive.
+pub fn undo_edit(save: WorkspaceSave) -> Result<(), String> {
+    let mut timeline = save.engine.peek().clone();
+    let mut undo = save.undo.peek().clone();
+    if !undo.undo(&mut timeline) {
+        return Err("nothing to undo".into());
+    }
+    restore(save, timeline, undo);
+    Ok(())
+}
+
+pub fn redo_edit(save: WorkspaceSave) -> Result<(), String> {
+    let mut timeline = save.engine.peek().clone();
+    let mut undo = save.undo.peek().clone();
+    if !undo.redo(&mut timeline) {
+        return Err("nothing to redo".into());
+    }
+    restore(save, timeline, undo);
+    Ok(())
+}
+
+/// Jump the Undo History. `keep` is how many changes stay applied.
+pub fn jump_history(save: WorkspaceSave, keep: usize) -> Result<(), String> {
+    let mut timeline = save.engine.peek().clone();
+    let mut undo = save.undo.peek().clone();
+    if !undo.jump(&mut timeline, keep) && keep != undo.depth() {
+        return Err("that step is not in the history".into());
+    }
+    restore(save, timeline, undo);
+    Ok(())
+}
+
+pub fn clear_history(mut save: WorkspaceSave) {
+    let mut undo = save.undo.peek().clone();
+    undo.clear();
+    save.undo.set(undo.clone());
+    store_undo(&save.project_id.peek(), &undo);
 }
 
 fn enqueue_persist(mut save: WorkspaceSave, ops: Vec<Op>) {
@@ -363,7 +446,7 @@ pub fn set_transition_at(
     kind: TransitionKind,
 ) -> Result<Vec<String>, String> {
     let clip_id = selected_or_playhead(save, selected, track_id, at)?;
-    let mut notes = run_ops(save, vec![Op::SetTransition { clip_id, kind }])?;
+    let mut notes = run_ops(save, vec![Op::SetTransition { clip_id, kind, duration: None }])?;
     let has_next = save.engine.peek().tracks.iter().any(|track| {
         let Some(i) = track.clips.iter().position(|c| c.id == clip_id) else {
             return false;
@@ -465,6 +548,63 @@ pub fn add_graphic_at(
 
 pub fn duck_at(save: WorkspaceSave) -> Result<Vec<String>, String> {
     run_ops(save, vec![Op::Duck { amount: 0.7 }])
+}
+
+pub fn set_mix(
+    save: WorkspaceSave,
+    track_id: Option<oc_core::TrackId>,
+    mix: oc_core::Mix,
+) -> Result<Vec<String>, String> {
+    run_ops(save, vec![Op::SetMix { track_id, mix }])
+}
+
+pub fn set_curves_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    curves: oc_core::Curves,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(save, vec![Op::SetCurves { clip_id, curves }])
+}
+
+pub fn set_mask_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    mask: Option<oc_core::AlphaShape>,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(save, vec![Op::SetMask { clip_id, mask }])
+}
+
+pub fn set_speed_keys_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    keys: Vec<oc_core::SpeedKey>,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(save, vec![Op::SetSpeedKeys { clip_id, keys }])
+}
+
+pub fn add_generator(
+    save: WorkspaceSave,
+    generator: oc_core::Generator,
+    at: f64,
+    duration: f64,
+) -> Result<Vec<String>, String> {
+    run_ops(
+        save,
+        vec![Op::AddGenerator {
+            generator,
+            at: Time::from_seconds(at),
+            duration: Duration::from_seconds(duration),
+        }],
+    )
 }
 
 fn parse_track_id(raw: &str) -> Option<TrackId> {

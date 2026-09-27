@@ -18,6 +18,30 @@ pub struct ShotLook {
     pub subject: String,
     #[serde(default)]
     pub motion: f32,
+    /// Filled by one vision batch at import. Missing when there is no API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<ShotCard>,
+}
+
+/// Compact look from one vision batch. Cached on the analysis row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShotCard {
+    #[serde(default)]
+    pub scale: String,
+    #[serde(default)]
+    pub camera: String,
+    #[serde(default)]
+    pub motion_dir: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub mood: String,
+    #[serde(default)]
+    pub palette: Vec<String>,
+    #[serde(default)]
+    pub quality: u8,
+    #[serde(default)]
+    pub best_moment: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -32,6 +56,8 @@ pub struct VisualDigest {
     /// Scene ranges with a look each. Missing on rows saved before shot lists.
     #[serde(default)]
     pub shots: Vec<ShotLook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music: Option<crate::MusicAnalysis>,
 }
 
 impl Default for VisualDigest {
@@ -45,6 +71,7 @@ impl Default for VisualDigest {
             has_video: false,
             has_audio: false,
             shots: Vec::new(),
+            music: None,
         }
     }
 }
@@ -118,6 +145,7 @@ pub async fn analyze_path(input: &Path) -> Result<VisualDigest, crate::MediaErro
                     look: look.into(),
                     subject: String::new(),
                     motion: 0.0,
+                    card: None,
                 }]
             } else {
                 Vec::new()
@@ -156,6 +184,7 @@ pub async fn analyze_path(input: &Path) -> Result<VisualDigest, crate::MediaErro
             look: look.into(),
             subject: String::new(),
             motion: *motion,
+            card: None,
         });
     }
 
@@ -477,6 +506,7 @@ fn fold_frames(frames: Vec<FrameStats>, scene_n: usize, duration: f64, has_audio
         has_video: true,
         has_audio,
         shots: Vec::new(),
+        music: None,
     }
 }
 

@@ -1,7 +1,10 @@
 //! MCP tool list so any LLM provider can call the same edits as the UI.
 
 use crate::ops::{AssembleItem, AssembleStyle, ExportPreset, Op, TimeRange, TimelineEditMode};
-use oc_timeline::{AudioFx, Fx, Grade, Graphic, GraphicKind, Lut, TransitionKind};
+use oc_timeline::{
+    AlphaShape, AudioFx, CurvePoint, Curves, Fx, Generator, Grade, Graphic, GraphicKind, Lut,
+    MaskShape, Mix, SpeedKey, TransitionKind,
+};
 use crate::registry::tools;
 use crate::ToolGroup;
 use oc_time::{Duration, Time};
@@ -31,6 +34,15 @@ pub enum Inspect {
     ListTimeline,
     GetMedia { media_id: MediaId },
     ListCues { media_id: MediaId },
+    GetMusic { media_id: MediaId },
+    FindShots {
+        scale: Option<String>,
+        camera: Option<String>,
+        motion_dir: Option<String>,
+        min_quality: Option<u8>,
+        subject: Option<String>,
+        limit: usize,
+    },
 }
 
 #[must_use]
@@ -44,6 +56,26 @@ pub fn inspect_from_mcp(call: &McpCall) -> Option<Inspect> {
         "list_cues" => media_id(&call.arguments, "media_id")
             .ok()
             .map(|media_id| Inspect::ListCues { media_id }),
+        "get_music" => media_id(&call.arguments, "media_id")
+            .ok()
+            .map(|media_id| Inspect::GetMusic { media_id }),
+        "find_shots" => Some(Inspect::FindShots {
+            scale: call.arguments.get("scale").and_then(Value::as_str).map(str::to_string),
+            camera: call.arguments.get("camera").and_then(Value::as_str).map(str::to_string),
+            motion_dir: call
+                .arguments
+                .get("motion_dir")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            min_quality: number(&call.arguments, "min_quality")
+                .ok()
+                .map(|n| n.clamp(1.0, 10.0) as u8),
+            subject: call.arguments.get("subject").and_then(Value::as_str).map(str::to_string),
+            limit: number(&call.arguments, "limit")
+                .ok()
+                .map(|n| n as usize)
+                .unwrap_or(24),
+        }),
         _ => None,
     }
 }
@@ -104,17 +136,27 @@ pub fn mcp_tools() -> Vec<McpTool> {
                  wipe_left/right/up/down, circle_open, radial, pixelize, …"
                 .into(),
             input_schema: object(&[
-                ("clip_id", str_prop("Outgoing clip id"), true),
+                ("clip_id", str_prop("Outgoing clip id"), false),
+                ("clip_ids", str_prop("JSON array of clip ids"), false),
+                ("all", str_prop("true sets every video clip"), false),
                 ("kind", str_prop("xfade / editor name, e.g. dissolve, wipe_left"), true),
+                ("duration", num_prop("Mix length in seconds"), false),
             ]),
         },
         McpTool {
             name: "set_grade".into(),
-            description: "Color on a clip: exposure, contrast, saturation, temperature, \
-                 lift (shadows), gamma (mids), gain (highlights), lut (none, film, cool, warm, teal_orange, mono)."
+            description: "Color on a clip. Every number defaults to 0 (no change). \
+                 lut: none, film, cool, warm, teal_orange, mono. \
+                 Pass clip_ids or all=true to style many clips at once."
                 .into(),
             input_schema: object(&[
-                ("clip_id", str_prop("Clip id"), true),
+                ("clip_id", str_prop("Clip id"), false),
+                ("clip_ids", str_prop("JSON array of clip ids"), false),
+                ("all", str_prop("true styles every video clip"), false),
+                ("exposure", num_prop("Exposure, 0 = unchanged"), false),
+                ("contrast", num_prop("Contrast, 0 = unchanged"), false),
+                ("saturation", num_prop("Saturation, 0 = unchanged"), false),
+                ("temperature", num_prop("Temperature, 0 = unchanged"), false),
                 ("lift", num_prop("Shadows -1..1"), false),
                 ("gamma", num_prop("Mids -1..1"), false),
                 ("gain", num_prop("Highlights -1..1"), false),
@@ -123,19 +165,28 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "set_fx".into(),
-            description: "Blur, grain, vignette on a clip.".into(),
-            input_schema: object(&[("clip_id", str_prop("Clip id"), true)]),
+            description: "Blur, grain, and vignette. Each defaults to 0. \
+                 Pass clip_ids or all=true to style many clips."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), false),
+                ("clip_ids", str_prop("JSON array of clip ids"), false),
+                ("all", str_prop("true styles every video clip"), false),
+                ("blur", num_prop("Blur, 0 = none"), false),
+                ("grain", num_prop("Grain, 0 = none"), false),
+                ("vignette", num_prop("Vignette, 0 = none"), false),
+            ]),
         },
         McpTool {
             name: "set_transform".into(),
-            description: "Kdenlive Transform: zoom and pan a video clip. \
-                 scale 1 is the full frame, 1.18 is a punch-in. x and y pan in pixels."
+            description: "Zoom and pan a video clip. scale 1 is the full frame. \
+                 x and y are fractions of the frame, 0 is centered."
                 .into(),
             input_schema: object(&[
                 ("clip_id", str_prop("Clip id"), true),
                 ("scale", num_prop("Zoom, 1 = fit"), false),
-                ("x", num_prop("Pan X pixels"), false),
-                ("y", num_prop("Pan Y pixels"), false),
+                ("x", num_prop("Pan X, fraction of the frame"), false),
+                ("y", num_prop("Pan Y, fraction of the frame"), false),
                 ("rotation", num_prop("Degrees"), false),
             ]),
         },
@@ -153,23 +204,111 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "set_move".into(),
-            description: "Move zoom and pan across the clip, from the current transform to end_scale, end_x, end_y."
+            description: "Animate zoom and pan across the clip. end_x and end_y are fractions of the frame. \
+                 ease is linear, in, out, or in_out."
                 .into(),
             input_schema: object(&[
                 ("clip_id", str_prop("Clip id"), true),
                 ("end_scale", num_prop("Zoom at the tail"), true),
-                ("end_x", num_prop("Pan X at the tail"), false),
-                ("end_y", num_prop("Pan Y at the tail"), false),
+                ("end_x", num_prop("Pan X at the tail, fraction"), false),
+                ("end_y", num_prop("Pan Y at the tail, fraction"), false),
+                ("ease", str_prop("linear, in, out, in_out"), false),
             ]),
         },
         McpTool {
             name: "set_speed_ramp".into(),
-            description: "Speed at the head and at the tail. 1 is normal. Use for a ramp, not a jump cut."
+            description: "Speed at the head and at the tail. 1 is normal. Use for a ramp, not a jump cut. \
+                 For a change in the middle, use set_speed_keys."
                 .into(),
             input_schema: object(&[
                 ("clip_id", str_prop("Clip id"), true),
                 ("speed", num_prop("Start speed"), true),
                 ("end_speed", num_prop("End speed"), true),
+            ]),
+        },
+        McpTool {
+            name: "set_speed_keys".into(),
+            description: "Time remap. keys are points along the clip: at is 0 at the head and 1 at the tail, \
+                 speed is the rate there (1 is normal, 0.25..4). The picture ramps between the keys. \
+                 Use this when the speed change is in the middle. set_speed_ramp is enough for head-to-tail."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                (
+                    "keys",
+                    (
+                        json!({
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "at": { "type": "number", "description": "0..1 along the clip" },
+                                    "speed": { "type": "number", "description": "Playback rate" }
+                                },
+                                "required": ["at", "speed"]
+                            }
+                        }),
+                        "Speed keys",
+                    ),
+                    true,
+                ),
+            ]),
+        },
+        McpTool {
+            name: "set_mix".into(),
+            description: "Audio mixer strip, like Kdenlive. gain_db 0 is unity, pan -1 is left and 1 is right, \
+                 solo isolates the track. Pass a track_id from list_timeline. Omit track_id to set the master fader. \
+                 Solo does not clear the other strips: set solo false on them yourself for an exclusive solo."
+                .into(),
+            input_schema: object(&[
+                ("track_id", str_prop("Audio track id. Omit for the master."), false),
+                ("gain_db", num_prop("Fader dB, -60..12. 0 is unity."), false),
+                ("pan", num_prop("Balance -1..1"), false),
+                ("solo", str_prop("true or false"), false),
+            ]),
+        },
+        McpTool {
+            name: "set_curves".into(),
+            description: "Curves (avfilter) on one clip. channel is all, red, green, or blue. \
+                 mid is the output of the midpoint: 0.5 is a straight line, below darkens the mids, above lifts them. \
+                 Or pass points as {x, y} from 0 to 1. One call replaces the whole curve, so name the channel you mean."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("channel", str_prop("all, red, green, or blue"), false),
+                ("mid", num_prop("Midpoint output 0..1. 0.5 is unchanged."), false),
+            ]),
+        },
+        McpTool {
+            name: "set_mask".into(),
+            description: "Alpha shape on a clip so the track below shows outside it. \
+                 shape: rectangle, ellipse, triangle, diamond. x and y are the center (0..1), w and h are the size (0..1). \
+                 feather is 0..1. invert keeps the outside instead. clear true removes the mask."
+                .into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Clip id"), true),
+                ("shape", str_prop("rectangle, ellipse, triangle, diamond"), false),
+                ("x", num_prop("Center X 0..1"), false),
+                ("y", num_prop("Center Y 0..1"), false),
+                ("w", num_prop("Width 0..1"), false),
+                ("h", num_prop("Height 0..1"), false),
+                ("feather", num_prop("Feather 0..1"), false),
+                ("invert", str_prop("true or false"), false),
+                ("clear", str_prop("true removes the mask"), false),
+            ]),
+        },
+        McpTool {
+            name: "add_generator".into(),
+            description: "Insert a generated clip. These are Kdenlive generators, not footage of the scene: \
+                 color (a solid frame; pass color as #rrggbb), color_bars (SMPTE), white_noise (snow plus a noise bed), \
+                 counter (a clock plus a 1 kHz tone). Use them for a slate, a hold, bars, a noise bed, or a countdown. \
+                 Do not use them as B-roll of the story. Real B-roll is an imported file via place_clip or cover."
+                .into(),
+            input_schema: object(&[
+                ("kind", str_prop("color, color_bars, white_noise, counter"), true),
+                ("color", str_prop("#rrggbb, only for kind color"), false),
+                ("at", num_prop("Timeline start in seconds"), false),
+                ("duration", num_prop("Seconds"), false),
             ]),
         },
         McpTool {
@@ -205,11 +344,53 @@ pub fn mcp_tools() -> Vec<McpTool> {
             ]),
         },
         McpTool {
-            name: "finish_reel".into(),
-            description: "After the cut is the right length: grade, vignette, punch-in on jumps, \
-                 fade open and close, captions, vertical frame for a reel, and a cover when one exists."
+            name: "submit_edit".into(),
+            description: "Build the whole cut from a plan. Rust places the slots, snaps to the music, \
+                 grades every clip, sets transitions, ducks music, and writes captions. \
+                 Slots must sit on a real shot or spoken line. Prefer this over many place_clip calls."
                 .into(),
-            input_schema: object(&[]),
+            input_schema: object(&[
+                ("style", str_prop("cinematic, hype, documentary, vlog, or empty"), false),
+                ("aspect", str_prop("landscape, vertical, square"), false),
+                ("letterbox", str_prop("true or false"), false),
+                ("music_id", str_prop("Imported music file"), false),
+                ("slots", str_prop("Array of {media_id, source_in, duration, transition?, speed?, move?}"), true),
+            ]),
+        },
+        McpTool {
+            name: "revise_edit".into(),
+            description: "Change slots in the saved plan and rebuild. changes: [{slot, ...fields}]. \
+                 slot is the 0-based index."
+                .into(),
+            input_schema: object(&[("changes", str_prop("Array of slot patches"), true)]),
+        },
+        McpTool {
+            name: "get_music".into(),
+            description: "BPM, sections, and beats for an audio file. Compact."
+                .into(),
+            input_schema: object(&[("media_id", str_prop("Music file id"), true)]),
+        },
+        McpTool {
+            name: "find_shots".into(),
+            description: "Search every file's shot list. scale, camera, motion_dir, min_quality, subject, limit."
+                .into(),
+            input_schema: object(&[
+                ("scale", str_prop("ECU, CU, MS, WS, EWS"), false),
+                ("camera", str_prop("static, pan_l, push_in, …"), false),
+                ("motion_dir", str_prop("l2r, r2l, toward, away, none"), false),
+                ("min_quality", num_prop("1-10"), false),
+                ("subject", str_prop("person, product, street, …"), false),
+                ("limit", num_prop("Max rows"), false),
+            ]),
+        },
+        McpTool {
+            name: "snap_cuts_to_beats".into(),
+            description: "Move each video join to the nearest beat of media_id, within tolerance_frames. Ripples later clips."
+                .into(),
+            input_schema: object(&[
+                ("media_id", str_prop("Music file"), true),
+                ("tolerance_frames", num_prop("Frames, default 2"), false),
+            ]),
         },
         McpTool {
             name: "set_fade".into(),
@@ -679,34 +860,104 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 .get("kind")
                 .and_then(Value::as_str)
                 .unwrap_or("dissolve");
-            Ok(Op::SetTransition {
-                clip_id: clip_id(&call.arguments, "clip_id")?,
-                kind: TransitionKind::from_key(raw),
-            })
+            let kind = TransitionKind::from_key(raw);
+            let duration = number(&call.arguments, "duration").ok();
+            if batch(&call.arguments) {
+                Ok(Op::StyleClips {
+                    clip_ids: clip_ids_of(&call.arguments),
+                    all: flag(&call.arguments, "all"),
+                    grade: None,
+                    fx: None,
+                    transition: Some(kind),
+                    transition_seconds: duration,
+                })
+            } else {
+                Ok(Op::SetTransition {
+                    clip_id: clip_id(&call.arguments, "clip_id")?,
+                    kind,
+                    duration,
+                })
+            }
         }
-        "set_grade" => Ok(Op::SetGrade {
-            clip_id: clip_id(&call.arguments, "clip_id")?,
-            grade: Grade {
-                exposure: number(&call.arguments, "exposure").unwrap_or(0.08) as f32,
-                contrast: number(&call.arguments, "contrast").unwrap_or(0.14) as f32,
-                saturation: number(&call.arguments, "saturation").unwrap_or(0.12) as f32,
-                temperature: number(&call.arguments, "temperature").unwrap_or(0.06) as f32,
-                lift: number(&call.arguments, "lift").unwrap_or(0.0) as f32,
-                gamma: number(&call.arguments, "gamma").unwrap_or(0.0) as f32,
-                gain: number(&call.arguments, "gain").unwrap_or(0.0) as f32,
-                lut: lut_from(call.arguments.get("lut").and_then(Value::as_str).unwrap_or("none")),
-            },
-        }),
+        "set_grade" => {
+            let grade = grade_from(&call.arguments);
+            if batch(&call.arguments) {
+                Ok(Op::StyleClips {
+                    clip_ids: clip_ids_of(&call.arguments),
+                    all: flag(&call.arguments, "all"),
+                    grade: Some(grade),
+                    fx: None,
+                    transition: None,
+                    transition_seconds: None,
+                })
+            } else {
+                Ok(Op::SetGrade {
+                    clip_id: clip_id(&call.arguments, "clip_id")?,
+                    grade,
+                })
+            }
+        }
         "set_move" => Ok(Op::SetMove {
             clip_id: clip_id(&call.arguments, "clip_id")?,
             end_x: number(&call.arguments, "end_x").unwrap_or(0.0) as f32,
             end_y: number(&call.arguments, "end_y").unwrap_or(0.0) as f32,
             end_scale: number(&call.arguments, "end_scale").unwrap_or(1.12) as f32,
+            ease: oc_timeline::Ease::parse(
+                call.arguments
+                    .get("ease")
+                    .and_then(Value::as_str)
+                    .unwrap_or("linear"),
+            ),
         }),
         "set_speed_ramp" => Ok(Op::SetSpeedRamp {
             clip_id: clip_id(&call.arguments, "clip_id")?,
             speed: number(&call.arguments, "speed").unwrap_or(1.0) as f32,
             end_speed: number(&call.arguments, "end_speed").unwrap_or(1.0) as f32,
+        }),
+        "set_speed_keys" => {
+            let keys = speed_keys(&call.arguments)?;
+            Ok(Op::SetSpeedKeys {
+                clip_id: clip_id(&call.arguments, "clip_id")?,
+                keys,
+            })
+        }
+        "set_mix" => Ok(Op::SetMix {
+            track_id: optional_track(&call.arguments, "track_id"),
+            mix: Mix {
+                gain_db: number(&call.arguments, "gain_db").unwrap_or(0.0) as f32,
+                pan: number(&call.arguments, "pan").unwrap_or(0.0) as f32,
+                solo: flag(&call.arguments, "solo"),
+            },
+        }),
+        "set_curves" => Ok(Op::SetCurves {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            curves: curves_from(&call.arguments),
+        }),
+        "set_mask" => Ok(Op::SetMask {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            mask: if flag(&call.arguments, "clear") {
+                None
+            } else {
+                Some(AlphaShape {
+                    shape: mask_shape(
+                        call.arguments
+                            .get("shape")
+                            .and_then(Value::as_str)
+                            .unwrap_or("rectangle"),
+                    ),
+                    x: number(&call.arguments, "x").unwrap_or(0.5) as f32,
+                    y: number(&call.arguments, "y").unwrap_or(0.5) as f32,
+                    w: number(&call.arguments, "w").unwrap_or(0.5) as f32,
+                    h: number(&call.arguments, "h").unwrap_or(0.5) as f32,
+                    feather: number(&call.arguments, "feather").unwrap_or(0.0) as f32,
+                    invert: flag(&call.arguments, "invert"),
+                })
+            },
+        }),
+        "add_generator" => Ok(Op::AddGenerator {
+            generator: generator_from(&call.arguments),
+            at: seconds(&call.arguments, "at").unwrap_or(Time::ZERO),
+            duration: Duration::from_seconds(number(&call.arguments, "duration").unwrap_or(5.0)),
         }),
         "set_stabilize" => Ok(Op::SetStabilize {
             clip_id: clip_id(&call.arguments, "clip_id")?,
@@ -747,14 +998,28 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
             source_in: seconds(&call.arguments, "source_in").unwrap_or(Time::ZERO),
             duration: Duration::from_seconds(number(&call.arguments, "duration").unwrap_or(0.9)),
         }),
-        "set_fx" => Ok(Op::SetFx {
-            clip_id: clip_id(&call.arguments, "clip_id")?,
-            fx: Fx {
+        "set_fx" => {
+            let fx = Fx {
                 blur: number(&call.arguments, "blur").unwrap_or(0.0) as f32,
-                grain: number(&call.arguments, "grain").unwrap_or(0.18) as f32,
-                vignette: number(&call.arguments, "vignette").unwrap_or(0.35) as f32,
-            },
-        }),
+                grain: number(&call.arguments, "grain").unwrap_or(0.0) as f32,
+                vignette: number(&call.arguments, "vignette").unwrap_or(0.0) as f32,
+            };
+            if batch(&call.arguments) {
+                Ok(Op::StyleClips {
+                    clip_ids: clip_ids_of(&call.arguments),
+                    all: flag(&call.arguments, "all"),
+                    grade: None,
+                    fx: Some(fx),
+                    transition: None,
+                    transition_seconds: None,
+                })
+            } else {
+                Ok(Op::SetFx {
+                    clip_id: clip_id(&call.arguments, "clip_id")?,
+                    fx,
+                })
+            }
+        }
         "set_fade" => Ok(Op::SetFade {
             clip_id: clip_id(&call.arguments, "clip_id")?,
             fade_in: Duration::from_seconds(number(&call.arguments, "fade_in").unwrap_or(0.8)),
@@ -982,6 +1247,140 @@ fn flag(args: &Value, key: &str) -> bool {
         Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0) > 0.0,
         _ => false,
     }
+}
+
+fn speed_keys(args: &Value) -> Result<Vec<SpeedKey>, String> {
+    let keys: Vec<SpeedKey> = args
+        .get("keys")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let at = row.get("at").and_then(Value::as_f64)? as f32;
+                    let speed = row.get("speed").and_then(Value::as_f64)? as f32;
+                    Some(SpeedKey { at, speed })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.len() < 2 {
+        return Err("set_speed_keys needs at least two keys, each with at and speed".into());
+    }
+    Ok(keys)
+}
+
+fn curves_from(args: &Value) -> Curves {
+    let points = args
+        .get("points")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let x = row.get("x").and_then(Value::as_f64)? as f32;
+                    let y = row.get("y").and_then(Value::as_f64)? as f32;
+                    Some(CurvePoint { x, y })
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|points| !points.is_empty())
+        .unwrap_or_else(|| {
+            let y = number(args, "mid").unwrap_or(0.5) as f32;
+            if (y - 0.5).abs() < 0.01 {
+                Vec::new()
+            } else {
+                vec![
+                    CurvePoint { x: 0.0, y: 0.0 },
+                    CurvePoint { x: 0.5, y },
+                    CurvePoint { x: 1.0, y: 1.0 },
+                ]
+            }
+        });
+    if points.is_empty() {
+        return Curves::default();
+    }
+    match args.get("channel").and_then(Value::as_str).unwrap_or("all") {
+        "red" | "r" => Curves {
+            red: points,
+            ..Curves::default()
+        },
+        "green" | "g" => Curves {
+            green: points,
+            ..Curves::default()
+        },
+        "blue" | "b" => Curves {
+            blue: points,
+            ..Curves::default()
+        },
+        _ => Curves {
+            all: points,
+            ..Curves::default()
+        },
+    }
+}
+
+fn mask_shape(raw: &str) -> MaskShape {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ellipse" | "circle" => MaskShape::Ellipse,
+        "triangle" => MaskShape::Triangle,
+        "diamond" => MaskShape::Diamond,
+        _ => MaskShape::Rectangle,
+    }
+}
+
+fn generator_from(args: &Value) -> Generator {
+    match args
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("color")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "color_bars" | "bars" | "smpte" => Generator::ColorBars,
+        "white_noise" | "noise" => Generator::WhiteNoise,
+        "counter" | "countdown" => Generator::Counter,
+        _ => Generator::Color {
+            color: args
+                .get("color")
+                .and_then(Value::as_str)
+                .unwrap_or("#111111")
+                .to_string(),
+        },
+    }
+}
+
+fn grade_from(args: &Value) -> Grade {
+    Grade {
+        exposure: number(args, "exposure").unwrap_or(0.0) as f32,
+        contrast: number(args, "contrast").unwrap_or(0.0) as f32,
+        saturation: number(args, "saturation").unwrap_or(0.0) as f32,
+        temperature: number(args, "temperature").unwrap_or(0.0) as f32,
+        lift: number(args, "lift").unwrap_or(0.0) as f32,
+        gamma: number(args, "gamma").unwrap_or(0.0) as f32,
+        gain: number(args, "gain").unwrap_or(0.0) as f32,
+        lut: lut_from(args.get("lut").and_then(Value::as_str).unwrap_or("none")),
+    }
+}
+
+fn batch(args: &Value) -> bool {
+    flag(args, "all")
+        || args
+            .get("clip_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|rows| !rows.is_empty())
+}
+
+fn clip_ids_of(args: &Value) -> Vec<ClipId> {
+    args.get("clip_ids")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .filter_map(|raw| Uuid::parse_str(raw).ok())
+                .map(ClipId::from_uuid)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn lut_from(raw: &str) -> Lut {

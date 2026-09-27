@@ -4,19 +4,22 @@ mod finish;
 mod intent;
 mod mcp;
 mod ops;
+mod plan;
 mod registry;
 mod review;
 
 pub use intent::{Intent, is_director_request, parse_intent};
 pub use mcp::{inspect_from_mcp, Inspect, McpCall, McpTool, mcp_tools, op_from_mcp};
+pub use plan::{build_plan, plan_from_value, revise_plan, SourceWindow};
 pub use ops::{
     AppliedOp, AssembleItem, AssembleStyle, Excerpt, ExportPreset, Op, OpError, TimeRange,
-    TimelineEditMode, apply, excerpts_for_request, pick_reel_excerpts,
+    TimelineEditMode, apply, asks_for_judgment, choose_piece, excerpts_for_request,
+    pick_reel_excerpts, revises_existing_cut, PiecePick, SourceBeat,
 };
 pub use oc_timeline::PlaceMode;
 pub use registry::{actions, modes, tool, tools, track_actions};
 pub use finish::{CoverShot, SpokenLine, already_finished, finish_reel, wants_picture_finish};
-pub use review::{CutReview, Spoken, review_cut};
+pub use review::{review_cut, review_with, CutReview, ReviewFacts, Spoken};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

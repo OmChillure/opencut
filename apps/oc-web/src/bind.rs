@@ -7,7 +7,7 @@ use oc_core::{
 use uuid::Uuid;
 
 pub fn tracks_from_timeline(timeline: &Timeline) -> Vec<EditorTrack> {
-    timeline
+    let mut tracks: Vec<EditorTrack> = timeline
         .tracks
         .iter()
         .map(|track| EditorTrack {
@@ -51,7 +51,9 @@ pub fn tracks_from_timeline(timeline: &Timeline) -> Vec<EditorTrack> {
                 })
                 .collect(),
         })
-        .collect()
+        .collect();
+    crate::media::close_editor_gaps(&mut tracks);
+    tracks
 }
 
 pub fn timeline_from_tracks(
@@ -75,6 +77,7 @@ pub fn timeline_from_tracks(
                 muted: track.muted,
                 hidden: track.hidden,
                 locked: prev_track.map(|t| t.locked).unwrap_or(false),
+                mix: prev_track.map(|t| t.mix).unwrap_or_default(),
                 clips: track
                     .clips
                     .iter()

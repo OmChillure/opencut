@@ -6,13 +6,15 @@ pub use oc_tools as tools;
 pub use oc_tools::{
     inspect_from_mcp, AppliedOp, AssembleItem, AssembleStyle, Excerpt, Inspect, Intent, McpCall,
     McpTool, Op, ExportPreset, TimelineEditMode, apply, is_director_request, mcp_tools, op_from_mcp,
-    parse_intent, pick_reel_excerpts, excerpts_for_request, review_cut, finish_reel, already_finished,
-    wants_picture_finish, CutReview, Spoken, SpokenLine, CoverShot,
+    parse_intent, pick_reel_excerpts, excerpts_for_request, choose_piece, asks_for_judgment,
+    revises_existing_cut, PiecePick, SourceBeat, review_cut, review_with, finish_reel, already_finished,
+    wants_picture_finish, CutReview, Spoken, SpokenLine, CoverShot, build_plan, revise_plan,
+    plan_from_value, SourceWindow, ReviewFacts,
 };
 pub use oc_time::{Duration, FrameRate, Time};
 pub use oc_timeline::{
-    AudioFx, CaptionCue, Clip, ClipId, ClipKind, ClipLook, Crop, Fx, Grade, Graphic, GraphicKind,
-    GroupId, LinkId, Lut,
-    Marker, MarkerId, MediaId, PlaceMode, Project, ProjectId, Timeline, Track, TrackId, TrackKind,
-    Transform, TransitionKind, UndoStack,
+    AlphaShape, AudioFx, CaptionCue, Clip, ClipId, ClipKind, ClipLook, Crop, CurvePoint, Curves,
+    Ease, EditPlan, EditSlot, Fx, Generator, Grade, Graphic, GraphicKind, GroupId, LinkId, Lut,
+    Marker, MarkerId, MaskShape, MediaId, Mix, PlaceMode, Project, ProjectId, SpeedKey, Timeline,
+    Track, TrackId, TrackKind, Transform, TransitionKind, UndoStack,
 };

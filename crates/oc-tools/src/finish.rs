@@ -98,6 +98,7 @@ pub fn finish_reel(
                 end_x: 0.0,
                 end_y: 0.0,
                 end_scale: look.punch_scale + 0.08,
+                ease: oc_timeline::Ease::InOut,
             });
         }
         let long_enough = clip.duration.as_seconds() >= 1.2;
@@ -116,6 +117,7 @@ pub fn finish_reel(
                 ops.push(Op::SetTransition {
                     clip_id: clips[i - 1].id,
                     kind: TransitionKind::Dissolve,
+                    duration: Some(0.4),
                 });
             }
         }

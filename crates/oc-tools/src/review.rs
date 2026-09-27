@@ -16,11 +16,34 @@ pub struct Spoken {
 pub struct CutReview {
     pub text: String,
     pub issues: bool,
+    /// Taste notes. They block "done" only in director mode, and only for two rounds.
+    pub notes: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReviewFacts {
+    pub beats: Vec<f64>,
+    pub has_music: bool,
+    /// Target average shot length from the style guide, when one is loaded.
+    pub target_shot: Option<f64>,
+    /// Shot scale in timeline order, when the vision card exists.
+    pub scales: Vec<String>,
+    pub qualities: Vec<u8>,
+    pub motion_dirs: Vec<String>,
 }
 
 /// Facts about the timeline plus problems the director should fix.
 /// `request` is the user's ask, used only to read a target length.
 pub fn review_cut(timeline: &Timeline, speech: &[Spoken], request: &str) -> CutReview {
+    review_with(timeline, speech, request, &ReviewFacts::default())
+}
+
+pub fn review_with(
+    timeline: &Timeline,
+    speech: &[Spoken],
+    request: &str,
+    facts: &ReviewFacts,
+) -> CutReview {
     let mut lines = Vec::new();
     let mut issues = Vec::new();
     let videos = video_clips(timeline);
@@ -73,10 +96,114 @@ pub fn review_cut(timeline: &Timeline, speech: &[Spoken], request: &str) -> CutR
             text.push('\n');
         }
     }
+    let notes = taste_notes(timeline, &videos, facts);
+    for note in &notes {
+        text.push_str("note: ");
+        text.push_str(note);
+        text.push('\n');
+    }
     CutReview {
         text,
         issues: !issues.is_empty(),
+        notes: !notes.is_empty(),
     }
+}
+
+fn taste_notes(timeline: &Timeline, videos: &[&Clip], facts: &ReviewFacts) -> Vec<String> {
+    let mut notes = Vec::new();
+    if facts.scales.len() >= 3 {
+        let mut run = 1;
+        for pair in facts.scales.windows(2) {
+            if !pair[0].is_empty() && pair[0] == pair[1] {
+                run += 1;
+                if run >= 3 {
+                    notes.push(format!("same shot size {} times in a row ({})", run, pair[0]));
+                    break;
+                }
+            } else {
+                run = 1;
+            }
+        }
+    }
+    let transitions: Vec<_> = videos
+        .iter()
+        .filter(|c| c.look.transition != oc_timeline::TransitionKind::Cut)
+        .map(|c| c.look.transition.label())
+        .collect();
+    if transitions.len() >= 3 && transitions.windows(2).all(|w| w[0] == w[1]) {
+        notes.push(format!(
+            "the same transition ({}) is on every join",
+            transitions[0]
+        ));
+    }
+    if !facts.beats.is_empty() && videos.len() >= 2 {
+        let tol = 1.0 / timeline.frame_rate.as_f64().max(1.0);
+        let mut on = 0;
+        for clip in videos.iter().skip(1) {
+            let at = clip.start.as_seconds();
+            if facts.beats.iter().any(|b| (b - at).abs() <= tol * 2.0) {
+                on += 1;
+            }
+        }
+        let pct = on as f64 / (videos.len() - 1) as f64;
+        if pct < 0.70 {
+            notes.push(format!(
+                "only {:.0}% of cuts land on a beat",
+                pct * 100.0
+            ));
+        }
+    }
+    if let Some(target) = facts.target_shot {
+        if !videos.is_empty() {
+            let avg = videos.iter().map(|c| c.duration.as_seconds()).sum::<f64>() / videos.len() as f64;
+            if (avg - target).abs() > target * 0.4 {
+                notes.push(format!(
+                    "average shot {avg:.1}s vs the style target {target:.1}s"
+                ));
+            }
+        }
+    }
+    if facts.qualities.iter().any(|q| *q > 0 && *q < 5) {
+        notes.push("a shot scored under 5 is in the cut".into());
+    }
+    let dirs: Vec<_> = facts
+        .motion_dirs
+        .iter()
+        .filter(|d| !d.is_empty() && *d != "none")
+        .cloned()
+        .collect();
+    for pair in dirs.windows(2) {
+        if reversed(&pair[0], &pair[1]) {
+            notes.push(format!(
+                "motion direction reverses across a cut ({} then {})",
+                pair[0], pair[1]
+            ));
+            break;
+        }
+    }
+    if !videos.is_empty() && videos.iter().all(|c| c.look.grade.is_identity()) {
+        notes.push("no grade applied".into());
+    }
+    if facts.has_music {
+        let ducked = timeline.tracks.iter().any(|t| {
+            t.kind == TrackKind::Audio
+                && t.clips.iter().any(|c| match &c.kind {
+                    ClipKind::Audio { ducked, .. } => *ducked,
+                    _ => false,
+                })
+        });
+        if !ducked {
+            notes.push("music is not ducked under speech".into());
+        }
+    }
+    notes
+}
+
+fn reversed(a: &str, b: &str) -> bool {
+    matches!(
+        (a, b),
+        ("l2r", "r2l") | ("r2l", "l2r") | ("toward", "away") | ("away", "toward")
+    )
 }
 
 fn video_clips(timeline: &Timeline) -> Vec<&Clip> {
@@ -432,5 +559,43 @@ mod tests {
         }];
         let review = review_cut(&tl, &speech, "trim the open");
         assert!(!review.issues, "{}", review.text);
+    }
+
+    #[test]
+    fn each_taste_note_fires() {
+        let media = MediaId::new();
+        let mut clips = vec![
+            video_clip(media, 0.0, 2.0, 0.0),
+            video_clip(media, 2.0, 2.0, 2.0),
+            video_clip(media, 4.0, 2.0, 4.0),
+            video_clip(media, 6.0, 2.0, 6.0),
+        ];
+        for clip in &mut clips {
+            clip.look.transition = oc_timeline::TransitionKind::Dissolve;
+        }
+        let tl = tl_with(clips);
+        let facts = ReviewFacts {
+            beats: vec![0.0, 10.0],
+            has_music: true,
+            target_shot: Some(8.0),
+            scales: vec!["CU".into(), "CU".into(), "CU".into()],
+            qualities: vec![3],
+            motion_dirs: vec!["l2r".into(), "r2l".into()],
+        };
+        let review = review_with(&tl, &[], "make a short", &facts);
+        for needle in [
+            "same shot size",
+            "same transition",
+            "cuts land on a beat",
+            "average shot",
+            "scored under 5",
+            "motion direction reverses",
+            "no grade",
+            "not ducked",
+        ] {
+            assert!(review.notes, "{}", review.text);
+            assert!(review.text.contains(needle), "{needle} missing in {}", review.text);
+        }
+        assert!(!review.issues || review.text.contains("fix:"), "{}", review.text);
     }
 }
