@@ -209,6 +209,19 @@ impl Timeline {
         if dest.kind != TrackKind::Video {
             return Err(TimelineError::TrackKindMismatch);
         }
+        let reference = self
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .flat_map(|t| t.clips.iter())
+            .find(|c| {
+                !c.disabled && c.contains(at) && matches!(c.kind, ClipKind::Video { .. })
+            })
+            .map(|c| {
+                let into = (at - c.start).as_seconds().max(0.0);
+                let speed = f64::from(c.speed.max(0.01));
+                c.source_in.as_seconds() + into * speed
+            });
         let _ = self.split_all(at);
         for track in &mut self.tracks {
             if track.kind != TrackKind::Video {
@@ -218,6 +231,18 @@ impl Timeline {
             for clip in &mut track.clips {
                 if clip.start >= at {
                     clip.disabled = !enable;
+                }
+            }
+        }
+        if let Some(reference) = reference {
+            if let Some(track) = self.track_mut(track_id) {
+                if let Some(clip) = track.clips.iter_mut().find(|c| !c.disabled && c.contains(at))
+                {
+                    let into = (at - clip.start).as_seconds().max(0.0);
+                    let speed = f64::from(clip.speed.max(0.01));
+                    let current = clip.source_in.as_seconds() + into * speed;
+                    let next = (clip.source_in.as_seconds() + (reference - current)).max(0.0);
+                    clip.source_in = Time::from_seconds(next);
                 }
             }
         }
@@ -618,6 +643,66 @@ mod tests {
         let clips = &tl.first_track(TrackKind::Video).unwrap().clips;
         assert_eq!(clips.len(), 2);
         assert!((clips[1].start.as_seconds() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn multicam_cut_matches_the_angle_you_were_watching() {
+        let mut tl = Timeline::default();
+        let v1 = tl.first_track(TrackKind::Video).unwrap().id;
+        let v2 = tl.add_track(TrackKind::Video, "V2");
+        let mut wide = video(0.0, 8.0);
+        wide.source_in = Time::from_seconds(10.0);
+        let mut tight = video(0.0, 8.0);
+        tight.source_in = Time::from_seconds(2.0);
+        tl.add_clip(v1, wide).unwrap();
+        tl.add_clip(v2, tight).unwrap();
+        tl.multicam_cut(v2, Time::from_seconds(4.0)).unwrap();
+        let angle = tl
+            .track(v2)
+            .unwrap()
+            .clips
+            .iter()
+            .find(|c| !c.disabled && c.contains(Time::from_seconds(4.0)))
+            .unwrap();
+        let into = (Time::from_seconds(4.0) - angle.start).as_seconds();
+        let src = angle.source_in.as_seconds() + into;
+        assert!((src - 14.0).abs() < 1e-3, "shared clock {src}");
+        assert!(tl
+            .track(v1)
+            .unwrap()
+            .clips
+            .iter()
+            .any(|c| c.start >= Time::from_seconds(4.0) && c.disabled));
+    }
+
+    #[test]
+    fn detach_keeps_the_offset_when_the_picture_moves() {
+        let mut tl = Timeline::default();
+        let video_track = tl.first_track(TrackKind::Video).unwrap().id;
+        let picture = tl.add_clip(video_track, video(1.0, 4.0)).unwrap();
+        let audio = tl.detach_audio(picture).unwrap();
+        tl.trim(audio, Time::ZERO, Duration::from_seconds(5.0))
+            .unwrap();
+        tl.move_clip(picture, video_track, Time::from_seconds(3.0))
+            .unwrap();
+        let audio = tl.find_clip(audio).unwrap().1;
+        assert!((audio.start.as_seconds() - 2.0).abs() < 1e-6);
+        let picture = tl.find_clip(picture).unwrap().1;
+        assert!((picture.start.as_seconds() - 3.0).abs() < 1e-6);
+        assert_eq!(audio.link_id, picture.link_id);
+    }
+
+    #[test]
+    fn split_cuts_the_linked_audio() {
+        let mut tl = Timeline::default();
+        let video_track = tl.first_track(TrackKind::Video).unwrap().id;
+        let picture = tl.add_clip(video_track, video(0.0, 4.0)).unwrap();
+        tl.detach_audio(picture).unwrap();
+        tl.split(picture, Time::from_seconds(1.5)).unwrap();
+        let audio = tl.first_track(TrackKind::Audio).unwrap();
+        assert_eq!(audio.clips.len(), 2);
+        assert!((audio.clips[0].duration.as_seconds() - 1.5).abs() < 1e-6
+            || (audio.clips[1].duration.as_seconds() - 1.5).abs() < 1e-6);
     }
 
     #[test]

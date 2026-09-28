@@ -26,9 +26,7 @@ pub fn compile(
     preset: ExportPreset,
     work: &Path,
 ) -> Result<Compiled, RenderError> {
-    let (pw, ph) = preset.size();
-    let width = if timeline.width >= 2 { timeline.width } else { pw };
-    let height = if timeline.height >= 2 { timeline.height } else { ph };
+    let (width, height) = preset.size();
     let fps = timeline.frame_rate.as_f64().max(1.0);
 
     let mut inputs: Vec<PathBuf> = Vec::new();
@@ -252,8 +250,10 @@ fn stitch_base(
                     ));
                     acc = Some((out, left_end + dur - mix));
                 } else {
+                    let left_tb = next_label();
+                    let right_tb = next_label();
                     fc.push_str(&format!(
-                        "[{left}][{v}]concat=n=2:v=1:a=0[{out}];"
+                        "[{left}]fps={fps},settb=AVTB[{left_tb}];[{v}]fps={fps},settb=AVTB[{right_tb}];[{left_tb}][{right_tb}]concat=n=2:v=1:a=0[{out}];"
                     ));
                     acc = Some((out, left_end + dur));
                 }

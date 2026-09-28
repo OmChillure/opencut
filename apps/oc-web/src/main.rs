@@ -780,7 +780,24 @@ fn AssetView(tab: AssetTab) -> Element {
                 IconCaptions {}
                 strong { "Captions" }
                 small { "Transcribe speech and drop a caption track on the timeline." }
-                button { class: "btn btn-primary", "Generate captions" }
+                button {
+                    class: "btn btn-primary",
+                    onclick: move |_| {
+                        let pid = save.project_id.peek().clone();
+                        let clock = clock;
+                        spawn(async move {
+                            match api::generate_captions(&pid).await {
+                                Ok((timeline, note)) => {
+                                    let mut save = save;
+                                    show_timeline(&mut save, &clock, timeline);
+                                    show_toast().success(note);
+                                }
+                                Err(err) => show_toast().error(err),
+                            }
+                        });
+                    },
+                    "Generate captions"
+                }
             }
         },
         AssetTab::Audio => rsx! {
@@ -2354,6 +2371,10 @@ fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent
             if text.is_empty() {
                 return;
             }
+            if looks_like_tool_trace(&text) {
+                push_thought(messages, text);
+                return;
+            }
             let mut list = messages.write();
             if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Bot) {
                 last.text.push_str(&text);
@@ -2378,16 +2399,7 @@ fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent
                 last.text.push_str(&ev.text);
             } else {
                 let n = list.len();
-                list.push(ChatMsg {
-                    role: ChatRole::Thought,
-                    text: ev.text,
-                    tool_id: format!("thought-{n}"),
-                    tool_name: String::new(),
-                    tool_status: String::new(),
-                    tool_args: String::new(),
-                    tool_result: String::new(),
-                    open: true,
-                });
+                list.push(closed_thought(ev.text, n));
             }
         }
         "note" => {
@@ -2576,6 +2588,37 @@ fn collapse_aside(mut messages: Signal<Vec<ChatMsg>>) {
 fn short_tool_name(raw: &str) -> String {
     let s = raw.rsplit([':', '/', '@']).next().unwrap_or(raw);
     s.rsplit("__").next().unwrap_or(s).trim().to_string()
+}
+
+fn looks_like_tool_trace(text: &str) -> bool {
+    let t = text.trim();
+    t.contains("function_call")
+        || t.contains("tool_call")
+        || t.contains("sessionUpdate")
+        || (t.starts_with('{') && t.contains("\"arguments\""))
+}
+
+fn closed_thought(text: String, n: usize) -> ChatMsg {
+    ChatMsg {
+        role: ChatRole::Thought,
+        text,
+        tool_id: format!("thought-{n}"),
+        tool_name: String::new(),
+        tool_status: String::new(),
+        tool_args: String::new(),
+        tool_result: String::new(),
+        open: false,
+    }
+}
+
+fn push_thought(mut messages: Signal<Vec<ChatMsg>>, text: String) {
+    let mut list = messages.write();
+    if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Thought) {
+        last.text.push_str(&text);
+    } else {
+        let n = list.len();
+        list.push(closed_thought(text, n));
+    }
 }
 
 fn strip_tool_lines(text: &str) -> String {
@@ -3147,5 +3190,18 @@ fn IconSend() -> Element {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
             path { d: "M22 2 11 13M22 2l-7 20-4-9-9-4 20-7Z" }
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    #[test]
+    fn thinking_starts_collapsed() {
+        let msg = closed_thought(r#"{"type":"function_call"}"#.into(), 0);
+        assert!(matches!(msg.role, ChatRole::Thought));
+        assert!(!msg.open);
+        assert!(looks_like_tool_trace(&msg.text));
     }
 }

@@ -362,6 +362,20 @@ fn update_node(v: &Value) -> &Value {
     v.get("update").unwrap_or(v)
 }
 
+fn looks_like_tool_trace(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    t.contains("function_call")
+        || t.contains("\"type\":\"function\"")
+        || t.contains("\"type\": \"function\"")
+        || t.contains("tool_call")
+        || t.contains("sessionUpdate")
+        || t.contains("session/prompt")
+        || (t.starts_with('{') && t.contains("\"name\"") && t.contains("\"arguments\""))
+}
+
 fn content_text(v: &Value) -> Option<String> {
     let u = update_node(v);
     if let Some(text) = u.pointer("/content/text").and_then(|x| x.as_str()) {
@@ -384,8 +398,13 @@ async fn emit_update(params: &Option<Value>, events: Option<&EventSink>) {
     match kind {
         "agent_message_chunk" | "agent_message" => {
             if let Some(text) = content_text(v) {
-                tracing::debug!(chars = text.len(), "acp text");
-                emit(events, ChatEvent::text(text)).await;
+                if looks_like_tool_trace(&text) {
+                    tracing::debug!(chars = text.len(), "acp tool trace");
+                    emit(events, ChatEvent::thought(text)).await;
+                } else {
+                    tracing::debug!(chars = text.len(), "acp text");
+                    emit(events, ChatEvent::text(text)).await;
+                }
             }
         }
         "agent_thought_chunk" | "agent_thought" => {
@@ -589,6 +608,14 @@ mod tests {
         let ev = tool_event_from_update(&u).unwrap();
         assert_eq!(ev.name(), "list_bin");
         assert_eq!(ev.status_label(), "pending");
+    }
+
+    #[test]
+    fn tool_traces_are_not_chat_text() {
+        assert!(looks_like_tool_trace(
+            r#"{"type":"function_call","name":"read_file","arguments":{}}"#
+        ));
+        assert!(!looks_like_tool_trace("Cut a 40s reel from the interview."));
     }
 
     #[test]

@@ -522,18 +522,44 @@ pub fn MulticamBank() -> Element {
         .filter(|t| t.kind == TrackKind::Video)
         .enumerate()
         .filter_map(|(i, track)| {
-            let clip = track.clips.iter().find(|c| c.contains(oc_core::Time::from_seconds(at)) && !c.disabled)?;
+            let clip = track.clips.iter().find(|c| c.contains(oc_core::Time::from_seconds(at)))?;
             let url = clip.media_id.and_then(|id| {
                 library.read().iter().find(|m| m.id == id.to_string()).map(|m| m.url.clone())
             }).unwrap_or_default();
-            Some((i + 1, track.id.to_string(), track.name.clone(), url, clip.disabled))
+            let src = clip
+                .source_time_at(oc_core::Time::from_seconds(at))
+                .map(|t| t.as_seconds())
+                .unwrap_or_else(|| clip.source_in.as_seconds());
+            Some((i + 1, track.id.to_string(), track.name.clone(), url, src))
         })
         .collect();
+    use_effect(move || {
+        let _ = *clock.current.read();
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        let Ok(nodes) = doc.query_selector_all(".multicam-cell video") else {
+            return;
+        };
+        for i in 0..nodes.length() {
+            let Some(node) = nodes.item(i) else { continue };
+            let Ok(video) = node.dyn_into::<web_sys::HtmlVideoElement>() else {
+                continue;
+            };
+            let Some(raw) = video.get_attribute("data-src-time") else {
+                continue;
+            };
+            let Ok(t) = raw.parse::<f64>() else { continue };
+            if video.ready_state() >= 1 && (video.current_time() - t).abs() > 0.08 {
+                video.set_current_time(t.max(0.0));
+            }
+        }
+    });
     rsx! {
         div { class: "multicam",
             div { class: "mixer-title", "Multitrack" }
             div { class: "multicam-grid",
-                for (n, id, name, url, _off) in angles {
+                for (n, id, name, url, src) in angles {
                     button {
                         class: "multicam-cell",
                         title: "Cut to this angle. Keys 1–9 do the same while this tool is on.",
@@ -541,7 +567,12 @@ pub fn MulticamBank() -> Element {
                             let _ = tools::multicam_at(save, &id, at);
                         },
                         if !url.is_empty() {
-                            video { src: "{url}", muted: true, preload: "metadata" }
+                            video {
+                                src: "{url}",
+                                muted: true,
+                                preload: "auto",
+                                "data-src-time": "{src}",
+                            }
                         }
                         span { "{n} {name}" }
                     }

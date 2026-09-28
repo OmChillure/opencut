@@ -224,7 +224,7 @@ fn wants_vertical(request: &str) -> bool {
         || t.contains("9:16")
 }
 
-pub(crate) fn program_clips(timeline: &Timeline) -> Vec<&Clip> {
+pub fn program_clips(timeline: &Timeline) -> Vec<&Clip> {
     let mut clips = Vec::new();
     for track in &timeline.tracks {
         if track.kind != TrackKind::Video || track.hidden {
@@ -269,7 +269,7 @@ fn overlaps_any(start: f64, end: f64, used: &[(f64, f64)]) -> bool {
     used.iter().any(|(a, b)| start < *b - 0.05 && end > *a + 0.05)
 }
 
-pub(crate) fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
+pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
     let mut cues = Vec::new();
     for clip in clips {
         let Some(media) = clip.media_id else { continue };
@@ -347,6 +347,22 @@ mod tests {
         timeline.width = 1920;
         timeline.height = 1080;
         timeline
+    }
+
+    #[test]
+    fn mapped_cues_land_on_the_cut_not_the_source() {
+        let media = MediaId::new();
+        let clip = video(media, 0.0, 6.0, 40.0);
+        let lines = vec![SpokenLine {
+            media,
+            start: 41.0,
+            end: 43.0,
+            text: "on the cut".into(),
+        }];
+        let cues = mapped_cues(&[&clip], &lines);
+        assert_eq!(cues.len(), 1);
+        assert!((cues[0].start.as_seconds() - 1.0).abs() < 1e-6);
+        assert!((cues[0].end.as_seconds() - 3.0).abs() < 1e-6);
     }
 
     #[test]

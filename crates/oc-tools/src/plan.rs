@@ -243,7 +243,7 @@ fn finish_picture(
         }
     }
 
-    if plan.captions {
+    if plan.captions || !lines.is_empty() {
         let cues = finish::mapped_cues(&finish::program_clips(timeline), lines);
         if !cues.is_empty() {
             let added = apply(
@@ -512,5 +512,36 @@ mod tests {
             })
         });
         assert!(captioned, "{joined}");
+    }
+
+    #[test]
+    fn speech_is_captioned_even_when_the_plan_omits_the_flag() {
+        let picture = MediaId::new();
+        let mut timeline = Timeline::default();
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            grade: Grade::default(),
+            slots: vec![slot(picture, 2.0)],
+        };
+        let lines = vec![SpokenLine {
+            media: picture,
+            start: 2.2,
+            end: 5.0,
+            text: "The city opens up".into(),
+        }];
+        let windows = vec![window(picture, 0.0, 10.0, "talk", false)];
+        build_plan(&mut timeline, &plan, &windows, &[], &lines, &[]).unwrap();
+        let captioned = timeline.tracks.iter().any(|t| {
+            t.clips.iter().any(|c| match &c.kind {
+                ClipKind::Caption { cues, .. } => cues.iter().any(|cue| cue.text.contains("city")),
+                _ => false,
+            })
+        });
+        assert!(captioned);
     }
 }

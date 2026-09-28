@@ -15,8 +15,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::routes::{
     apply_ops, chat, complete_upload, create_project, delete_project, get_project, health,
-    get_export, get_media_file, list_ai_providers, list_media, list_projects, patch_media, put_media_bytes,
-    register_media, request_upload, transcribe_media, update_project,
+    get_export, get_media_file, head_export, list_ai_providers, list_media, list_projects,
+    patch_media, put_media_bytes, generate_captions, register_media, request_upload,
+    transcribe_media, update_project,
 };
 use crate::state::AppState;
 
@@ -70,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/projects/{id}/media/{media_id}/file",
             get(get_media_file),
         )
-        .route("/v1/projects/{id}/export", get(get_export))
+        .route("/v1/projects/{id}/export", get(get_export).head(head_export))
         .route(
             "/v1/projects/{id}/media/{media_id}/complete",
             post(complete_upload),
@@ -79,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/projects/{id}/media/{media_id}/transcribe",
             post(transcribe_media),
         )
+        .route("/v1/projects/{id}/captions", post(generate_captions))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

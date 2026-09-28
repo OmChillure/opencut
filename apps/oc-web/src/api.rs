@@ -375,6 +375,25 @@ pub async fn apply_ops(id: &str, ops: Vec<Op>) -> Result<Timeline, String> {
     Ok(resp.timeline)
 }
 
+pub async fn generate_captions(id: &str) -> Result<(Timeline, String), String> {
+    #[derive(Deserialize)]
+    struct Resp {
+        timeline: Timeline,
+        note: String,
+    }
+    let resp: Resp = reqwest::Client::new()
+        .post(format!("{API}/v1/projects/{id}/captions"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((resp.timeline, resp.note))
+}
+
 pub async fn save_timeline(id: &str, timeline: Timeline) -> Result<Timeline, String> {
     apply_ops(id, vec![Op::SetTimeline { timeline }]).await
 }

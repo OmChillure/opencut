@@ -1645,8 +1645,10 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
                         LAST_PLAY_MS.with(|cell| cell.set(js_sys::Date::now()));
                         LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                     }
-                } else if let Some(n) = &next {
-                    set_playhead(n.start.max(now) + 1e-3);
+                } else if next.is_some() {
+                    // Hold the outgoing frame until the next shot is seeked.
+                    // Jumping the playhead first shows a blank or a frozen frame.
+                    set_playhead((shot.start + take - 0.04).max(shot.start));
                     LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                 } else {
                     let _ = video.pause();

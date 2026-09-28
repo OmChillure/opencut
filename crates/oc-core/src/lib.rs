@@ -8,13 +8,14 @@ pub use oc_tools::{
     McpTool, Op, ExportPreset, TimelineEditMode, apply, is_director_request, mcp_tools, op_from_mcp,
     parse_intent, pick_reel_excerpts, excerpts_for_request, choose_piece, asks_for_judgment,
     revises_existing_cut, PiecePick, SourceBeat, review_cut, review_with, finish_reel, already_finished,
-    wants_picture_finish, CutReview, Spoken, SpokenLine, CoverShot, build_plan, revise_plan,
+    wants_picture_finish, CutReview, Spoken, SpokenLine, CoverShot, mapped_cues, program_clips,
+    build_plan, revise_plan,
     plan_from_value, SourceWindow, ReviewFacts,
 };
 pub use oc_time::{Duration, FrameRate, Time};
 pub use oc_timeline::{
     AlphaShape, AudioFx, CaptionCue, Clip, ClipId, ClipKind, ClipLook, Crop, CurvePoint, Curves,
-    Ease, EditPlan, EditSlot, Fx, Generator, Grade, Graphic, GraphicKind, GroupId, LinkId, Lut,
+    CaptionStyle, Ease, EditPlan, EditSlot, Fx, Generator, Grade, Graphic, GraphicKind, GroupId, LinkId, Lut,
     Marker, MarkerId, MaskShape, MediaId, Mix, PlaceMode, Project, ProjectId, SpeedKey, Timeline,
     Track, TrackId, TrackKind, Transform, TransitionKind, UndoStack,
 };

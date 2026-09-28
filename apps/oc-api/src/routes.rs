@@ -328,15 +328,39 @@ async fn fresh_review(state: &AppState, id: Uuid, request: &str) -> oc_core::Cut
     oc_core::review_with(&timeline, &spoken, request, &facts)
 }
 
+fn tool_finished(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(|v| v.as_str()) == Some("tool")
+        && value.get("status").and_then(|v| v.as_str()) == Some("done")
+}
+
+fn attach_timeline(value: &mut serde_json::Value, timeline: &Timeline) {
+    if let Ok(timeline) = serde_json::to_value(timeline) {
+        value["timeline"] = timeline;
+    }
+}
+
 async fn push(tx: &mpsc::Sender<String>, value: serde_json::Value) {
     let _ = tx.send(line(&value)).await;
 }
 
-async fn forward_events(mut rx: mpsc::Receiver<ChatEvent>, tx: mpsc::Sender<String>) {
+async fn forward_events(
+    mut rx: mpsc::Receiver<ChatEvent>,
+    tx: mpsc::Sender<String>,
+    db: oc_db::Db,
+    project_id: Uuid,
+) {
     while let Some(ev) = rx.recv().await {
-        if let Ok(value) = serde_json::to_value(&ev) {
-            let _ = tx.send(line(&value)).await;
+        let Ok(mut value) = serde_json::to_value(&ev) else {
+            continue;
+        };
+        // MCP writes the timeline before ACP reports the tool done. Attach it
+        // so the page paints the cut while the reply is still running.
+        if tool_finished(&value) {
+            if let Ok(project) = oc_db::get_project(&db, project_id).await {
+                attach_timeline(&mut value, &project.timeline);
+            }
         }
+        let _ = tx.send(line(&value)).await;
     }
 }
 
@@ -454,7 +478,7 @@ async fn run_chat(
     let mut turns = body.messages;
     let mut text = String::new();
     let (ev_tx, ev_rx) = mpsc::channel::<ChatEvent>(64);
-    let pump = tokio::spawn(forward_events(ev_rx, tx.clone()));
+    let pump = tokio::spawn(forward_events(ev_rx, tx.clone(), state.db.clone(), id));
     let mcp_servers = crate::mcp::builtin_mcp_acp(&id.to_string())
         .into_iter()
         .collect::<Vec<_>>();
@@ -1001,10 +1025,7 @@ pub async fn get_media_file(
     ))
 }
 
-pub async fn get_export(
-    Path(id): Path<Uuid>,
-    headers: axum::http::HeaderMap,
-) -> ApiResult<Response> {
+fn latest_export(id: Uuid) -> Result<std::path::PathBuf, ApiError> {
     let dir = std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into());
     let prefix = id.to_string();
     let entries = std::fs::read_dir(&dir)
@@ -1024,9 +1045,29 @@ pub async fn get_export(
             best = Some((modified, entry.path()));
         }
     }
-    let path = best
-        .map(|(_, path)| path)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?;
+    best.map(|(_, path)| path)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))
+}
+
+pub async fn head_export(Path(id): Path<Uuid>) -> ApiResult<Response> {
+    let path = latest_export(id)?;
+    let len = std::fs::metadata(&path)
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?
+        .len();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
+pub async fn get_export(
+    Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    let path = latest_export(id)?;
     serve_local_file(&path, "video/mp4", headers.get(header::RANGE)).await
 }
 
@@ -1124,6 +1165,20 @@ pub async fn complete_upload(
     Ok(Json(serde_json::json!({ "status": "ready" })))
 }
 
+pub async fn generate_captions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let _ = oc_db::get_project(&state.db, id).await?;
+    let (timeline, note) = edit::place_captions(&state.db, id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(serde_json::json!({
+        "note": note,
+        "timeline": timeline,
+    })))
+}
+
 pub async fn transcribe_media(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
@@ -1144,4 +1199,33 @@ pub async fn transcribe_media(
     .await?;
     oc_db::set_media_status(&state.db, media_id, "transcribing").await?;
     Ok(Json(serde_json::json!({ "job_id": job })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_tool_carries_the_timeline_before_the_reply_ends() {
+        let mut event = serde_json::json!({
+            "type": "tool",
+            "name": "submit_edit",
+            "status": "done",
+            "result": "placed 3 clips"
+        });
+        assert!(tool_finished(&event));
+        let mut timeline = Timeline::default();
+        timeline.width = 1920;
+        timeline.height = 1080;
+        attach_timeline(&mut event, &timeline);
+        assert_eq!(event["timeline"]["width"], 1920);
+        assert!(event["timeline"]["tracks"].is_array());
+
+        let pending = serde_json::json!({
+            "type": "tool",
+            "name": "list_bin",
+            "status": "pending"
+        });
+        assert!(!tool_finished(&pending));
+    }
 }

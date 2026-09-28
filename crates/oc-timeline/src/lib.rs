@@ -129,6 +129,15 @@ mod tests {
     }
 
     #[test]
+    fn source_time_follows_the_playhead() {
+        let mut clip = video_clip(2.0, 4.0);
+        clip.source_in = Time::from_seconds(10.0);
+        let at = clip.source_time_at(Time::from_seconds(3.0)).unwrap();
+        assert!((at.as_seconds() - 11.0).abs() < 1e-6);
+        assert!(clip.source_time_at(Time::from_seconds(0.5)).is_none());
+    }
+
+    #[test]
     fn mixer_unity_is_zero_db() {
         let tl = Timeline::default();
         assert!((tl.master.linear() - 1.0).abs() < 1e-4);

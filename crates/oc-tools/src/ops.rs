@@ -755,12 +755,6 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
                 transform.scale = 1.28;
             }
             let id = timeline.place_clip(track_id, picture, PlaceMode::Normal)?;
-            let audio_track = resolve_track(timeline, None, TrackKind::Audio);
-            let mut bed = clip_for_media(*media_id, *at, *duration, TrackKind::Audio, *source_in);
-            if let ClipKind::Audio { volume, .. } = &mut bed.kind {
-                *volume = 0.0;
-            }
-            let _ = timeline.place_clip(audio_track, bed, PlaceMode::Normal);
             format!(
                 "cover {id} from {media_id} at {:.2}s (src {:.2}s)",
                 at.as_seconds(),
@@ -1980,6 +1974,40 @@ fn duck_audio(timeline: &mut Timeline, amount: f32) {
 mod tests {
     use super::*;
     use oc_timeline::{Clip, ClipKind, MediaId, Transform};
+
+    #[test]
+    fn cover_is_picture_only() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        let media = MediaId::new();
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::Cover {
+                media_id: media,
+                at: Time::from_seconds(1.0),
+                source_in: Time::from_seconds(4.0),
+                duration: Duration::from_seconds(1.2),
+            },
+        )
+        .unwrap();
+        let pictures = tl
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.media_id == Some(media))
+            .count();
+        let sounds = tl
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.media_id == Some(media))
+            .count();
+        assert_eq!(pictures, 1);
+        assert_eq!(sounds, 0);
+    }
 
     #[test]
     fn apply_split() {

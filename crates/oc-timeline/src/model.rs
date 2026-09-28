@@ -1270,6 +1270,21 @@ impl Timeline {
             clip.look.transition = TransitionKind::Cut;
         }
         self.add_clip(track_id, new_clip)?;
+        let link = self
+            .find_clip(clip_id)
+            .and_then(|(_, c)| c.link_id);
+        if let Some(link) = link {
+            let partners: Vec<ClipId> = self
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .filter(|c| c.link_id == Some(link) && c.id != clip_id && c.id != right_id && c.contains(at))
+                .map(|c| c.id)
+                .collect();
+            for id in partners {
+                let _ = self.split(id, at);
+            }
+        }
         Ok(right_id)
     }
 
@@ -1311,11 +1326,11 @@ impl Timeline {
             }
             dest.kind
         };
-        let (origin_id, origin_kind) = {
-            let (track, _) = self
+        let (origin_id, origin_kind, old_start, link) = {
+            let (track, clip) = self
                 .find_clip(clip_id)
                 .ok_or(TimelineError::ClipNotFound(clip_id))?;
-            (track.id, track.kind)
+            (track.id, track.kind, clip.start, clip.link_id)
         };
         if dest_ok != origin_kind {
             return Err(TimelineError::TrackKindMismatch);
@@ -1326,6 +1341,18 @@ impl Timeline {
         if let Err(err) = self.add_clip(track_id, clip) {
             let _ = self.add_clip(origin_id, backup);
             return Err(err);
+        }
+        let delta = new_start - old_start;
+        if delta.as_ticks() != 0 {
+            if let Some(link) = link {
+                for track in &mut self.tracks {
+                    for clip in &mut track.clips {
+                        if clip.id != clip_id && clip.link_id == Some(link) {
+                            clip.start += delta;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }

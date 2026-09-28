@@ -166,6 +166,79 @@ pub(crate) fn look_by_media(rows: &[oc_db::AnalysisRow]) -> HashMap<Uuid, oc_db:
     rows.iter().cloned().map(|r| (r.media_id, r)).collect()
 }
 
+pub(crate) async fn place_captions(
+    db: &Db,
+    project_id: Uuid,
+) -> Result<(Timeline, String), String> {
+    let mut project = oc_db::get_project(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let transcripts = oc_db::list_transcripts_for_project(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let speech = speech_by_media(&transcripts);
+    let lines: Vec<oc_core::SpokenLine> = speech
+        .iter()
+        .flat_map(|(id, s)| {
+            let media = MediaId::from_uuid(*id);
+            s.cues.iter().map(move |c| oc_core::SpokenLine {
+                media,
+                start: c.start.as_seconds(),
+                end: c.end.as_seconds(),
+                text: c.text.clone(),
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        let media = oc_db::list_media(db, project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut queued = 0;
+        for row in media {
+            if row.content_type.starts_with("image/") {
+                continue;
+            }
+            oc_db::enqueue_job(
+                db,
+                "transcribe",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "media_id": row.id,
+                    "r2_key": row.r2_key,
+                }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            queued += 1;
+        }
+        return Ok((
+            project.timeline,
+            format!("no words yet — queued {queued} transcript(s). Try again when they finish."),
+        ));
+    }
+    let cues = oc_core::mapped_cues(&oc_core::program_clips(&project.timeline), &lines);
+    if cues.is_empty() {
+        return Ok((
+            project.timeline,
+            "speech does not overlap the picture on the timeline".into(),
+        ));
+    }
+    let mut undo = UndoStack::new();
+    let applied = apply(
+        &mut project.timeline,
+        &mut undo,
+        Op::AddCaptions {
+            style: oc_core::CaptionStyle::Stacked,
+            cues,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    oc_db::save_timeline(db, project_id, &project.timeline)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((project.timeline, applied.note))
+}
+
 pub(crate) fn spoken(speech: &HashMap<Uuid, Speech>) -> Vec<oc_core::Spoken> {
     speech
         .iter()

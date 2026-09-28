@@ -49,9 +49,24 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
             if clip.disabled || !matches!(clip.kind, ClipKind::Video { .. }) {
                 continue;
             }
+            let tl0 = clip.start.as_seconds();
+            let tl1 = clip.end().as_seconds();
             let src0 = clip.source_in.as_seconds();
             let src1 = src0 + clip.duration.as_seconds() * f64::from(clip.speed.max(0.01));
             for (c0, c1, text) in &cues {
+                let (c0, c1) = (*c0, *c1);
+                if c1 > tl0 + 0.05 && c0 < tl1 - 0.05 {
+                    let a = c0.max(tl0);
+                    let b = c1.min(tl1);
+                    if b - a >= 0.05 {
+                        out.push(BurnedCue {
+                            start: a,
+                            end: b,
+                            text: text.clone(),
+                        });
+                        continue;
+                    }
+                }
                 let a = c0.max(src0);
                 let b = c1.min(src1);
                 if b - a < 0.05 {
@@ -66,6 +81,7 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
         }
     }
     out.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    out.dedup_by(|a, b| (a.start - b.start).abs() < 0.05 && a.text == b.text);
     shorten_cues(out)
 }
 
@@ -184,5 +200,61 @@ mod tests {
         assert!((burned[0].start - 0.0).abs() < 1e-6);
         assert!((burned[0].end - 3.0).abs() < 1e-6);
         assert_eq!(burned[0].text, "we left");
+    }
+
+    #[test]
+    fn burns_timeline_cues_on_the_cut() {
+        let mut tl = oc_timeline::Timeline::default();
+        let v = tl.first_track(TrackKind::Video).unwrap().id;
+        tl.add_clip(
+            v,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(oc_timeline::MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Default::default(),
+                },
+                start: Time::from_seconds(0.0),
+                duration: Duration::from_seconds(6.0),
+                source_in: Time::from_seconds(40.0),
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        let cap = tl.add_track(TrackKind::Caption, "Captions");
+        tl.add_clip(
+            cap,
+            Clip {
+                id: ClipId::new(),
+                media_id: None,
+                kind: ClipKind::Caption {
+                    style: CaptionStyle::Stacked,
+                    cues: vec![CaptionCue {
+                        start: Time::from_seconds(1.0),
+                        end: Time::from_seconds(3.0),
+                        text: "on the cut".into(),
+                        speaker: None,
+                    }],
+                },
+                start: Time::ZERO,
+                duration: Duration::from_seconds(6.0),
+                source_in: Time::ZERO,
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        let burned = captions_for_cut(&tl);
+        assert_eq!(burned.len(), 1, "{burned:?}");
+        assert!((burned[0].start - 1.0).abs() < 1e-6);
+        assert!((burned[0].end - 3.0).abs() < 1e-6);
+        assert_eq!(burned[0].text, "on the cut");
     }
 }
