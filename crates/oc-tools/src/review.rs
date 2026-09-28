@@ -349,7 +349,14 @@ fn leftover_speech(clips: &[&Clip], speech: &[Spoken], request: &str) -> Vec<Str
     let mut notes = Vec::new();
     let keep_silence = {
         let t = request.to_ascii_lowercase();
-        t.contains("silence") || t.contains("b-roll") || t.contains("broll") || t.contains("music")
+        t.contains("silence")
+            || t.contains("b-roll")
+            || t.contains("broll")
+            || t.contains("music")
+            || t.contains("cinematic")
+            || t.contains("vlog")
+            || t.contains("documentary")
+            || t.contains("travel")
     };
     for clip in clips {
         let Some(media) = clip.media_id else { continue };

@@ -60,6 +60,20 @@ pub fn builtin_mcp_acp(project_id: &str) -> Option<Value> {
             env.push(json!({ "name": "DATABASE_URL", "value": url }));
         }
     }
+    for key in [
+        "R2_ACCOUNT_ID",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_BUCKET",
+        "R2_ENDPOINT",
+        "OPENCUT_MEDIA_DIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                env.push(json!({ "name": key, "value": value }));
+            }
+        }
+    }
     Some(json!({
         "name": "opencut",
         "command": exe.to_string_lossy(),
@@ -98,6 +112,9 @@ async fn handle_rpc(msg: &Value) -> Option<Value> {
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            if name == "see" {
+                return Some(see_result(id, args).await);
+            }
             match dispatch(name, args).await {
                 Ok(text) => {
                     tracing::info!(tool = name, chars = text.len(), "mcp tool ok");
@@ -132,6 +149,48 @@ async fn handle_rpc(msg: &Value) -> Option<Value> {
 
 fn tools_list() -> Value {
     json!({ "tools": mcp_tools() })
+}
+
+async fn see_result(id: Option<Value>, args: Value) -> Value {
+    let fail = |err: String| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id.clone(),
+            "result": {
+                "content": [{ "type": "text", "text": err }],
+                "isError": true
+            }
+        })
+    };
+    let Some(project_id) = PROJECT_ID.get().copied() else {
+        return fail("mcp not initialized".into());
+    };
+    let Some(db) = DB.get() else {
+        return fail("mcp db missing".into());
+    };
+    let media = args.get("media_id").and_then(|v| v.as_str()).unwrap_or("");
+    let at = args.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let Ok(media_id) = Uuid::parse_str(media) else {
+        return fail(format!("bad media id {media}"));
+    };
+    let r2 = oc_db::R2::from_env().await.ok();
+    match crate::edit::see_frame(db, r2.as_ref(), project_id, media_id, at).await {
+        Ok(frame) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [
+                    { "type": "text", "text": frame.caption },
+                    {
+                        "type": "image",
+                        "data": oc_providers::encode_b64(&frame.jpeg),
+                        "mimeType": "image/jpeg"
+                    }
+                ]
+            }
+        }),
+        Err(err) => fail(err),
+    }
 }
 
 async fn dispatch(name: &str, args: Value) -> Result<String, String> {

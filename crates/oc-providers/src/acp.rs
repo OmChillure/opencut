@@ -135,31 +135,34 @@ impl AcpClient {
         Ok(session_id)
     }
 
-    pub async fn prompt(
-        &mut self,
-        cwd: &str,
-        message: &str,
-        model: Option<&str>,
-        mcp_servers: &[Value],
-        events: Option<&EventSink>,
-    ) -> Result<String, LlmError> {
-        let session_id = self.open_session(cwd, model, mcp_servers, events).await?;
-        self.continue_prompt(&session_id, message, events).await
-    }
-
     pub async fn continue_prompt(
         &mut self,
         session_id: &str,
         message: &str,
+        frames: &[crate::PromptImage],
         events: Option<&EventSink>,
     ) -> Result<String, LlmError> {
-        tracing::info!(session_id = %session_id, chars = message.len(), "acp session/prompt");
+        tracing::info!(
+            session_id = %session_id,
+            chars = message.len(),
+            frames = frames.len(),
+            "acp session/prompt"
+        );
         let prompt_id = self.next_id + 1;
+        let mut blocks = vec![serde_json::json!({ "type": "text", "text": message })];
+        for frame in frames {
+            blocks.push(serde_json::json!({ "type": "text", "text": frame.caption }));
+            blocks.push(serde_json::json!({
+                "type": "image",
+                "mimeType": "image/jpeg",
+                "data": encode_b64(&frame.jpeg),
+            }));
+        }
         self.send(
             "session/prompt",
             serde_json::json!({
                 "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": message }]
+                "prompt": blocks
             }),
         )
         .await?;
@@ -528,6 +531,35 @@ async fn emit(events: Option<&EventSink>, ev: ChatEvent) {
 
 pub fn to_reply(text: String) -> LlmReply {
     LlmReply::Text(text)
+}
+
+pub fn encode_b64(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | bytes[i + 2] as u32;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(T[((n >> 6) & 63) as usize] as char);
+        out.push(T[(n & 63) as usize] as char);
+        i += 3;
+    }
+    if i < bytes.len() {
+        let b0 = bytes[i] as u32;
+        let b1 = bytes.get(i + 1).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        if i + 1 < bytes.len() {
+            out.push(T[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        } else {
+            out.push('=');
+            out.push('=');
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -51,7 +51,6 @@ fn source(id: MediaId, path: PathBuf) -> MediaSource {
 #[test]
 fn graph_keeps_voice_across_excerpts() {
     let mut tl = Timeline::default();
-    let mut undo = UndoStack::new();
     let track = tl.first_track(TrackKind::Video).unwrap().id;
     let mid = MediaId::new();
     let _ = tl.add_clip(track, video_on(mid, 0.0, 4.0)).unwrap();

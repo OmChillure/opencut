@@ -572,7 +572,6 @@ fn Header(name: Signal<String>) -> Element {
     let project_id = use_context::<CtxProject>().0;
     let save = use_context::<WorkspaceSave>();
     let held = use_context::<CtxHeld>().0;
-    let aspect = use_context::<Signal<Aspect>>();
     let library = use_context::<Signal<Vec<MediaItem>>>();
     let tracks = use_context::<Signal<Vec<EditorTrack>>>();
     let unsaved = !held.read().is_empty();
@@ -2098,7 +2097,7 @@ fn AiSidebar(
     let mut provider_id = use_signal(|| "xai".to_string());
     let mut model_id = use_signal(|| "grok-4.6".to_string());
     let mut model_name = use_signal(|| "Grok 4.6".to_string());
-    let mut busy = use_signal(|| false);
+    let busy = use_signal(|| false);
 
     use_future(move || async move {
         if let Ok(list) = api::list_ai_providers().await {

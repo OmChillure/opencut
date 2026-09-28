@@ -107,6 +107,17 @@ pub fn mcp_tools() -> Vec<McpTool> {
             input_schema: object(&[]),
         },
         McpTool {
+            name: "see".into(),
+            description:
+                "Grab one frame of a video at any source time, in seconds. You see the JPEG. \
+                 Call this whenever you need to look during the edit."
+                    .into(),
+            input_schema: object(&[
+                ("media_id", str_prop("Media id from list_bin"), true),
+                ("at", num_prop("Source time in seconds"), true),
+            ]),
+        },
+        McpTool {
             name: "get_media".into(),
             description:
                 "Shot list for one media id: each range has a look (wide/close/action), \
@@ -345,16 +356,26 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "submit_edit".into(),
-            description: "Build the whole cut from a plan. Rust places the slots, snaps to the music, \
-                 grades every clip, sets transitions, ducks music, and writes captions. \
-                 Slots must sit on a real shot or spoken line. Prefer this over many place_clip calls."
+            description: "Build the whole cut from a plan. Rust places the slots and snaps to the beat. \
+                 It applies grade, fx, fades, cover, music volume, captions, and letterbox only when \
+                 you set them. Omit a field to leave that shot alone. Slots must sit on a real shot \
+                 or spoken line. A clean review queues the export."
                 .into(),
             input_schema: object(&[
-                ("style", str_prop("cinematic, hype, documentary, vlog, or empty"), false),
-                ("aspect", str_prop("landscape, vertical, square"), false),
-                ("letterbox", str_prop("true or false"), false),
-                ("music_id", str_prop("Imported music file"), false),
-                ("slots", str_prop("Array of {media_id, source_in, duration, transition?, speed?, move?}"), true),
+                ("style", str_prop("Note for yourself. It does not pick a look."), false),
+                ("aspect", str_prop("landscape, vertical, square — omit to keep the project frame"), false),
+                ("letterbox", str_prop("true only when the piece should be widescreen"), false),
+                ("music_id", str_prop("Imported music file, when the piece needs a bed"), false),
+                ("music_volume", str_prop("0–1. Set below 1 to duck the bed under speech"), false),
+                ("captions", str_prop("true only when the words should be on screen"), false),
+                ("grade", str_prop("Piece grade for slots that omit their own. Omit for no grade."), false),
+                (
+                    "slots",
+                    str_prop(
+                        "Array of {media_id, source_in, duration, transition?, speed?, end_scale?, grade?, fx?, fade_in?, fade_out?, cover?}",
+                    ),
+                    true,
+                ),
             ]),
         },
         McpTool {

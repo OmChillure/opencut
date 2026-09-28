@@ -128,15 +128,6 @@ pub fn chat_stopped() -> bool {
     CHAT_STOP.with(|cell| cell.get())
 }
 
-pub async fn chat(
-    project_id: &str,
-    provider: &str,
-    model: &str,
-    messages: &[(bool, String)],
-) -> Result<ChatReply, String> {
-    chat_stream(project_id, provider, model, messages, |_| {}).await
-}
-
 pub async fn chat_stream(
     project_id: &str,
     provider: &str,

@@ -57,6 +57,38 @@ pub(crate) async fn call_tool(
     if name == "submit_edit" || name == "revise_edit" {
         return apply_submitted_plan(db, project_id, name, &call.arguments, &media, &speech, &looks).await;
     }
+    if name == "snap_cuts_to_beats" {
+        let raw = call
+            .arguments
+            .get("media_id")
+            .and_then(Value::as_str)
+            .ok_or("missing media_id")?;
+        let music_id = Uuid::parse_str(raw).map_err(|_| "bad media_id")?;
+        let beats = music_beats(looks.get(&music_id)).unwrap_or_default();
+        if beats.is_empty() {
+            return Err("no beat grid for that file yet".into());
+        }
+        let tolerance = call
+            .arguments
+            .get("tolerance_frames")
+            .and_then(Value::as_f64)
+            .unwrap_or(2.0)
+            .clamp(1.0, 48.0) as u32;
+        let mut undo = UndoStack::new();
+        let applied = apply(
+            &mut project.timeline,
+            &mut undo,
+            Op::SnapCuts {
+                tolerance_frames: tolerance,
+                beats,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        oc_db::save_timeline(db, project_id, &project.timeline)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(applied.note);
+    }
     let op = op_from_mcp(&call).map_err(|e| {
         tracing::error!(project = %project_id, tool = name, "bad tool: {e}");
         e
@@ -98,270 +130,6 @@ pub(crate) async fn queue_export(
     .map_err(|e| e.to_string())?;
     tracing::info!(project = %project_id, job = %id, ?preset, "export queued");
     Ok(())
-}
-
-/// One-pass sentence cutter. The chat no longer calls this: the model cuts with tools.
-#[allow(dead_code)]
-pub(crate) async fn cut_short_now(db: &Db, project_id: Uuid, request: &str) -> Option<String> {
-    if !oc_core::wants_picture_finish(request) || oc_core::asks_for_judgment(request) {
-        return None;
-    }
-    let mut project = oc_db::get_project(db, project_id).await.ok()?;
-    let has_picture = project.timeline.tracks.iter().any(|t| {
-        t.kind == TrackKind::Video && t.clips.iter().any(|c| !c.disabled)
-    });
-    if has_picture && oc_core::revises_existing_cut(request) {
-        return None;
-    }
-    let media_rows = oc_db::list_media(db, project_id).await.ok()?;
-    let transcripts = oc_db::list_transcripts_for_project(db, project_id)
-        .await
-        .ok()?;
-    let speech = speech_by_media(&transcripts);
-    let looks = look_by_media(
-        &oc_db::list_analysis_for_project(db, project_id)
-            .await
-            .unwrap_or_default(),
-    );
-    let beats = piece_beats(&media_rows, &speech, &looks);
-    let target = asked_seconds(request).unwrap_or(60.0);
-    let picks = oc_core::choose_piece(&beats, request, target);
-    if picks.iter().all(|p| p.cover) {
-        return None;
-    }
-    let mut undo = UndoStack::new();
-    apply(&mut project.timeline, &mut undo, Op::ClearTimeline).ok()?;
-    let mut at = 0.0;
-    for pick in picks.iter().filter(|p| !p.cover) {
-        apply(
-            &mut project.timeline,
-            &mut undo,
-            Op::PlaceMedia {
-                media_id: pick.media,
-                track_id: None,
-                start: Time::from_seconds(pick.at),
-                duration: oc_core::Duration::from_seconds(pick.duration),
-                source_in: Time::from_seconds(pick.source_in),
-                kind: TrackKind::Video,
-                mode: oc_core::TimelineEditMode::Normal,
-            },
-        )
-        .ok()?;
-        at = pick.at + pick.duration;
-    }
-    for pick in picks.iter().filter(|p| p.cover) {
-        apply(
-            &mut project.timeline,
-            &mut undo,
-            Op::Cover {
-                media_id: pick.media,
-                at: Time::from_seconds(pick.at),
-                source_in: Time::from_seconds(pick.source_in),
-                duration: oc_core::Duration::from_seconds(pick.duration),
-            },
-        )
-        .ok()?;
-    }
-    close_program_gaps(&mut project.timeline);
-    oc_db::save_timeline(db, project_id, &project.timeline)
-        .await
-        .ok()?;
-    let note = apply_finish(db, project_id, request, true).await.ok()?;
-    let sources = picks.iter().filter(|p| !p.cover).map(|p| p.media).collect::<std::collections::HashSet<_>>().len();
-    Some(format!(
-        "Cut a {at:.0}s short from the strongest lines and shots across {sources} source(s). {note}"
-    ))
-}
-
-fn piece_beats(
-    media: &[oc_db::MediaRow],
-    speech: &HashMap<Uuid, Speech>,
-    looks: &HashMap<Uuid, oc_db::AnalysisRow>,
-) -> Vec<oc_core::SourceBeat> {
-    let mut beats = Vec::new();
-    for row in media {
-        if row.content_type.starts_with("image/") {
-            continue;
-        }
-        let media_id = MediaId::from_uuid(row.id);
-        let picture = looks.get(&row.id).map(shot_looks).unwrap_or_default();
-        let cue_refs: Vec<(f64, f64, &str)> = speech
-            .get(&row.id)
-            .map(|s| {
-                s.cues
-                    .iter()
-                    .map(|c| (c.start.as_seconds(), c.end.as_seconds(), c.text.as_str()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let briefs = oc_media::brief_shots(&picture, &cue_refs);
-        if briefs.is_empty() {
-            for (start, end, text) in cue_refs {
-                beats.push(oc_core::SourceBeat {
-                    media: media_id,
-                    start,
-                    end,
-                    look: String::new(),
-                    subject: String::new(),
-                    role: "speech".into(),
-                    text: text.to_string(),
-                });
-            }
-            continue;
-        }
-        for brief in briefs {
-            beats.push(oc_core::SourceBeat {
-                media: media_id,
-                start: brief.start,
-                end: brief.end,
-                look: brief.look,
-                subject: brief.subject,
-                role: brief.role.as_str().into(),
-                text: brief.text,
-            });
-        }
-    }
-    beats
-}
-
-fn asked_seconds(request: &str) -> Option<f64> {
-    let lower = request.to_ascii_lowercase();
-    let mut num = String::new();
-    for ch in lower.chars() {
-        if ch.is_ascii_digit() {
-            num.push(ch);
-        } else if !num.is_empty() {
-            break;
-        }
-    }
-    let n: f64 = num.parse().ok()?;
-    let rest = lower.split_once(&num)?.1.trim_start();
-    if rest.starts_with("min") {
-        Some(n * 60.0)
-    } else if rest.starts_with("sec") || rest.starts_with('s') {
-        Some(n)
-    } else {
-        None
-    }
-}
-
-/// Grade, punch-in, fades, captions, vertical frame, and a cover when the cut is a reel.
-pub(crate) async fn apply_finish(
-    db: &Db,
-    project_id: Uuid,
-    request: &str,
-    force: bool,
-) -> Result<String, String> {
-    if !force && !oc_core::wants_picture_finish(request) {
-        return Ok(String::new());
-    }
-    let mut project = oc_db::get_project(db, project_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    close_program_gaps(&mut project.timeline);
-    if oc_core::already_finished(&project.timeline) {
-        oc_db::save_timeline(db, project_id, &project.timeline)
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(String::new());
-    }
-    let transcripts = oc_db::list_transcripts_for_project(db, project_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    let speech = speech_by_media(&transcripts);
-    let looks = look_by_media(
-        &oc_db::list_analysis_for_project(db, project_id)
-            .await
-            .unwrap_or_default(),
-    );
-    let lines = spoken_lines(&speech);
-    let covers = cover_shots(&looks, &speech);
-    let ops = oc_core::finish_reel(&project.timeline, &lines, &covers, request);
-    if ops.is_empty() {
-        return Ok(String::new());
-    }
-    let mut undo = UndoStack::new();
-    let mut notes = Vec::new();
-    for op in ops {
-        let applied = apply(&mut project.timeline, &mut undo, op).map_err(|e| e.to_string())?;
-        notes.push(applied.note);
-    }
-    oc_db::save_timeline(db, project_id, &project.timeline)
-        .await
-        .map_err(|e| e.to_string())?;
-    tracing::info!(project = %project_id, ops = notes.len(), "picture finish");
-    Ok(format!("finish: {}", notes.join("; ")))
-}
-
-/// Pull later picture back so a hole cannot skip the playhead from one clip to the next.
-fn close_program_gaps(timeline: &mut Timeline) {
-    for track in &mut timeline.tracks {
-        if track.hidden || track.kind != TrackKind::Video {
-            continue;
-        }
-        let mut order: Vec<usize> = (0..track.clips.len())
-            .filter(|&i| {
-                !track.clips[i].disabled
-                    && matches!(track.clips[i].kind, oc_core::ClipKind::Video { .. })
-            })
-            .collect();
-        order.sort_by(|&a, &b| track.clips[a].start.cmp(&track.clips[b].start));
-        let mut cursor = order
-            .first()
-            .map(|&i| track.clips[i].start)
-            .unwrap_or(Time::ZERO);
-        for i in order {
-            if track.clips[i].start.as_seconds() > cursor.as_seconds() + 0.08 {
-                track.clips[i].start = cursor;
-            }
-            cursor = track.clips[i].end();
-        }
-    }
-}
-
-fn spoken_lines(speech: &HashMap<Uuid, Speech>) -> Vec<oc_core::SpokenLine> {
-    speech
-        .iter()
-        .flat_map(|(id, s)| {
-            let media = MediaId::from_uuid(*id);
-            s.cues.iter().map(move |c| oc_core::SpokenLine {
-                media,
-                start: c.start.as_seconds(),
-                end: c.end.as_seconds(),
-                text: c.text.clone(),
-            })
-        })
-        .collect()
-}
-
-fn cover_shots(
-    looks: &HashMap<Uuid, oc_db::AnalysisRow>,
-    speech: &HashMap<Uuid, Speech>,
-) -> Vec<oc_core::CoverShot> {
-    let mut out = Vec::new();
-    for (id, row) in looks {
-        let picture = shot_looks(row);
-        let cues: Vec<(f64, f64, &str)> = speech
-            .get(id)
-            .map(|s| {
-                s.cues
-                    .iter()
-                    .map(|c| (c.start.as_seconds(), c.end.as_seconds(), c.text.as_str()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for brief in oc_media::brief_shots(&picture, &cues) {
-            if brief.role != oc_media::ShotRole::Silence || brief.end - brief.start < 1.0 {
-                continue;
-            }
-            out.push(oc_core::CoverShot {
-                media: MediaId::from_uuid(*id),
-                start: brief.start,
-                end: brief.end,
-            });
-        }
-    }
-    out
 }
 
 pub(crate) fn speech_by_media(rows: &[oc_db::TranscriptCueRow]) -> HashMap<Uuid, Speech> {
@@ -419,6 +187,84 @@ pub(crate) fn shot_looks(row: &oc_db::AnalysisRow) -> Vec<oc_media::ShotLook> {
         .and_then(|v| serde_json::from_value::<oc_media::VisualDigest>(v.clone()).ok())
         .map(|d| d.shots)
         .unwrap_or_default()
+}
+
+/// One JPEG at a source time. The model calls `see` when it wants to look.
+pub(crate) async fn see_frame(
+    db: &Db,
+    r2: Option<&oc_db::R2>,
+    project_id: Uuid,
+    media_id: Uuid,
+    at: f64,
+) -> Result<oc_providers::PromptImage, String> {
+    let media = oc_db::list_media(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = media
+        .iter()
+        .find(|m| m.id == media_id)
+        .ok_or_else(|| format!("media {media_id} is not in this project"))?;
+    if row.content_type.starts_with("audio/") {
+        return Err("see needs a picture, not an audio file".into());
+    }
+    let mut temps = Vec::new();
+    let path = open_for_frames(row, r2, &mut temps)
+        .await
+        .ok_or_else(|| format!("media {media_id} is not on disk"))?;
+    let dest = std::env::temp_dir().join(format!(
+        "oc-see-{}-{}.jpg",
+        std::process::id(),
+        at.to_bits()
+    ));
+    let grabbed = oc_media::grab_jpeg(&path, at.max(0.0), &dest).await;
+    let jpeg = if grabbed.is_ok() {
+        tokio::fs::read(&dest).await.ok()
+    } else {
+        None
+    };
+    let _ = tokio::fs::remove_file(&dest).await;
+    for dir in temps {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    let jpeg = jpeg.filter(|b| b.len() >= 32).ok_or_else(|| {
+        format!("no frame at {at:.1}s in {media_id}")
+    })?;
+    Ok(oc_providers::PromptImage {
+        caption: format!("media {media_id} @ {at:.1}s"),
+        jpeg,
+    })
+}
+
+async fn open_for_frames(
+    row: &oc_db::MediaRow,
+    r2: Option<&oc_db::R2>,
+    temps: &mut Vec<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = media_file(row) {
+        return Some(path);
+    }
+    if !oc_db::is_r2_object_key(&row.r2_key) {
+        return None;
+    }
+    let r2 = r2?;
+    let bytes = r2.get_bytes(&row.r2_key).await.ok()?;
+    let dir = std::env::temp_dir().join(format!("oc-see-src-{}-{}", std::process::id(), row.id));
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+    let name = row.r2_key.rsplit('/').next().unwrap_or("media.bin");
+    let path = dir.join(name);
+    tokio::fs::write(&path, bytes).await.ok()?;
+    temps.push(dir);
+    Some(path)
+}
+
+fn media_file(row: &oc_db::MediaRow) -> Option<std::path::PathBuf> {
+    if let Some(path) = oc_db::local_media_path(&row.r2_key) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let path = std::path::PathBuf::from(&row.r2_key);
+    if path.is_file() { Some(path) } else { None }
 }
 
 pub(crate) fn run_inspect(
@@ -825,7 +671,25 @@ async fn apply_submitted_plan(
         .music_id
         .and_then(|id| music_beats(looks.get(&id.as_uuid())))
         .unwrap_or_default();
-    let notes = oc_core::build_plan(&mut project.timeline, &plan, &windows, &beats)?;
+    let lines: Vec<oc_core::SpokenLine> = spoken(speech)
+        .into_iter()
+        .map(|s| oc_core::SpokenLine {
+            media: s.media,
+            start: s.start,
+            end: s.end,
+            text: s.text,
+        })
+        .collect();
+    let covers: Vec<oc_core::CoverShot> = windows
+        .iter()
+        .filter(|w| w.silent && w.end - w.start >= 1.0)
+        .map(|w| oc_core::CoverShot {
+            media: w.media,
+            start: w.start,
+            end: w.end,
+        })
+        .collect();
+    let notes = oc_core::build_plan(&mut project.timeline, &plan, &windows, &beats, &lines, &covers)?;
     oc_db::save_timeline(db, project_id, &project.timeline)
         .await
         .map_err(|e| e.to_string())?;
@@ -857,6 +721,8 @@ fn source_windows(
                         start: cue.start.as_seconds(),
                         end: cue.end.as_seconds(),
                         duration: dur.as_seconds(),
+                        look: String::new(),
+                        silent: false,
                     });
                 }
             }
@@ -865,19 +731,32 @@ fn source_windows(
                 start: 0.0,
                 end: 0.0,
                 duration: dur.as_seconds().max(0.1),
+                look: String::new(),
+                silent: false,
             });
         } else {
             for shot in shots {
+                let silent = !range_has_speech(speech, row.id, shot.start, shot.end);
                 windows.push(oc_core::SourceWindow {
                     media: id,
                     start: shot.start,
                     end: shot.end,
                     duration: dur.as_seconds().max(shot.end),
+                    look: shot.look.clone(),
+                    silent,
                 });
             }
         }
     }
     windows
+}
+
+fn range_has_speech(speech: &HashMap<Uuid, Speech>, id: Uuid, start: f64, end: f64) -> bool {
+    speech.get(&id).is_some_and(|s| {
+        s.cues.iter().any(|c| {
+            c.end.as_seconds() > start + 0.2 && c.start.as_seconds() < end - 0.2
+        })
+    })
 }
 
 fn music_beats(row: Option<&oc_db::AnalysisRow>) -> Option<Vec<f64>> {

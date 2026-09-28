@@ -5,6 +5,13 @@ use oc_tools::McpTool;
 use serde_json::Value;
 
 /// Run one turn on the local vendor CLI (same as cbot). No API keys.
+/// One still the selected director model should see.
+#[derive(Clone, Debug)]
+pub struct PromptImage {
+    pub caption: String,
+    pub jpeg: Vec<u8>,
+}
+
 pub async fn complete(
     provider: &str,
     model: &str,
@@ -12,7 +19,7 @@ pub async fn complete(
     turns: &[ChatTurn],
     tools: &[McpTool],
 ) -> Result<LlmReply, LlmError> {
-    complete_stream(provider, model, system, turns, tools, None, &[]).await
+    complete_stream(provider, model, system, turns, tools, None, &[], &[]).await
 }
 
 pub async fn complete_stream(
@@ -23,6 +30,7 @@ pub async fn complete_stream(
     tools: &[McpTool],
     events: Option<EventSink>,
     mcp_servers: &[Value],
+    frames: &[PromptImage],
 ) -> Result<LlmReply, LlmError> {
     let id = ProviderId::parse(provider)
         .ok_or_else(|| LlmError::Message(format!("unknown provider {provider}")))?;
@@ -46,7 +54,7 @@ pub async fn complete_stream(
         ChatEvent::status(format!("ACP {} · {model}", id.name())),
     )
     .await;
-    let text = run_provider(id, model, &prompt, mcp_servers, events.as_ref())
+    let text = run_provider(id, model, &prompt, mcp_servers, frames, events.as_ref())
         .await
         .inspect_err(|e| tracing::error!(provider, model, "provider failed: {e}"))?;
     let reply = parse_tool_reply(text);
@@ -67,6 +75,7 @@ async fn run_provider(
     model: &str,
     prompt: &str,
     mcp_servers: &[Value],
+    frames: &[PromptImage],
     events: Option<&EventSink>,
 ) -> Result<String, LlmError> {
     let (bin, args) = acp_launch(id, model);
@@ -89,7 +98,7 @@ async fn run_provider(
         };
     }
     tracing::info!(bin = %bin, args = %args.join(" "), "acp launch");
-    match spawn_acp(&bin, &args, model, prompt, mcp_servers, events).await {
+    match spawn_acp(&bin, &args, model, prompt, mcp_servers, frames, events).await {
         Ok(text) => Ok(text),
         Err(err) => match id {
             ProviderId::Xai => Err(err),
@@ -220,15 +229,19 @@ async fn spawn_acp(
     model: &str,
     prompt: &str,
     mcp_servers: &[Value],
+    frames: &[PromptImage],
     events: Option<&EventSink>,
 ) -> Result<String, LlmError> {
-    tracing::info!(bin, mcp = mcp_servers.len(), "acp connect");
+    tracing::info!(bin, mcp = mcp_servers.len(), frames = frames.len(), "acp connect");
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".into());
     let mut client = AcpClient::connect(bin, args, events.cloned()).await?;
+    let session_id = client
+        .open_session(&cwd, Some(model), mcp_servers, events)
+        .await?;
     client
-        .prompt(&cwd, prompt, Some(model), mcp_servers, events)
+        .continue_prompt(&session_id, prompt, frames, events)
         .await
 }
 
@@ -327,6 +340,7 @@ impl DirectorSession {
     pub async fn turn(
         &mut self,
         message: &str,
+        frames: &[PromptImage],
         events: Option<&EventSink>,
     ) -> Result<LlmReply, LlmError> {
         self.chars += message.len();
@@ -335,7 +349,7 @@ impl DirectorSession {
             SessionInner::Acp {
                 client,
                 session_id,
-            } => client.continue_prompt(session_id, message, events).await?,
+            } => client.continue_prompt(session_id, message, frames, events).await?,
             SessionInner::Stateless => {
                 return Err(LlmError::Message(
                     "no ACP session — use complete_stream".into(),

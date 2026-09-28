@@ -809,6 +809,18 @@ pub struct EditSlot {
     pub end_scale: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ease: Option<Ease>,
+    /// Set only when this shot needs a grade. Absent leaves the picture untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<Grade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fx: Option<Fx>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fade_in: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fade_out: Option<f64>,
+    /// Cover the join into this slot with a silent range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<bool>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub why: String,
 }
@@ -824,6 +836,13 @@ pub struct EditPlan {
     pub letterbox: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music_id: Option<MediaId>,
+    /// Music fader, 1 is unity. Set it only when the bed should sit under speech.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music_volume: Option<f32>,
+    /// Write transcript captions onto the new timeline.
+    #[serde(default)]
+    pub captions: bool,
+    /// Applied to every slot that does not set its own grade.
     #[serde(default)]
     pub grade: Grade,
     pub slots: Vec<EditSlot>,
@@ -1052,6 +1071,9 @@ pub struct Timeline {
     /// Master fader. Solo and pan are unused; gain is the master volume.
     #[serde(default)]
     pub master: Mix,
+    /// Black bars top and bottom. The renderer draws them on export.
+    #[serde(default)]
+    pub letterbox: bool,
     /// Last submit_edit plan. Revisions rebuild from this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_plan: Option<EditPlan>,
@@ -1079,6 +1101,7 @@ impl Timeline {
             mark_in: None,
             mark_out: None,
             master: Mix::default(),
+            letterbox: false,
             edit_plan: None,
         }
     }

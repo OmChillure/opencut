@@ -88,6 +88,14 @@ pub fn compile(
         fps,
     )?;
     vcur = overlay_graphics(&mut fc, &mut next_label, timeline, &vcur, width, height)?;
+    if timeline.letterbox && height > 8 {
+        let bar = ((height as f32) * 0.12).round() as u32;
+        let lab = next_label();
+        fc.push_str(&format!(
+            "[{vcur}]drawbox=x=0:y=0:w=iw:h={bar}:color=black@1:t=fill,drawbox=x=0:y=ih-{bar}:w=iw:h={bar}:color=black@1:t=fill[{lab}];"
+        ));
+        vcur = lab;
+    }
 
     let captions = captions_for_cut(timeline);
     let srt = if captions.is_empty() {
@@ -96,8 +104,13 @@ pub fn compile(
         let path = work.join("cut.srt");
         std::fs::write(&path, to_srt(&captions)).map_err(RenderError::Io)?;
         let lab = next_label();
+        let margin_v = if timeline.letterbox {
+            ((height as f32) * 0.12).round() as u32 + 28
+        } else {
+            36
+        };
         fc.push_str(&format!(
-            "[{vcur}]subtitles={}:force_style='Fontsize=13,Outline=1,Shadow=0,Alignment=2,MarginL=48,MarginR=48,MarginV=36,WrapStyle=0'[{lab}];",
+            "[{vcur}]subtitles={}:force_style='Fontsize=13,Outline=1,Shadow=0,Alignment=2,MarginL=48,MarginR=48,MarginV={margin_v},WrapStyle=0'[{lab}];",
             escape_path(&path)
         ));
         vcur = lab;
@@ -231,8 +244,10 @@ fn stitch_base(
                 let out = next_label();
                 if let Some(kind) = xfade_kind.filter(|k| *k != TransitionKind::Cut) {
                     let offset = (left_end - mix).max(0.0);
+                    let left_tb = next_label();
+                    let right_tb = next_label();
                     fc.push_str(&format!(
-                        "[{left}][{v}]xfade=transition={}:duration={mix:.4}:offset={offset:.4}[{out}];",
+                        "[{left}]fps={fps},settb=AVTB[{left_tb}];[{v}]fps={fps},settb=AVTB[{right_tb}];[{left_tb}][{right_tb}]xfade=transition={}:duration={mix:.4}:offset={offset:.4}[{out}];",
                         xfade_name(kind)
                     ));
                     acc = Some((out, left_end + dur - mix));

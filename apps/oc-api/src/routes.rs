@@ -200,14 +200,6 @@ pub struct ChatBody {
     pub messages: Vec<ChatTurn>,
 }
 
-#[derive(Serialize)]
-#[allow(dead_code)]
-pub struct ChatResponse {
-    pub text: String,
-    pub notes: Vec<String>,
-    pub timeline: Timeline,
-}
-
 pub async fn chat(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -320,7 +312,20 @@ async fn fresh_review(state: &AppState, id: Uuid, request: &str) -> oc_core::Cut
         .await
         .unwrap_or_default();
     let speech = speech_by_media(&rows);
-    review_cut(&timeline, &edit::spoken(&speech), request)
+    let spoken = edit::spoken(&speech);
+    let director = oc_core::is_director_request(request);
+    if !director {
+        return review_cut(&timeline, &spoken, request);
+    }
+    let facts = oc_core::ReviewFacts {
+        has_music: timeline
+            .edit_plan
+            .as_ref()
+            .and_then(|p| p.music_id)
+            .is_some(),
+        ..oc_core::ReviewFacts::default()
+    };
+    oc_core::review_with(&timeline, &spoken, request, &facts)
 }
 
 async fn push(tx: &mpsc::Sender<String>, value: serde_json::Value) {
@@ -477,6 +482,7 @@ async fn run_chat(
         !mcp_servers.is_empty(),
     );
     let mut note_rounds = 0_u32;
+    let mut seen: Vec<oc_providers::PromptImage> = Vec::new();
     for turn_i in 0..8 {
         if tx.is_closed() {
             drop(ev_tx);
@@ -490,8 +496,9 @@ async fn run_chat(
                 return Ok(());
             }
             reply = async {
+                let show = seen.as_slice();
                 if session.remembers() {
-                    session.turn(&message, Some(&ev_tx)).await
+                    session.turn(&message, show, Some(&ev_tx)).await
                 } else {
                     oc_providers::complete_stream(
                         &body.provider,
@@ -501,11 +508,13 @@ async fn run_chat(
                         &tools,
                         Some(ev_tx.clone()),
                         &mcp_servers,
+                        show,
                     )
                     .await
                 }
             } => reply,
         };
+        seen.clear();
         let reply = match reply {
             Ok(reply) => reply,
             Err(err) => {
@@ -542,6 +551,15 @@ async fn run_chat(
                     continue;
                 }
                 text = t;
+                if director && !review.issues {
+                    if let Ok(fresh) = oc_db::get_project(&state.db, id).await {
+                        let preset = export_preset(&fresh.timeline);
+                        match edit::queue_export(&state.db, id, preset).await {
+                            Ok(()) => notes.push(format!("export queued {}", preset.label())),
+                            Err(err) => tracing::error!(project = %id, "export queue failed: {err}"),
+                        }
+                    }
+                }
                 break;
             }
             LlmReply::Tools(calls) => {
@@ -559,7 +577,10 @@ async fn run_chat(
                     )
                     .await;
                     tracing::info!(tool = %call.name, "host tool");
-                    let (ok, result) = match edit::call_tool(
+                    let (ok, result) = if call.name == "see" {
+                        see_host(&state, id, &call.arguments, &mut seen).await
+                    } else {
+                        match edit::call_tool(
                         &state.db,
                         id,
                         &call.name,
@@ -584,7 +605,15 @@ async fn run_chat(
                             batch.push('\n');
                             (false, msg)
                         }
+                    }
                     };
+                    if call.name == "see" {
+                        batch.push_str(&compact_tool("see", &result));
+                        batch.push('\n');
+                        if ok {
+                            notes.push(result.clone());
+                        }
+                    }
                     let timeline = oc_db::get_project(&state.db, id)
                         .await
                         .ok()
@@ -638,6 +667,37 @@ async fn run_chat(
     );
     finish_chat(&tx, &text, &notes, &project.timeline).await;
     Ok(())
+}
+
+async fn see_host(
+    state: &AppState,
+    project_id: Uuid,
+    arguments: &serde_json::Value,
+    seen: &mut Vec<oc_providers::PromptImage>,
+) -> (bool, String) {
+    let media = arguments.get("media_id").and_then(|v| v.as_str()).unwrap_or("");
+    let at = arguments.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let Ok(media_id) = Uuid::parse_str(media) else {
+        return (false, format!("tool error: bad media id {media}"));
+    };
+    match edit::see_frame(&state.db, state.r2.as_ref(), project_id, media_id, at).await {
+        Ok(frame) => {
+            let caption = frame.caption.clone();
+            seen.push(frame);
+            (true, caption)
+        }
+        Err(err) => (false, format!("tool error: {err}")),
+    }
+}
+
+fn export_preset(timeline: &Timeline) -> oc_core::ExportPreset {
+    if timeline.height > timeline.width + 32 {
+        oc_core::ExportPreset::Vertical1080
+    } else if (timeline.width as i32 - timeline.height as i32).unsigned_abs() < 32 {
+        oc_core::ExportPreset::Square1080
+    } else {
+        oc_core::ExportPreset::Youtube1080
+    }
 }
 
 fn compact_tool(name: &str, result: &str) -> String {

@@ -24,7 +24,7 @@ Decide the shape from the ask. You choose the in-points. Do not walk the transcr
 - **One long source** — several excerpts, not one short bite and not the whole file.
 - **Trim / split / delete / recut** — touch only what they named.
 - **Captions / silence / duck / reframe** — just that.
-- **After the picture is cut** — grade, motion, mix, and captions with tools. Nothing applies them for you.
+- **On the plan** — grade, grain, a fade, a push, a cover, music volume, captions, and letterbox only where this footage needs them. Rust applies those fields and leaves every other shot alone.
 - **Louder, quieter, panned, solo** — `set_mix` on the audio track (or omit `track_id` for the master). Not a new cut.
 - **A curve, a mask, a speed change in the middle** — `set_curves`, `set_mask`, `set_speed_keys` on the clip they named.
 - **A slate, bars, snow, or a countdown** — `add_generator`. Not a substitute for their footage.

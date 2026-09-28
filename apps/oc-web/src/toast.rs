@@ -1,10 +1,3 @@
-//! Fleet-style toaster: high-contrast card + progress line, then auto-close.
-//!
-//! ```ignore
-//! show_toast().success("Dissolve applied.");
-//! show_toast().error("no clip at the playhead");
-//! ```
-
 use std::cell::Cell;
 
 use dioxus::prelude::*;
@@ -14,7 +7,6 @@ const MAX_TOASTS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
-    Info,
     Success,
     Warn,
     Error,
@@ -43,15 +35,7 @@ pub fn show_toast() -> Toaster {
         .expect("show_toast() used before <ToastProvider> mounted")
 }
 
-pub fn try_toast() -> Option<Toaster> {
-    GLOBAL_TOASTER.with(Cell::get)
-}
-
 impl Toaster {
-    pub fn info(self, message: impl Into<String>) {
-        self.push(ToastKind::Info, message.into());
-    }
-
     pub fn success(self, message: impl Into<String>) {
         self.push(ToastKind::Success, message.into());
     }
@@ -115,7 +99,6 @@ fn ToastHost() -> Element {
                 {
                     let id = t.id;
                     let kind = match t.kind {
-                        ToastKind::Info => "info",
                         ToastKind::Success => "ok",
                         ToastKind::Warn => "warn",
                         ToastKind::Error => "err",
@@ -149,12 +132,6 @@ fn ToastHost() -> Element {
 #[component]
 fn ToastIcon(kind: ToastKind) -> Element {
     match kind {
-        ToastKind::Info => rsx! {
-            svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
-                path { d: "M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" }
-                path { d: "M10.3 21a1.94 1.94 0 0 0 3.4 0" }
-            }
-        },
         ToastKind::Success => rsx! {
             svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2",
                 circle { cx: "12", cy: "12", r: "10" }

@@ -207,14 +207,6 @@ pub struct EditorTrack {
 }
 
 impl TrackKindUi {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Video => "Video",
-            Self::Audio => "Audio",
-            Self::Caption => "Captions",
-        }
-    }
-
     pub fn prefix(self) -> &'static str {
         match self {
             Self::Video => "V",
@@ -325,11 +317,6 @@ pub const PPS_MAX: f64 = 80.0;
 
 pub fn clamp_pps(pps: f64) -> f64 {
     pps.clamp(PPS_MIN, PPS_MAX)
-}
-
-pub fn fit_pps(span: f64, viewport_w: f64) -> f64 {
-    let span = span.max(1.0);
-    clamp_pps((viewport_w.max(160.0) - 24.0) / span)
 }
 
 pub fn wave_bars(seed: &str, n: usize) -> Vec<u8> {
@@ -1252,7 +1239,7 @@ fn preroll(video: &HtmlVideoElement, shot: &ProgramShot) {
         }
     }
     if !video.paused() {
-        video.pause();
+        let _ = video.pause();
     }
 }
 
@@ -1577,7 +1564,7 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
     match shot {
         None => {
             if let Some(video) = video {
-                video.pause();
+                let _ = video.pause();
             }
             set_class_off(".preview-video", true);
             set_class_off(".preview-video-b", true);
@@ -1586,7 +1573,7 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
         }
         Some(shot) if shot.kind == MediaKind::Image => {
             if let Some(video) = video {
-                video.pause();
+                let _ = video.pause();
             }
             if let Some(img) = web_sys::window()
                 .and_then(|w| w.document())
@@ -1632,7 +1619,7 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
                 .is_some_and(|n| contiguous_source(&shot, n));
 
             if !playing {
-                video.pause();
+                let _ = video.pause();
                 if ready && drift > 0.04 {
                     seek_video(&video, src_time, false);
                 }
@@ -1651,7 +1638,7 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
                             standby.set_muted(false);
                             let _ = standby.play();
                         }
-                        video.pause();
+                        let _ = video.pause();
                         video.set_muted(true);
                         swap_program();
                         set_playhead(n.start.max(now) + 1e-3);
@@ -1662,7 +1649,7 @@ pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, pla
                     set_playhead(n.start.max(now) + 1e-3);
                     LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                 } else {
-                    video.pause();
+                    let _ = video.pause();
                     set_playhead(shot.start + take);
                     LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                 }

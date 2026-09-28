@@ -188,10 +188,6 @@ pub async fn analyze_path(input: &Path) -> Result<VisualDigest, crate::MediaErro
         });
     }
 
-    if let Err(e) = crate::subject::label_subjects(input, &mut shots).await {
-        tracing::warn!("subject look skipped: {e}");
-    }
-
     let mut digest = fold_frames(frames, scene_times.len(), duration, probe.has_audio);
     digest.shots = shots;
     let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -369,6 +365,32 @@ async fn scene_cuts(input: &Path) -> Result<Vec<f64>, crate::MediaError> {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     times.dedup();
     Ok(times)
+}
+
+/// One JPEG at `at` seconds. 384px wide keeps the frame readable and the vision tokens small.
+pub async fn grab_jpeg(input: &Path, at: f64, dest: &Path) -> Result<(), crate::MediaError> {
+    let out = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-ss",
+            &format!("{at:.3}"),
+            "-i",
+            &path_str(input),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=384:-2",
+            "-q:v",
+            "8",
+            &path_str(dest),
+        ])
+        .output()
+        .await
+        .map_err(|e| crate::MediaError::Ffmpeg(e.to_string()))?;
+    if !out.status.success() || !dest.exists() {
+        return Err(crate::MediaError::Ffmpeg("no jpeg".into()));
+    }
+    Ok(())
 }
 
 async fn grab_rgb(input: &Path, at: f64, dest: &Path) -> Result<(), crate::MediaError> {

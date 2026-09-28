@@ -1,11 +1,12 @@
 mod beats;
 mod shots;
-mod subject;
 mod vision;
 
 pub use beats::{MusicAnalysis, MusicSection, detect_beats, format_music};
 pub use shots::{ShotBrief, ShotRole, brief_shots, format_shot_list};
-pub use vision::{ShotCard, ShotLook, VisualDigest, analyze_local, analyze_path, picture_ranges};
+pub use vision::{
+    ShotCard, ShotLook, VisualDigest, analyze_local, analyze_path, grab_jpeg, picture_ranges,
+};
 
 use oc_time::{Duration, FrameRate};
 use oc_timeline::{MediaId, ProjectId};

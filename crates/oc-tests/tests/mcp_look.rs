@@ -183,7 +183,6 @@ fn parse_mixer_curves_mask_remap_and_generator() {
 }
 
 #[test]
-#[test]
 fn grade_defaults_are_zero_and_transition_keeps_duration() {
     let grade = op_from_mcp(&call("set_grade", json!({ "clip_id": clip(), "lut": "film" }))).unwrap();
     match grade {

@@ -224,7 +224,7 @@ fn wants_vertical(request: &str) -> bool {
         || t.contains("9:16")
 }
 
-fn program_clips(timeline: &Timeline) -> Vec<&Clip> {
+pub(crate) fn program_clips(timeline: &Timeline) -> Vec<&Clip> {
     let mut clips = Vec::new();
     for track in &timeline.tracks {
         if track.kind != TrackKind::Video || track.hidden {
@@ -250,7 +250,7 @@ fn same_media(a: &Clip, b: &Clip) -> bool {
     matches!((a.media_id, b.media_id), (Some(x), Some(y)) if x == y)
 }
 
-fn pick_cover<'a>(covers: &'a [CoverShot], a: &Clip, b: &Clip) -> Option<&'a CoverShot> {
+pub(crate) fn pick_cover<'a>(covers: &'a [CoverShot], a: &Clip, b: &Clip) -> Option<&'a CoverShot> {
     let media = a.media_id?;
     if b.media_id != Some(media) {
         return None;
@@ -269,7 +269,7 @@ fn overlaps_any(start: f64, end: f64, used: &[(f64, f64)]) -> bool {
     used.iter().any(|(a, b)| start < *b - 0.05 && end > *a + 0.05)
 }
 
-fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
+pub(crate) fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
     let mut cues = Vec::new();
     for clip in clips {
         let Some(media) = clip.media_id else { continue };
