@@ -196,6 +196,14 @@ impl TimelineClip {
     }
 }
 
+pub fn clip_name(clip: &TimelineClip, media_name: Option<&str>) -> String {
+    if !clip.graphic.is_empty() {
+        clip.graphic.clone()
+    } else {
+        media_name.unwrap_or("Clip").to_string()
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct EditorTrack {
     pub id: String,
@@ -905,13 +913,14 @@ pub fn timeline_end(tracks: &[EditorTrack]) -> f64 {
 }
 
 /// Pull a later picture clip back across a hole so playback cannot skip it.
+/// Drawings, labels, and the corner window keep the gaps between spoken lines.
 pub fn close_editor_gaps(tracks: &mut [EditorTrack]) {
     for track in tracks {
-        if track.hidden || track.kind != TrackKindUi::Video {
+        if track.hidden || track.kind != TrackKindUi::Video || is_overlay_track(&track.name) {
             continue;
         }
         let mut order: Vec<usize> = (0..track.clips.len())
-            .filter(|&i| !track.clips[i].disabled)
+            .filter(|&i| !track.clips[i].disabled && !track.clips[i].media_id.is_empty())
             .collect();
         order.sort_by(|&a, &b| {
             track.clips[a]
@@ -1095,23 +1104,33 @@ pub struct ProgramShot {
     pub duration: f64,
 }
 
+/// Design, the corner window, and text labels are drawn on top of the program.
+/// They are not the shot the monitor plays.
+fn is_overlay_track(name: &str) -> bool {
+    matches!(name, "Design" | "Front" | "GFX")
+}
+
 pub fn clip_under(tracks: &[EditorTrack], library: &[MediaItem], time: f64) -> Option<ProgramShot> {
-    let mut best: Option<&TimelineClip> = None;
+    let mut best: Option<ProgramShot> = None;
     for track in tracks {
-        if track.hidden || track.kind != TrackKindUi::Video {
+        if track.hidden || track.kind != TrackKindUi::Video || is_overlay_track(&track.name) {
             continue;
         }
         for clip in &track.clips {
             if clip.disabled || time + 1e-4 < clip.start || time >= clip.end() {
                 continue;
             }
+            // A label has no picture. Skipping it here keeps the speaker playing.
+            let Some(shot) = shot_from(library, clip) else {
+                continue;
+            };
             // Later start wins (V2 over a V1 tail). Same start → later track.
-            if best.is_none_or(|b| clip.start + 1e-6 >= b.start) {
-                best = Some(clip);
+            if best.as_ref().is_none_or(|b| shot.start + 1e-6 >= b.start) {
+                best = Some(shot);
             }
         }
     }
-    shot_from(library, best?)
+    best
 }
 
 pub fn video_duration_from_src(src: &str) -> Option<f64> {
@@ -1180,8 +1199,14 @@ pub fn following_shot(
         if track.hidden || track.kind != TrackKindUi::Video {
             continue;
         }
+        if is_overlay_track(&track.name) {
+            continue;
+        }
         for clip in &track.clips {
-            if clip.disabled || clip.start <= cur.start + 0.04 {
+            if clip.disabled || clip.media_id.is_empty() || clip.start <= cur.start + 0.04 {
+                continue;
+            }
+            if shot_from(library, clip).is_none() {
                 continue;
             }
             if is_join_ui(cur.start, cur_end, clip.start) {
@@ -1401,7 +1426,12 @@ fn caption_line(text: &str, into: f64, span: f64) -> String {
         .unwrap_or_default()
 }
 
-pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
+pub fn apply_monitor_look(
+    engine: &oc_core::Timeline,
+    library: &[MediaItem],
+    now: f64,
+    playing: bool,
+) {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
@@ -1416,7 +1446,7 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
     let mut pan_x = 0.0_f32;
     let mut pan_y = 0.0_f32;
     let mut volume = 1.0_f64;
-    let mut graphics: Vec<(String, String)> = Vec::new();
+    let mut graphics: Vec<(String, String, Option<f32>, Option<f32>)> = Vec::new();
     let mut next_url = String::new();
     let mut next_src = 0.0_f64;
     let mut mask: Option<oc_core::AlphaShape> = None;
@@ -1492,14 +1522,19 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
                         oc_core::GraphicKind::Shape => "shape",
                         oc_core::GraphicKind::Sticker => "sticker",
                     };
-                    graphics.push((cls.into(), graphic.text.clone()));
+                    graphics.push((cls.into(), graphic.text.clone(), graphic.x, graphic.y));
                 }
                 oc_core::ClipKind::Caption { style: _, cues } => {
                     let local_t = oc_core::Time::from_ticks((t - clip.start).as_ticks());
                     if let Some(cue) = cues.iter().find(|c| local_t >= c.start && local_t < c.end) {
                         let span = (cue.end - cue.start).as_seconds().max(0.3);
                         let into = (local_t - cue.start).as_seconds().clamp(0.0, span);
-                        graphics.push(("caption".into(), caption_line(&cue.text, into, span)));
+                        graphics.push((
+                            "caption".into(),
+                            caption_line(&cue.text, into, span),
+                            None,
+                            None,
+                        ));
                     }
                 }
             }
@@ -1521,9 +1556,12 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
     }
     remember_look(engine, &filter, cube_id, mask, &look_clip);
 
+    let person = frame_card(engine, now, "Front");
     if let Some(video) = preview_video() {
         let (a, mix_tf, clip_path, extra_filter) = mix_preview_css(kind, mix, opacity, &filter);
-        let transform = if (zoom - 1.0).abs() > 0.01 || pan_x.abs() > 0.5 || pan_y.abs() > 0.5 {
+        let transform = if person.is_some() {
+            "none".to_string()
+        } else if (zoom - 1.0).abs() > 0.01 || pan_x.abs() > 0.5 || pan_y.abs() > 0.5 {
             let punch = format!("scale({zoom:.3}) translate({pan_x:.1}px,{pan_y:.1}px)");
             if mix_tf == "none" {
                 punch
@@ -1533,10 +1571,21 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
         } else {
             mix_tf
         };
+        let pip = person
+            .map(|card| {
+                format!(
+                    "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;right:auto;bottom:auto;object-fit:cover;z-index:4;",
+                    card.x * 100.0,
+                    card.y * 100.0,
+                    card.w * 100.0,
+                    card.h * 100.0
+                )
+            })
+            .unwrap_or_default();
         let _ = video.set_attribute(
             "style",
             &format!(
-                "filter:{extra_filter};opacity:{a:.3};transform:{transform};clip-path:{clip_path}"
+                "filter:{extra_filter};opacity:{a:.3};transform:{transform};clip-path:{clip_path};{pip}"
             ),
         );
         video.set_volume(volume.clamp(0.0, 1.0));
@@ -1588,16 +1637,162 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
         };
         let _ = layer.set_attribute("class", gfx_class);
         layer.set_inner_html("");
-        for (cls, text) in graphics {
+        for (cls, text, x, y) in graphics {
             if let Some(node) = doc.create_element("div").ok() {
                 let _ = node.set_attribute("class", &format!("gfx {cls}"));
+                if let (Some(x), Some(y)) = (x, y) {
+                    let (x, max_w) = label_clear_of_card(x, person);
+                    let _ = node.set_attribute(
+                        "style",
+                        &format!(
+                            "position:absolute;left:{:.2}%;top:{:.2}%;transform:translate(-50%,-50%);margin:0;width:max-content;max-width:{:.0}%;font-size:clamp(15px,3.2cqw,28px);line-height:1.15;text-align:center;",
+                            x * 100.0,
+                            y * 100.0,
+                            max_w
+                        ),
+                    );
+                }
                 node.set_text_content(Some(&text));
                 let _ = layer.append_child(&node);
             }
         }
     }
+    paint_design(&doc, engine, library, now, playing);
     paint_monitor_matte(&doc, engine.letterbox);
     let _ = paint_grade_canvas();
+}
+
+/// Keep a label in the open side of the frame when the person window would cover it.
+fn label_clear_of_card(x: f32, card: Option<oc_core::FrameCard>) -> (f32, f32) {
+    let Some(card) = card else {
+        return (x, 80.0);
+    };
+    let right = card.x + card.w;
+    let inside = x > card.x + 0.02 && x < right - 0.02;
+    if inside {
+        let left_free = card.x;
+        let right_free = 1.0 - right;
+        if left_free >= right_free {
+            let cx = (card.x * 0.5).clamp(0.12, (card.x - 0.06).max(0.12));
+            return (cx, ((card.x - 0.04) * 100.0).clamp(24.0, 70.0));
+        }
+        let cx = (right + right_free * 0.5).clamp(right + 0.06, 0.88);
+        return (cx, ((right_free - 0.04) * 100.0).clamp(24.0, 70.0));
+    }
+    if x <= card.x {
+        return (x, ((card.x - 0.04) * 100.0).clamp(24.0, 80.0));
+    }
+    (x, ((1.0 - right - 0.04) * 100.0).clamp(24.0, 80.0))
+}
+
+fn frame_card(engine: &oc_core::Timeline, now: f64, track_name: &str) -> Option<oc_core::FrameCard> {
+    let t = oc_core::Time::from_seconds(now);
+    engine.tracks.iter().find_map(|track| {
+        if track.name != track_name {
+            return None;
+        }
+        track.clips.iter().find_map(|clip| {
+            (!clip.disabled && clip.contains(t))
+                .then_some(clip.look.card)
+                .flatten()
+        })
+    })
+}
+
+fn hide_design() {
+    set_class_off(".preview-design", true);
+    set_class_off(".preview-design-clip", true);
+    if let Some(video) = query_video(".preview-design-clip") {
+        let _ = video.pause();
+    }
+}
+
+fn paint_design(
+    doc: &web_sys::Document,
+    engine: &oc_core::Timeline,
+    library: &[MediaItem],
+    now: f64,
+    playing: bool,
+) {
+    let t = oc_core::Time::from_seconds(now);
+    let design = engine.tracks.iter().find_map(|track| {
+        if track.name != "Design" {
+            return None;
+        }
+        track.clips.iter().find(|clip| {
+            !clip.disabled
+                && clip.contains(t)
+                && matches!(clip.kind, oc_core::ClipKind::Video { .. })
+        })
+    });
+    let Some(clip) = design else {
+        hide_design();
+        return;
+    };
+    let Some(item) = clip.media_id.and_then(|id| {
+        library
+            .iter()
+            .find(|item| item.id == id.to_string())
+            .cloned()
+    }) else {
+        hide_design();
+        return;
+    };
+    let style = if let Some(card) = clip.look.card {
+        format!(
+            "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;",
+            card.x * 100.0,
+            card.y * 100.0,
+            card.w * 100.0,
+            card.h * 100.0
+        )
+    } else {
+        "left:0;top:0;width:100%;height:100%;".to_string()
+    };
+    if item.kind == MediaKind::Video {
+        set_class_off(".preview-design", true);
+        let Some(video) = query_video(".preview-design-clip") else {
+            return;
+        };
+        let loaded = video.get_attribute("data-media").unwrap_or_default();
+        if loaded != item.id {
+            let _ = video.set_attribute("data-media", &item.id);
+            video.set_src(&item.url);
+            video.set_muted(true);
+        }
+        let _ = video.set_attribute("style", &style);
+        set_class_off(".preview-design-clip", false);
+        let local = (now - clip.start.as_seconds())
+            .clamp(0.0, clip.duration.as_seconds().max(0.04));
+        let ready = video.ready_state() >= 2;
+        let drift = (video.current_time() - local).abs();
+        if !playing {
+            let _ = video.pause();
+            if ready && drift > 0.04 {
+                video.set_current_time(local);
+            }
+        } else if video.paused() {
+            if ready && drift > 0.08 {
+                video.set_current_time(local);
+            }
+            if ready {
+                let _ = video.play();
+            }
+        } else if ready && drift > 0.45 {
+            video.set_current_time(local);
+        }
+        return;
+    }
+    set_class_off(".preview-design-clip", true);
+    if let Some(video) = query_video(".preview-design-clip") {
+        let _ = video.pause();
+    }
+    let Some(img) = doc.query_selector(".preview-design").ok().flatten() else {
+        return;
+    };
+    let _ = img.set_attribute("src", &item.url);
+    let _ = img.set_attribute("style", &style);
+    set_class_off(".preview-design", false);
 }
 
 pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, playing: bool) {
@@ -1909,6 +2104,61 @@ mod tests {
         };
         assert!(contiguous_source(&a, &b));
         assert!(!contiguous_source(&b, &c));
+    }
+
+    #[test]
+    fn clip_under_keeps_the_speaker_when_a_label_has_no_picture() {
+        let library = vec![item("a", "blob:a", 40.0), item("d", "blob:d", 6.0)];
+        let mut label = clip("g1", "", 5.0, 6.0);
+        label.graphic = "Bullish flag".into();
+        let tracks = vec![
+            video_track(vec![clip("c1", "a", 0.0, 40.0)]),
+            video_track_named("design", "Design", vec![clip("d1", "d", 5.0, 6.0)]),
+            video_track_named("front", "Front", vec![clip("f1", "a", 5.0, 6.0)]),
+            video_track_named("gfx", "GFX", vec![label]),
+        ];
+        let shot = clip_under(&tracks, &library, 6.0).unwrap();
+        assert_eq!(shot.media_id, "a");
+        assert!((shot.start - 0.0).abs() < 1e-6);
+        assert!(following_shot(&tracks, &library, 6.0).is_none());
+    }
+
+    #[test]
+    fn close_editor_gaps_leaves_a_drawing_on_its_spoken_line() {
+        let mut tracks = vec![video_track_named(
+            "design",
+            "Design",
+            vec![clip("a", "d", 5.0, 6.0), clip("b", "d", 26.8, 6.0)],
+        )];
+        close_editor_gaps(&mut tracks);
+        assert!((tracks[0].clips[0].start - 5.0).abs() < 1e-6);
+        assert!((tracks[0].clips[1].start - 26.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn label_moves_out_of_the_person_window() {
+        let card = oc_core::FrameCard {
+            x: 0.56,
+            y: 0.18,
+            w: 0.38,
+            h: 0.64,
+        };
+        let (x, width) = label_clear_of_card(0.50, Some(card));
+        assert!(x < card.x, "the words have to sit in the open side, x={x}");
+        assert!(width <= card.x * 100.0);
+        let (parked, _) = label_clear_of_card(0.27, Some(card));
+        assert!((parked - 0.27).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_label_clip_uses_its_words_as_the_name() {
+        let mut label = clip("g", "", 0.0, 4.0);
+        label.graphic = "Bullish flag".into();
+        assert_eq!(clip_name(&label, None), "Bullish flag");
+        let named = clip("p", "m", 0.0, 4.0);
+        assert_eq!(clip_name(&named, Some("design-flag.jpg")), "design-flag.jpg");
+        let bare = clip("q", "", 0.0, 4.0);
+        assert_eq!(clip_name(&bare, None), "Clip");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 use media::{
     Clock, DragSession, DragSource, EditMode, EditTool, EditorTrack, MediaItem, MediaKind,
-    TimelineClip, TrackKindUi, advance_playhead, clip_duration, commit_drag,
+    TimelineClip, TrackKindUi, advance_playhead, clip_duration, clip_name, commit_drag,
     display_tracks, film_tiles, fit_scale, format_clock, format_tc_short,
     item_from_bytes_id, lane_height, next_track_name, paint_clock, paint_playhead, place_clip,
     playhead_now, preview_video, reset_tick_clock, ruler_marks_nle, scroll_left,
@@ -404,7 +404,12 @@ fn Workspace(id: String) -> Element {
                 continue;
             }
             sync_monitor(&library.peek(), &tracks.peek(), before, true);
-            apply_monitor_look(&engine.peek(), &library.peek(), playhead_now().max(before).min(end));
+            apply_monitor_look(
+                &engine.peek(),
+                &library.peek(),
+                playhead_now().max(before).min(end),
+                true,
+            );
             let under = crate::media::clip_under(
                 &tracks.peek(),
                 &library.peek(),
@@ -692,7 +697,7 @@ fn ask_text(title: &str, fallback: &str) -> String {
 fn live_note(save: WorkspaceSave, library: &[MediaItem], result: Result<Vec<String>, String>) {
     match result {
         Ok(notes) => {
-            apply_monitor_look(&save.engine.peek(), library, playhead_now());
+            apply_monitor_look(&save.engine.peek(), library, playhead_now(), false);
             let text = notes
                 .iter()
                 .filter(|n| !n.is_empty())
@@ -1229,7 +1234,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
         }
         let now = *clock.current.read();
         sync_monitor(&library.read(), &tracks.read(), now, false);
-        apply_monitor_look(&save.engine.read(), &library.read(), now);
+        apply_monitor_look(&save.engine.read(), &library.read(), now, false);
     });
 
     rsx! {
@@ -1313,6 +1318,13 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                         muted: true,
                     }
                     img { class: "preview-image off", alt: "" }
+                    img { class: "preview-design off", alt: "" }
+                    video {
+                        class: "preview-design-clip off",
+                        preload: "auto",
+                        playsinline: true,
+                        muted: true,
+                    }
                     canvas {
                         id: "grade-canvas",
                         class: "{grade_class}",
@@ -1880,7 +1892,7 @@ fn Timeline() -> Element {
                                                 let left = clip.start * *pps.read();
                                                 let width = (clip.duration * *pps.read()).max(24.0);
                                                 let item = library.read().iter().find(|m| m.id == clip.media_id).cloned();
-                                                let name = item.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| "Clip".into());
+                                                let name = clip_name(clip, item.as_ref().map(|m| m.name.as_str()));
                                                 let url = item.as_ref().map(|m| m.url.clone()).unwrap_or_default();
                                                 let media_kind = item.as_ref().map(|m| m.kind).unwrap_or(MediaKind::Video);
                                                 let is_video = media_kind == MediaKind::Video;
@@ -2196,12 +2208,14 @@ fn TrackRow(
                     {
                         let left = 100.0 * clip.start / span;
                         let width = 100.0 * clip.duration / span;
-                        let label = library
-                            .read()
-                            .iter()
-                            .find(|item| item.id == clip.media_id)
-                            .map(|item| item.name.clone())
-                            .unwrap_or_else(|| "Clip".into());
+                        let label = clip_name(
+                            clip,
+                            library
+                                .read()
+                                .iter()
+                                .find(|item| item.id == clip.media_id)
+                                .map(|item| item.name.as_str()),
+                        );
                         rsx! {
                             div {
                                 class: "clip-bar",
