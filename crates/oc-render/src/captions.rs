@@ -41,43 +41,58 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
     }
 
     let mut out = Vec::new();
-    for track in &timeline.tracks {
-        if track.kind != oc_timeline::TrackKind::Video || track.muted || track.hidden {
-            continue;
-        }
-        for clip in &track.clips {
-            if clip.disabled || !matches!(clip.kind, ClipKind::Video { .. }) {
+    let mut placed = vec![false; cues.len()];
+    let program: Vec<&oc_timeline::Clip> = timeline
+        .tracks
+        .iter()
+        .filter(|track| {
+            track.kind == oc_timeline::TrackKind::Video
+                && !track.muted
+                && !track.hidden
+                // Design stills and the corner window are overlays.
+                && !matches!(track.name.as_str(), "Design" | "Front" | "GFX")
+        })
+        .flat_map(|track| track.clips.iter())
+        .filter(|clip| !clip.disabled && matches!(clip.kind, ClipKind::Video { .. }))
+        .collect();
+    for clip in &program {
+        let tl0 = clip.start.as_seconds();
+        let tl1 = clip.end().as_seconds();
+        for (i, (c0, c1, text)) in cues.iter().enumerate() {
+            if *c1 <= tl0 + 0.05 || *c0 >= tl1 - 0.05 {
                 continue;
             }
-            let tl0 = clip.start.as_seconds();
-            let tl1 = clip.end().as_seconds();
-            let src0 = clip.source_in.as_seconds();
-            let src1 = src0 + clip.duration.as_seconds() * f64::from(clip.speed.max(0.01));
-            for (c0, c1, text) in &cues {
-                let (c0, c1) = (*c0, *c1);
-                if c1 > tl0 + 0.05 && c0 < tl1 - 0.05 {
-                    let a = c0.max(tl0);
-                    let b = c1.min(tl1);
-                    if b - a >= 0.05 {
-                        out.push(BurnedCue {
-                            start: a,
-                            end: b,
-                            text: text.clone(),
-                        });
-                        continue;
-                    }
-                }
-                let a = c0.max(src0);
-                let b = c1.min(src1);
-                if b - a < 0.05 {
-                    continue;
-                }
-                out.push(BurnedCue {
-                    start: clip.start.as_seconds() + (a - src0),
-                    end: clip.start.as_seconds() + (b - src0),
-                    text: text.clone(),
-                });
+            let a = c0.max(tl0);
+            let b = c1.min(tl1);
+            if b - a < 0.05 {
+                continue;
             }
+            out.push(BurnedCue {
+                start: a,
+                end: b,
+                text: text.clone(),
+            });
+            placed[i] = true;
+        }
+    }
+    // Cues still in source time (not already on the cut) map through the excerpt.
+    for clip in &program {
+        let src0 = clip.source_in.as_seconds();
+        let src1 = src0 + clip.duration.as_seconds() * f64::from(clip.speed.max(0.01));
+        for (i, (c0, c1, text)) in cues.iter().enumerate() {
+            if placed[i] {
+                continue;
+            }
+            let a = c0.max(src0);
+            let b = c1.min(src1);
+            if b - a < 0.05 {
+                continue;
+            }
+            out.push(BurnedCue {
+                start: clip.start.as_seconds() + (a - src0),
+                end: clip.start.as_seconds() + (b - src0),
+                text: text.clone(),
+            });
         }
     }
     out.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
@@ -256,5 +271,168 @@ mod tests {
         assert!((burned[0].start - 1.0).abs() < 1e-6);
         assert!((burned[0].end - 3.0).abs() < 1e-6);
         assert_eq!(burned[0].text, "on the cut");
+    }
+
+    #[test]
+    fn a_design_still_does_not_replay_the_opening_line() {
+        let mut tl = oc_timeline::Timeline::default();
+        let v = tl.first_track(TrackKind::Video).unwrap().id;
+        tl.add_clip(
+            v,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(oc_timeline::MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Default::default(),
+                },
+                start: Time::ZERO,
+                duration: Duration::from_seconds(8.0),
+                source_in: Time::from_seconds(40.0),
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        let design = tl.add_track(TrackKind::Video, "Design");
+        tl.add_clip(
+            design,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(oc_timeline::MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Default::default(),
+                },
+                start: Time::from_seconds(2.0),
+                duration: Duration::from_seconds(4.0),
+                source_in: Time::ZERO,
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        let cap = tl.add_track(TrackKind::Caption, "Captions");
+        tl.add_clip(
+            cap,
+            Clip {
+                id: ClipId::new(),
+                media_id: None,
+                kind: ClipKind::Caption {
+                    style: CaptionStyle::Stacked,
+                    cues: vec![CaptionCue {
+                        start: Time::ZERO,
+                        end: Time::from_seconds(2.0),
+                        text: "learn the patterns".into(),
+                        speaker: None,
+                    }],
+                },
+                start: Time::ZERO,
+                duration: Duration::from_seconds(8.0),
+                source_in: Time::ZERO,
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        let burned = captions_for_cut(&tl);
+        assert_eq!(burned.len(), 1, "{burned:?}");
+        assert!((burned[0].start - 0.0).abs() < 1e-6);
+        assert!((burned[0].end - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_later_line_is_not_replayed_inside_an_earlier_source_range() {
+        // The flag excerpt is timeline 5–22.3 from source 56.5. The neckline
+        // line is already placed at 52.2–58.2. Those numbers also sit inside
+        // the flag's source range, so a second source pass would burn the
+        // ending words over the flag.
+        let mut tl = oc_timeline::Timeline::default();
+        let v = tl.first_track(TrackKind::Video).unwrap().id;
+        tl.add_clip(
+            v,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(oc_timeline::MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Default::default(),
+                },
+                start: Time::from_seconds(5.0),
+                duration: Duration::from_seconds(17.3),
+                source_in: Time::from_seconds(56.5),
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        tl.add_clip(
+            v,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(oc_timeline::MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Default::default(),
+                },
+                start: Time::from_seconds(52.2),
+                duration: Duration::from_seconds(6.0),
+                source_in: Time::from_seconds(355.5),
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        let cap = tl.add_track(TrackKind::Caption, "Captions");
+        tl.add_clip(
+            cap,
+            Clip {
+                id: ClipId::new(),
+                media_id: None,
+                kind: ClipKind::Caption {
+                    style: CaptionStyle::Stacked,
+                    cues: vec![
+                        CaptionCue {
+                            start: Time::from_seconds(5.0),
+                            end: Time::from_seconds(7.2),
+                            text: "be a bullish flag".into(),
+                            speaker: None,
+                        },
+                        CaptionCue {
+                            start: Time::from_seconds(52.2),
+                            end: Time::from_seconds(58.2),
+                            text: "is the important level though as".into(),
+                            speaker: None,
+                        },
+                    ],
+                },
+                start: Time::ZERO,
+                duration: Duration::from_seconds(58.2),
+                source_in: Time::ZERO,
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        let burned = captions_for_cut(&tl);
+        assert_eq!(burned.len(), 2, "{burned:?}");
+        assert_eq!(burned[0].text, "be a bullish flag");
+        assert!((burned[0].start - 5.0).abs() < 1e-6);
+        assert_eq!(burned[1].text, "is the important level though as");
+        assert!((burned[1].start - 52.2).abs() < 1e-6);
     }
 }

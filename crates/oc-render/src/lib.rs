@@ -56,6 +56,17 @@ pub enum RenderError {
 }
 
 #[must_use]
+pub fn still_input(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif")
+    )
+}
+
+#[must_use]
 pub fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
@@ -100,6 +111,12 @@ pub fn render(req: &RenderRequest) -> Result<RenderResult, RenderError> {
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
     for input in &compiled.inputs {
+        if still_input(input) {
+            cmd.arg("-loop")
+                .arg("1")
+                .arg("-framerate")
+                .arg(format!("{:.3}", compiled.fps));
+        }
         cmd.arg("-i").arg(input);
     }
     cmd.arg("-filter_complex")

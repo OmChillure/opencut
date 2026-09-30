@@ -39,6 +39,12 @@ fn make_color_clip(path: &std::path::Path, color: &str, seconds: f64) {
     assert!(status.success(), "lavfi encode failed");
 }
 
+#[test]
+fn a_jpeg_is_a_still_input() {
+    assert!(oc_render::still_input(std::path::Path::new("design.JPG")));
+    assert!(!oc_render::still_input(std::path::Path::new("take.mp4")));
+}
+
 fn source(id: MediaId, path: PathBuf) -> MediaSource {
     MediaSource {
         id,
@@ -156,6 +162,140 @@ fn graph_draws_title_and_grade() {
     assert!(compiled.filter.contains("drawtext"), "{}", compiled.filter);
     assert!(compiled.filter.contains("eq="), "{}", compiled.filter);
     assert!(compiled.filter.contains("1080") && compiled.filter.contains("1920"));
+}
+
+#[test]
+fn explanation_drawing_dissolves_under_the_person() {
+    let mut tl = Timeline::default();
+    let mut undo = UndoStack::new();
+    let track = tl.first_track(TrackKind::Video).unwrap().id;
+    let speaker = MediaId::new();
+    tl.add_clip(track, video_on(speaker, 0.0, 6.0)).unwrap();
+    let drawing = MediaId::new();
+    apply(
+        &mut tl,
+        &mut undo,
+        Op::AddDesign {
+            media_id: drawing,
+            at: Time::from_seconds(1.0),
+            duration: Duration::from_seconds(3.0),
+            layout: oc_core::DesignLayout::Behind,
+            text: "Head and shoulders".into(),
+        },
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join("oc-render-design");
+    let _ = std::fs::create_dir_all(&dir);
+    let talk = dir.join("talk.mp4");
+    let still = dir.join("pattern.jpg");
+    std::fs::write(&talk, b"x").unwrap();
+    std::fs::write(&still, b"x").unwrap();
+    let mut media = HashMap::new();
+    media.insert(speaker, source(speaker, talk));
+    media.insert(drawing, source(drawing, still));
+    let compiled = compile(&tl, &media, ExportPreset::Youtube1080, &dir).unwrap();
+    let draw = compiled.filter.find("drawtext").expect(&compiled.filter);
+    let person = compiled.filter.rfind("overlay=").expect(&compiled.filter);
+    assert!(
+        person > draw,
+        "the person window has to be composited after the words\n{}",
+        compiled.filter
+    );
+    assert!(compiled.filter.contains("alpha=1"), "{}", compiled.filter);
+    assert!(compiled.filter.contains("split=2"), "{}", compiled.filter);
+    assert!(
+        compiled.filter.contains("Head and shoulders"),
+        "{}",
+        compiled.filter
+    );
+}
+
+#[test]
+fn bakes_explanation_drawing_with_ffmpeg() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "oc-render-design-bake-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let talk = dir.join("talk.mp4");
+    let still = dir.join("pattern.jpg");
+    make_color_clip(&talk, "0x224466", 2.0);
+    let jpg = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=0x88c040:s=640x360:d=1",
+            "-frames:v",
+            "1",
+            still.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(jpg.success(), "still encode failed");
+
+    let mut tl = Timeline::default();
+    let mut undo = UndoStack::new();
+    let track = tl.first_track(TrackKind::Video).unwrap().id;
+    let speaker = MediaId::new();
+    tl.add_clip(track, video_on(speaker, 0.0, 2.0)).unwrap();
+    let drawing = MediaId::new();
+    apply(
+        &mut tl,
+        &mut undo,
+        Op::AddDesign {
+            media_id: drawing,
+            at: Time::from_seconds(0.4),
+            duration: Duration::from_seconds(1.2),
+            layout: oc_core::DesignLayout::Behind,
+            text: "Head and shoulders".into(),
+        },
+    )
+    .unwrap();
+    let mut media = HashMap::new();
+    media.insert(speaker, source(speaker, talk));
+    media.insert(
+        drawing,
+        MediaSource {
+            id: drawing,
+            path: still,
+            has_video: true,
+            has_audio: false,
+        },
+    );
+    let output = dir.join("out.mp4");
+    let result = render(&RenderRequest {
+        timeline: tl,
+        media,
+        output: output.clone(),
+        preset: ExportPreset::Youtube1080,
+    })
+    .expect("render");
+    assert!(result.output.is_file());
+    let meta = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            result.output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ffprobe");
+    let dur: f64 = String::from_utf8_lossy(&meta.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0.0);
+    assert!(dur > 1.6 && dur < 2.4, "expected the speaker's 2s, got {dur}");
 }
 
 #[test]

@@ -56,6 +56,7 @@ pub fn compile(
 
     let bg = oc_timeline::ffmpeg_color(&timeline.background);
     let cube_files = write_cubes(timeline, work)?;
+    let mut video_pads = split_reused_video(&mut fc, &mut next_label, timeline, &index_of);
 
     let mut vcur = if base.is_empty() {
         let d = timeline.duration().as_seconds().max(0.1);
@@ -71,6 +72,7 @@ pub fn compile(
             &base,
             media,
             &index_of,
+            &mut video_pads,
             width,
             height,
             fps,
@@ -85,6 +87,7 @@ pub fn compile(
         timeline,
         media,
         &index_of,
+        &mut video_pads,
         &vcur,
         width,
         height,
@@ -92,6 +95,19 @@ pub fn compile(
         &cube_files,
     )?;
     vcur = overlay_graphics(&mut fc, &mut next_label, timeline, &vcur, width, height)?;
+    vcur = overlay_front(
+        &mut fc,
+        &mut next_label,
+        timeline,
+        media,
+        &index_of,
+        &mut video_pads,
+        &vcur,
+        width,
+        height,
+        fps,
+        &cube_files,
+    )?;
     if timeline.letterbox && height > 8 {
         let bar = ((height as f32) * 0.12).round() as u32;
         let lab = next_label();
@@ -159,7 +175,14 @@ fn base_clips(timeline: &Timeline) -> Vec<&Clip> {
     let mut all: Vec<&Clip> = timeline
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Video && !t.muted && !t.hidden && t.name != "GFX")
+        .filter(|t| {
+            t.kind == TrackKind::Video
+                && !t.muted
+                && !t.hidden
+                && t.name != "GFX"
+                && t.name != "Design"
+                && t.name != "Front"
+        })
         .flat_map(|t| t.clips.iter())
         .filter(|c| {
             !c.disabled
@@ -210,6 +233,7 @@ fn stitch_base(
     clips: &[&Clip],
     media: &HashMap<MediaId, MediaSource>,
     index_of: &HashMap<MediaId, usize>,
+    video_pads: &mut HashMap<usize, Vec<String>>,
     width: u32,
     height: u32,
     fps: f64,
@@ -218,7 +242,18 @@ fn stitch_base(
 ) -> Result<String, RenderError> {
     let mut acc: Option<(String, f64)> = None;
     for clip in clips {
-        let v = picture_branch(fc, next_label, clip, media, index_of, width, height, fps, cubes)?;
+        let v = picture_branch(
+            fc,
+            next_label,
+            clip,
+            media,
+            index_of,
+            video_pads,
+            width,
+            height,
+            fps,
+            cubes,
+        )?;
         let dur = clip.duration.as_seconds();
         match acc {
             None => {
@@ -298,6 +333,7 @@ fn picture_branch(
     clip: &Clip,
     media: &HashMap<MediaId, MediaSource>,
     index_of: &HashMap<MediaId, usize>,
+    video_pads: &mut HashMap<usize, Vec<String>>,
     width: u32,
     height: u32,
     fps: f64,
@@ -312,7 +348,11 @@ fn picture_branch(
         let idx = *index_of.get(&id).ok_or(RenderError::UnknownMedia(id))?;
         let sin = clip.source_in.as_seconds();
         let src_dur = source_span(clip, dur);
-        format!("[{idx}:v]trim=start={sin:.4}:duration={src_dur:.4},setpts=PTS-STARTPTS")
+        let src = video_pads
+            .get_mut(&idx)
+            .and_then(|pads| pads.pop())
+            .unwrap_or_else(|| format!("{idx}:v"));
+        format!("[{src}]trim=start={sin:.4}:duration={src_dur:.4},setpts=PTS-STARTPTS")
     };
     chain.push_str(&speed_filter(clip, dur));
     if clip.look.stabilize {
@@ -327,30 +367,46 @@ fn picture_branch(
             ",crop=iw*{w:.4}:ih*{h:.4}:iw*{x:.4}:ih*{y:.4}"
         ));
     }
-    chain.push_str(&format!(
-        ",scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p"
-    ));
+    let (out_w, out_h) = clip
+        .look
+        .card
+        .map(|card| {
+            (
+                even_px(width as f32 * card.w.clamp(0.12, 1.0)),
+                even_px(height as f32 * card.h.clamp(0.12, 1.0)),
+            )
+        })
+        .unwrap_or((width, height));
+    if clip.look.card.is_some() {
+        chain.push_str(&format!(
+            ",scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},fps={fps},format=yuv420p"
+        ));
+    } else {
+        chain.push_str(&format!(
+            ",scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p"
+        ));
+    }
     if let ClipKind::Video { transform } = &clip.kind {
         if let Some(end) = clip.look.move_to {
             let frames = (dur * fps).max(1.0);
             let z0 = transform.scale.clamp(0.25, 4.0);
             let z1 = end.scale.clamp(0.25, 4.0);
-            let x0 = pan_px(transform.x, width);
-            let x1 = pan_px(end.x, width);
-            let y0 = pan_px(transform.y, height);
-            let y1 = pan_px(end.y, height);
+            let x0 = pan_px(transform.x, out_w);
+            let x1 = pan_px(end.x, out_w);
+            let y0 = pan_px(transform.y, out_h);
+            let y1 = pan_px(end.y, out_h);
             let t = ease_expr(clip.look.move_ease.unwrap_or_default(), &format!("on/{frames:.1}"));
             chain.push_str(&format!(
-                ",zoompan=z='{z0:.4}+({z1:.4}-{z0:.4})*({t})':x='(iw-iw/zoom)/2+({x0:.2}+({x1:.2}-{x0:.2})*({t}))':y='(ih-ih/zoom)/2+({y0:.2}+({y1:.2}-{y0:.2})*({t}))':d=1:s={width}x{height}:fps={fps}"
+                ",zoompan=z='{z0:.4}+({z1:.4}-{z0:.4})*({t})':x='(iw-iw/zoom)/2+({x0:.2}+({x1:.2}-{x0:.2})*({t}))':y='(ih-ih/zoom)/2+({y0:.2}+({y1:.2}-{y0:.2})*({t}))':d=1:s={out_w}x{out_h}:fps={fps}"
             ));
         } else {
             let z = transform.scale;
             if (z - 1.0).abs() > 0.01 || transform.x.abs() > 0.5 || transform.y.abs() > 0.5 {
                 let z = z.clamp(0.25, 4.0);
                 chain.push_str(&format!(
-                    ",scale=iw*{z:.4}:ih*{z:.4},crop={width}:{height}:(in_w-{width})/2+({:.2}):(in_h-{height})/2+({:.2})",
-                    pan_px(transform.x, width),
-                    pan_px(transform.y, height)
+                    ",scale=iw*{z:.4}:ih*{z:.4},crop={out_w}:{out_h}:(in_w-{out_w})/2+({:.2}):(in_h-{out_h})/2+({:.2})",
+                    pan_px(transform.x, out_w),
+                    pan_px(transform.y, out_h)
                 ));
             }
         }
@@ -361,11 +417,24 @@ fn picture_branch(
     chain.push_str(&mask_filter(clip.look.mask.as_ref(), width, height));
     let fi = clip.look.fade_in.as_seconds();
     let fo = clip.look.fade_out.as_seconds();
-    if fi > 0.04 {
-        chain.push_str(&format!(",fade=t=in:st=0:d={fi:.3}"));
-    }
-    if fo > 0.04 {
-        chain.push_str(&format!(",fade=t=out:st={:.3}:d={fo:.3}", (dur - fo).max(0.0)));
+    if clip.look.overlay && (fi > 0.04 || fo > 0.04) {
+        chain.push_str(",format=yuva420p");
+        if fi > 0.04 {
+            chain.push_str(&format!(",fade=t=in:st=0:d={fi:.3}:alpha=1"));
+        }
+        if fo > 0.04 {
+            chain.push_str(&format!(
+                ",fade=t=out:st={:.3}:d={fo:.3}:alpha=1",
+                (dur - fo).max(0.0)
+            ));
+        }
+    } else {
+        if fi > 0.04 {
+            chain.push_str(&format!(",fade=t=in:st=0:d={fi:.3}"));
+        }
+        if fo > 0.04 {
+            chain.push_str(&format!(",fade=t=out:st={:.3}:d={fo:.3}", (dur - fo).max(0.0)));
+        }
     }
     let lab = next_label();
     fc.push_str(&format!("{chain}[{lab}];"));
@@ -653,22 +722,21 @@ fn audio_fx(fx: &oc_timeline::AudioFx) -> String {
     s
 }
 
-fn overlay_broll(
-    fc: &mut String,
-    next_label: &mut impl FnMut() -> String,
-    timeline: &Timeline,
-    media: &HashMap<MediaId, MediaSource>,
-    index_of: &HashMap<MediaId, usize>,
-    base: &str,
-    width: u32,
-    height: u32,
-    fps: f64,
-    cubes: &HashMap<u32, PathBuf>,
-) -> Result<String, RenderError> {
+fn even_px(value: f32) -> u32 {
+    let n = value.round().max(2.0) as u32;
+    (n + n % 2).max(2)
+}
+
+fn broll_clips(timeline: &Timeline) -> Vec<&Clip> {
     let program = base_clips(timeline);
-    let mut cur = base.to_string();
+    let mut out = Vec::new();
     for track in &timeline.tracks {
-        if track.kind != TrackKind::Video || track.muted || track.hidden || track.name == "GFX" {
+        if track.kind != TrackKind::Video
+            || track.muted
+            || track.hidden
+            || track.name == "GFX"
+            || track.name == "Front"
+        {
             continue;
         }
         for clip in &track.clips {
@@ -681,26 +749,162 @@ fn overlay_broll(
             if program.iter().any(|c| c.id == clip.id) {
                 continue;
             }
-            let v = picture_branch(fc, next_label, clip, media, index_of, width, height, fps, cubes)?;
-            let shifted = next_label();
-            let start = clip.start.as_seconds();
-            fc.push_str(&format!(
-                "[{v}]setpts=PTS-STARTPTS+{start:.4}/TB[{shifted}];"
-            ));
-            let out = next_label();
-            let end = clip.end().as_seconds();
-            let alpha = if clip.look.mask.is_some() {
-                ":format=auto"
-            } else {
-                ""
-            };
-            fc.push_str(&format!(
-                "[{cur}][{shifted}]overlay=0:0{alpha}:enable='between(t,{start:.4},{end:.4})'[{out}];"
-            ));
-            cur = out;
+            out.push(clip);
         }
     }
+    out
+}
+
+fn front_clips(timeline: &Timeline) -> Vec<&Clip> {
+    let mut out = Vec::new();
+    for track in &timeline.tracks {
+        if track.kind != TrackKind::Video || track.muted || track.hidden || track.name != "Front" {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.disabled || !matches!(clip.kind, ClipKind::Video { .. }) || clip.media_id.is_none()
+            {
+                continue;
+            }
+            out.push(clip);
+        }
+    }
+    out
+}
+
+/// One input pad can feed the filter graph once. The speaker is also the corner window.
+fn split_reused_video(
+    fc: &mut String,
+    next_label: &mut impl FnMut() -> String,
+    timeline: &Timeline,
+    index_of: &HashMap<MediaId, usize>,
+) -> HashMap<usize, Vec<String>> {
+    let mut uses: HashMap<usize, usize> = HashMap::new();
+    let mut note = |clip: &Clip| {
+        if clip.look.generator.is_some() {
+            return;
+        }
+        let Some(id) = clip.media_id else { return };
+        let Some(&idx) = index_of.get(&id) else { return };
+        *uses.entry(idx).or_insert(0) += 1;
+    };
+    for clip in base_clips(timeline) {
+        note(clip);
+    }
+    for clip in broll_clips(timeline) {
+        note(clip);
+    }
+    for clip in front_clips(timeline) {
+        note(clip);
+    }
+    let mut pads = HashMap::new();
+    for (idx, n) in uses {
+        if n <= 1 {
+            continue;
+        }
+        let labels: Vec<String> = (0..n).map(|_| next_label()).collect();
+        let outs: String = labels.iter().map(|label| format!("[{label}]")).collect();
+        fc.push_str(&format!("[{idx}:v]split={n}{outs};"));
+        pads.insert(idx, labels);
+    }
+    pads
+}
+
+fn overlay_broll(
+    fc: &mut String,
+    next_label: &mut impl FnMut() -> String,
+    timeline: &Timeline,
+    media: &HashMap<MediaId, MediaSource>,
+    index_of: &HashMap<MediaId, usize>,
+    video_pads: &mut HashMap<usize, Vec<String>>,
+    base: &str,
+    width: u32,
+    height: u32,
+    fps: f64,
+    cubes: &HashMap<u32, PathBuf>,
+) -> Result<String, RenderError> {
+    let mut cur = base.to_string();
+    for clip in broll_clips(timeline) {
+        let v = picture_branch(
+            fc,
+            next_label,
+            clip,
+            media,
+            index_of,
+            video_pads,
+            width,
+            height,
+            fps,
+            cubes,
+        )?;
+        cur = paste_overlay(fc, next_label, clip, &v, &cur, width, height);
+    }
     Ok(cur)
+}
+
+fn overlay_front(
+    fc: &mut String,
+    next_label: &mut impl FnMut() -> String,
+    timeline: &Timeline,
+    media: &HashMap<MediaId, MediaSource>,
+    index_of: &HashMap<MediaId, usize>,
+    video_pads: &mut HashMap<usize, Vec<String>>,
+    base: &str,
+    width: u32,
+    height: u32,
+    fps: f64,
+    cubes: &HashMap<u32, PathBuf>,
+) -> Result<String, RenderError> {
+    let mut cur = base.to_string();
+    for clip in front_clips(timeline) {
+        let v = picture_branch(
+            fc,
+            next_label,
+            clip,
+            media,
+            index_of,
+            video_pads,
+            width,
+            height,
+            fps,
+            cubes,
+        )?;
+        cur = paste_overlay(fc, next_label, clip, &v, &cur, width, height);
+    }
+    Ok(cur)
+}
+
+fn paste_overlay(
+    fc: &mut String,
+    next_label: &mut impl FnMut() -> String,
+    clip: &Clip,
+    branch: &str,
+    base: &str,
+    width: u32,
+    height: u32,
+) -> String {
+    let shifted = next_label();
+    let start = clip.start.as_seconds();
+    fc.push_str(&format!(
+        "[{branch}]setpts=PTS-STARTPTS+{start:.4}/TB[{shifted}];"
+    ));
+    let out = next_label();
+    let end = clip.end().as_seconds();
+    let (ox, oy) = clip.look.card.map_or((0, 0), |card| {
+        (
+            (f64::from(card.x.clamp(0.0, 1.0)) * f64::from(width)).round() as i32,
+            (f64::from(card.y.clamp(0.0, 1.0)) * f64::from(height)).round() as i32,
+        )
+    });
+    let alpha = if clip.look.mask.is_some() || clip.look.overlay {
+        ":format=auto"
+    } else {
+        ""
+    };
+    fc.push_str(&format!(
+        "[{base}][{shifted}]overlay={ox}:{oy}{alpha}:enable='between(t,{start:.4},{end:.4})'[{out}];"
+    ));
+    out
 }
 
 fn overlay_graphics(
@@ -730,6 +934,12 @@ fn overlay_graphics(
             let alpha = clip
                 .look
                 .fade_gain(0.5 * clip.duration.as_seconds(), clip.duration.as_seconds());
+            let placed = graphic.x.zip(graphic.y).map(|(x, y)| {
+                (
+                    format!("(w*{x:.4}-text_w/2)"),
+                    format!("(h*{y:.4}-text_h/2)"),
+                )
+            });
             let out = next_label();
             match graphic.kind {
                 GraphicKind::Shape => {
@@ -759,13 +969,13 @@ fn overlay_graphics(
                     ));
                 }
                 GraphicKind::LowerThird => {
-                    let y = format!("h-{}", height / 6);
+                    let (x, y) = placed.unwrap_or_else(|| ("w/16".into(), format!("h-{}", height / 6)));
                     fc.push_str(&drawtext(
                         &cur,
                         &out,
                         &graphic.text,
                         width / 22,
-                        "w/16",
+                        &x,
                         &y,
                         &enable,
                         font.as_deref(),
@@ -788,13 +998,15 @@ fn overlay_graphics(
                     ));
                 }
                 GraphicKind::Title => {
+                    let (x, y) = placed
+                        .unwrap_or_else(|| ("(w-text_w)/2".into(), "(h-text_h)/2".into()));
                     fc.push_str(&drawtext(
                         &cur,
                         &out,
                         &graphic.text,
                         width / 12,
-                        "(w-text_w)/2",
-                        "(h-text_h)/2",
+                        &x,
+                        &y,
                         &enable,
                         font.as_deref(),
                     ));
