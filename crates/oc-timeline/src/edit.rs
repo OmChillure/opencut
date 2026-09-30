@@ -1,5 +1,5 @@
 use crate::ids::{ClipId, GroupId, LinkId, MarkerId, TrackId};
-use crate::model::{Clip, ClipKind, ClipLook, Marker, Timeline, TrackKind};
+use crate::model::{Clip, ClipKind, ClipLook, Lut, Marker, Timeline, TrackKind};
 use crate::{Result, TimelineError};
 use oc_time::{Duration, Time};
 
@@ -470,6 +470,85 @@ impl Timeline {
         self.add_clip(audio_id, audio)
     }
 
+    /// J-cut (`lead`) and L-cut (`tail`), in seconds of media time.
+    ///
+    /// Audio starts `lead` before the picture and runs `tail` past it.
+    /// The linked audio clip is written absolutely so a later move keeps the offset.
+    pub fn jl_cut(&mut self, clip_id: ClipId, lead: Duration, tail: Duration) -> Result<ClipId> {
+        let (picture_start, picture_dur, picture_in, link) = {
+            let (_, clip) = self
+                .find_clip(clip_id)
+                .ok_or(TimelineError::ClipNotFound(clip_id))?;
+            if !matches!(clip.kind, ClipKind::Video { .. }) {
+                return Err(TimelineError::TrackKindMismatch);
+            }
+            (clip.start, clip.duration, clip.source_in, clip.link_id)
+        };
+        let audio_id = match self.linked_audio_id(clip_id, link) {
+            Some(id) => id,
+            None => self.detach_audio(clip_id)?,
+        };
+        let (audio_track, _) = self
+            .locate(audio_id)
+            .ok_or(TimelineError::ClipNotFound(audio_id))?;
+        if self.tracks[audio_track].locked {
+            return Err(TimelineError::TrackLocked);
+        }
+        let lead = lead
+            .max(Duration::ZERO)
+            .min(Duration::from_ticks(picture_in.as_ticks().max(0)))
+            .min(picture_start - Time::ZERO);
+        let tail = tail.max(Duration::ZERO);
+        let audio = self
+            .clip_mut(audio_id)
+            .ok_or(TimelineError::ClipNotFound(audio_id))?;
+        audio.start = picture_start - lead;
+        audio.duration = picture_dur + lead + tail;
+        audio.source_in = picture_in - lead;
+        Ok(audio_id)
+    }
+
+    /// Store a `.cube` and point this video clip at it. Clears the named LUT preset.
+    pub fn import_cube(&mut self, clip_id: ClipId, text: &str) -> Result<u32> {
+        let mut cube = crate::parse_cube(text).map_err(TimelineError::Message)?;
+        let is_video = self
+            .find_clip(clip_id)
+            .map(|(_, clip)| matches!(clip.kind, ClipKind::Video { .. }))
+            .ok_or(TimelineError::ClipNotFound(clip_id))?;
+        if !is_video {
+            return Err(TimelineError::TrackKindMismatch);
+        }
+        let next = self
+            .cubes
+            .iter()
+            .map(|cube| cube.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        cube.id = next;
+        self.cubes.push(cube);
+        let clip = self
+            .clip_mut(clip_id)
+            .ok_or(TimelineError::ClipNotFound(clip_id))?;
+        clip.look.grade.cube = Some(next);
+        clip.look.grade.lut = Lut::None;
+        Ok(next)
+    }
+
+    fn linked_audio_id(&self, video_id: ClipId, link: Option<LinkId>) -> Option<ClipId> {
+        let link = link?;
+        self.tracks.iter().flat_map(|track| track.clips.iter()).find_map(|clip| {
+            if clip.id != video_id
+                && clip.link_id == Some(link)
+                && matches!(clip.kind, ClipKind::Audio { .. })
+            {
+                Some(clip.id)
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn add_marker(&mut self, time: Time, name: impl Into<String>, color: u8) -> MarkerId {
         let id = MarkerId::new();
         self.markers.push(Marker {
@@ -703,6 +782,70 @@ mod tests {
         assert_eq!(audio.clips.len(), 2);
         assert!((audio.clips[0].duration.as_seconds() - 1.5).abs() < 1e-6
             || (audio.clips[1].duration.as_seconds() - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn jl_cut_leads_and_trails_and_a_move_keeps_the_offset() {
+        let mut tl = Timeline::default();
+        let video_track = tl.first_track(TrackKind::Video).unwrap().id;
+        let mut picture_clip = video(2.0, 4.0);
+        picture_clip.source_in = Time::from_seconds(1.0);
+        let picture = tl.add_clip(video_track, picture_clip).unwrap();
+        let audio = tl
+            .jl_cut(
+                picture,
+                Duration::from_seconds(0.5),
+                Duration::from_seconds(0.25),
+            )
+            .unwrap();
+        let audio_clip = tl.find_clip(audio).unwrap().1;
+        assert!((audio_clip.start.as_seconds() - 1.5).abs() < 1e-4);
+        assert!((audio_clip.duration.as_seconds() - 4.75).abs() < 1e-4);
+        assert!((audio_clip.source_in.as_seconds() - 0.5).abs() < 1e-4);
+        tl.move_clip(picture, video_track, Time::from_seconds(3.0))
+            .unwrap();
+        let audio_clip = tl.find_clip(audio).unwrap().1;
+        assert!((audio_clip.start.as_seconds() - 2.5).abs() < 1e-4);
+        assert!((audio_clip.duration.as_seconds() - 4.75).abs() < 1e-4);
+        assert_eq!(audio_clip.link_id, tl.find_clip(picture).unwrap().1.link_id);
+    }
+
+    #[test]
+    fn jl_cut_clamps_the_lead_inside_the_source() {
+        let mut tl = Timeline::default();
+        let video_track = tl.first_track(TrackKind::Video).unwrap().id;
+        let mut picture_clip = video(0.2, 2.0);
+        picture_clip.source_in = Time::from_seconds(0.1);
+        let picture = tl.add_clip(video_track, picture_clip).unwrap();
+        let audio = tl
+            .jl_cut(picture, Duration::from_seconds(5.0), Duration::ZERO)
+            .unwrap();
+        let audio_clip = tl.find_clip(audio).unwrap().1;
+        assert!((audio_clip.source_in.as_seconds()).abs() < 1e-4);
+        assert!((audio_clip.start.as_seconds() - 0.1).abs() < 1e-4);
+        assert!((audio_clip.duration.as_seconds() - 2.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn import_cube_sets_the_grade_and_frame_rate_sticks() {
+        let mut tl = Timeline::default();
+        tl.set_frame_rate(oc_time::FrameRate::FPS_24);
+        tl.set_background("charcoal");
+        assert_eq!(tl.frame_rate, oc_time::FrameRate::FPS_24);
+        assert_eq!(tl.background, "#1a1a1a");
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let id = tl.add_clip(track, video(0.0, 1.0)).unwrap();
+        let cube = tl
+            .import_cube(
+                id,
+                "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+            )
+            .unwrap();
+        assert_eq!(cube, 1);
+        let grade = tl.find_clip(id).unwrap().1.look.grade;
+        assert_eq!(grade.cube, Some(1));
+        assert_eq!(grade.lut, crate::Lut::None);
+        assert_eq!(tl.cubes.len(), 1);
     }
 
     #[test]

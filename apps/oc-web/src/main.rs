@@ -375,27 +375,7 @@ fn Workspace(id: String) -> Element {
             }
         }
         if let Ok(remote) = api::list_media(&pid).await {
-            let mut library = library;
-            let mut merged = library.peek().clone();
-            for item in remote {
-                if let Some(existing) = merged.iter_mut().find(|m| m.id == item.id) {
-                    if !item.url.is_empty()
-                        && (existing.url.is_empty() || existing.url.starts_with("blob:"))
-                    {
-                        existing.url = item.url;
-                    }
-                    if existing.duration <= 0.05 && item.duration > 0.05 {
-                        existing.duration = item.duration;
-                    }
-                } else {
-                    merged.push(item);
-                }
-            }
-            library.set(merged);
-            if active.peek().is_none() {
-                let mut active = active;
-                active.set(library.peek().first().map(|item| item.url.clone()));
-            }
+            merge_library(library, active, remote);
         }
     });
 
@@ -920,18 +900,110 @@ fn AssetView(tab: AssetTab) -> Element {
                     b { "Effects" }
                     span { "Grain and vignette" }
                 }
+                button {
+                    class: "card",
+                    title: "Audio starts 12 frames before the picture",
+                    onclick: move |_| {
+                        let step = frame_step(save);
+                        live_note(save, &library.peek(), tools::jl_at(save, sel().as_deref(), &track(), at(), step, 0.0));
+                    },
+                    b { "J-cut" }
+                    span { "Sound leads the picture by 12 frames" }
+                }
+                button {
+                    class: "card",
+                    title: "Audio continues 12 frames after the picture",
+                    onclick: move |_| {
+                        let step = frame_step(save);
+                        live_note(save, &library.peek(), tools::jl_at(save, sel().as_deref(), &track(), at(), 0.0, step));
+                    },
+                    b { "L-cut" }
+                    span { "Sound holds 12 frames after the picture" }
+                }
+                label { class: "card cube-load",
+                    b { "Load .cube" }
+                    span { "3D LUT on the selected clip" }
+                    input {
+                        r#type: "file",
+                        accept: ".cube,text/plain",
+                        hidden: true,
+                        onchange: move |evt| {
+                            let save = save;
+                            let library = library;
+                            let selected = sel();
+                            let track_id = track();
+                            let at_s = at();
+                            spawn(async move {
+                                for file in evt.files() {
+                                    let Ok(bytes) = file.read_bytes().await else {
+                                        show_toast().error("Could not read the .cube file");
+                                        continue;
+                                    };
+                                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                                    live_note(
+                                        save,
+                                        &library.peek(),
+                                        tools::import_cube_text(
+                                            save,
+                                            selected.as_deref(),
+                                            &track_id,
+                                            at_s,
+                                            text,
+                                        ),
+                                    );
+                                    break;
+                                }
+                            });
+                        },
+                    }
+                }
             }
         },
-        AssetTab::Settings => rsx! {
-            studio::UndoHistory {}
-            div { class: "card-list",
-                button { class: "card",
-                    b { "Frame rate" }
-                    span { "30 fps" }
-                }
-                button { class: "card",
-                    b { "Background" }
-                    span { "Black" }
+        AssetTab::Settings => {
+            let (rate, bg, bg_name) = {
+                let engine = save.engine.read();
+                let bg = oc_core::canonical_color(&engine.background);
+                (
+                    format!("{} fps", engine.frame_rate.label()),
+                    bg.clone(),
+                    background_label(&bg),
+                )
+            };
+            rsx! {
+                studio::UndoHistory {}
+                div { class: "card-list",
+                    button {
+                        class: "card",
+                        title: "Cycle 23.976, 24, 25, 29.97, 30, 50, 59.94, 60",
+                        onclick: move |_| {
+                            let next = save.engine.peek().frame_rate.cycle();
+                            live_note(save, &library.peek(), tools::set_frame_rate(save, next));
+                        },
+                        b { "Frame rate" }
+                        span { "{rate}" }
+                    }
+                    div { class: "card settings-color",
+                        button {
+                            title: "Cycle black, white, gray, and charcoal",
+                            onclick: move |_| {
+                                let next = next_background(&save.engine.peek().background);
+                                live_note(save, &library.peek(), tools::set_background(save, next));
+                            },
+                            b { "Background" }
+                            span { "{bg_name}" }
+                        }
+                        input {
+                            r#type: "color",
+                            value: "{bg}",
+                            title: "Pick a monitor color",
+                            onchange: move |evt| {
+                                let color = evt.value();
+                                if !color.is_empty() {
+                                    live_note(save, &library.peek(), tools::set_background(save, &color));
+                                }
+                            },
+                        }
+                    }
                 }
             }
         },
@@ -1138,9 +1210,19 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
     let mut tracks = use_context::<Signal<Vec<EditorTrack>>>();
     let clock = use_context::<Clock>();
     let save = use_context::<WorkspaceSave>();
+    let selected_clip = use_context::<CtxSelected>().0;
     let _ = playing;
+    let now = playhead_now().max(*clock.current.read());
+    let chrome = media::monitor_chrome(&save.engine.read(), now, selected_clip.read().as_deref());
+    let monitor_bg = oc_core::canonical_color(&save.engine.read().background);
+    let grade_class = if chrome.cube { "preview-grade" } else { "preview-grade off" };
+    let mask_class = if chrome.mask { "preview-mask-host" } else { "preview-mask-host off" };
+    let letter_class = if chrome.letterbox { "preview-letterbox" } else { "preview-letterbox off" };
+    let handle_class = if chrome.mask { "mask-handles" } else { "mask-handles off" };
+    let gfx_class = if chrome.letterbox { "preview-gfx letterboxed" } else { "preview-gfx" };
 
     use_effect(move || {
+        media::set_selected_clip(selected_clip.read().clone());
         let playing = *clock.playing.read();
         if playing {
             return;
@@ -1187,7 +1269,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                 }
             }
             div { class: "monitor-wrap",
-                div { class: current.class(),
+                div { class: current.class(), style: "background: {monitor_bg}",
                     video {
                         class: "preview-video off",
                         preload: "auto",
@@ -1231,9 +1313,41 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                         muted: true,
                     }
                     img { class: "preview-image off", alt: "" }
+                    canvas {
+                        id: "grade-canvas",
+                        class: "{grade_class}",
+                        width: "160",
+                        height: "90",
+                    }
+                    div { class: "{mask_class}" }
+                    div { class: "{letter_class}" }
                     div { class: "preview-vignette off" }
                     div { class: "preview-grain off" }
-                    div { class: "preview-gfx" }
+                    div { class: "{gfx_class}" }
+                    div {
+                        id: "mask-handles",
+                        class: "{handle_class}",
+                        onpointerdown: move |evt| {
+                            capture_pointer(&evt);
+                            media::mask_down(&evt);
+                        },
+                        onpointermove: move |evt| media::mask_move(&evt),
+                        onpointerup: move |evt| commit_mask(save, &library.peek(), &evt),
+                        onpointercancel: move |evt| commit_mask(save, &library.peek(), &evt),
+                        div {
+                            id: "mask-box",
+                            class: "mask-box",
+                            "data-edge": "move",
+                            span { class: "mask-handle nw", "data-edge": "nw" }
+                            span { class: "mask-handle ne", "data-edge": "ne" }
+                            span { class: "mask-handle sw", "data-edge": "sw" }
+                            span { class: "mask-handle se", "data-edge": "se" }
+                            span { class: "mask-handle n", "data-edge": "n" }
+                            span { class: "mask-handle s", "data-edge": "s" }
+                            span { class: "mask-handle e", "data-edge": "e" }
+                            span { class: "mask-handle w", "data-edge": "w" }
+                        }
+                    }
                     div { class: "monitor-blank",
                         span { class: "monitor-meta", "{size}" }
                     }
@@ -1320,9 +1434,15 @@ fn Timeline() -> Element {
                     if let Key::Character(c) = evt.key() {
                         if let Some(n) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
                             if (1..10).contains(&n) {
-                                let tl = save.engine.peek();
-                                if let Some(track) = tl.tracks.iter().filter(|t| t.kind == TrackKind::Video).nth((n - 1) as usize) {
-                                    let id = track.id.to_string();
+                                let id = {
+                                    let tl = save.engine.peek();
+                                    tl.tracks
+                                        .iter()
+                                        .filter(|t| t.kind == TrackKind::Video)
+                                        .nth((n - 1) as usize)
+                                        .map(|track| track.id.to_string())
+                                };
+                                if let Some(id) = id {
                                     let _ = tools::multicam_at(save, &id, playhead_now().max(*clock.current.peek()));
                                 }
                                 return;
@@ -1436,6 +1556,7 @@ fn Timeline() -> Element {
                         let next = !*playing.read();
                         if next {
                             crate::media::set_playhead(*clock.current.peek());
+                            crate::media::resume_meter();
                             reset_tick_clock();
                         } else {
                             let mut current = clock.current;
@@ -2116,6 +2237,17 @@ fn AiSidebar(
     let mut model_name = use_signal(|| "Grok 4.6".to_string());
     let busy = use_signal(|| false);
 
+    // A schema dump already stored as a reply collapses on the next render,
+    // including a chat that was open before this build loaded.
+    use_effect(move || {
+        let current = messages.read().clone();
+        let mut next = current.clone();
+        fold_messages(&mut next);
+        if next != current {
+            messages.set(next);
+        }
+    });
+
     use_future(move || async move {
         if let Ok(list) = api::list_ai_providers().await {
             if let Some(first) = list.iter().find(|p| p.connected).or_else(|| list.first()) {
@@ -2140,15 +2272,16 @@ fn AiSidebar(
         ("Auto color grade", "Apply automatic color grading to the video clips"),
     ];
 
+    let open = *ai_open.read();
+    let panel_w = if open { *ai_width.read() } else { 40.0 };
+    let mut folded = messages.read().clone();
+    fold_messages(&mut folded);
+    let chat_empty = folded.is_empty();
     rsx! {
         aside {
-            class: if *ai_open.read() { "ai" } else { "ai collapsed" },
-            style: if *ai_open.read() {
-                format!("width: {}px", *ai_width.read())
-            } else {
-                String::new()
-            },
-            if *ai_open.read() {
+            class: if open { "ai" } else { "ai collapsed" },
+            style: "width: {panel_w}px; min-width: {panel_w}px; max-width: {panel_w}px; flex: 0 0 {panel_w}px;",
+            if open {
                 div {
                     class: "ai-resize",
                     onmousedown: move |evt| {
@@ -2160,25 +2293,28 @@ fn AiSidebar(
             div { class: "ai-head",
                 button {
                     class: "collapse",
-                    title: if *ai_open.read() { "Collapse AI" } else { "Open AI Studio" },
+                    title: if open { "Collapse AI" } else { "Open AI Studio" },
                     onclick: move |_| {
                         let next = !*ai_open.read();
                         ai_open.set(next);
                     },
-                    if *ai_open.read() {
+                    if open {
                         IconChevRight {}
                     } else {
                         IconSpark {}
                     }
                 }
-                div { class: "ai-title ai-copy",
-                    span { "AI Studio" }
-                    span { class: "badge", "Beta" }
+                if open {
+                    div { class: "ai-title ai-copy",
+                        span { "AI Studio" }
+                        span { class: "badge", "Beta" }
+                    }
+                    span { class: "kbd", "Ctrl+K" }
                 }
-                span { class: "kbd", "Ctrl+K" }
             }
+            if open {
             div { class: "ai-body",
-                if messages.read().is_empty() {
+                if chat_empty {
                     div { class: "ai-empty",
                         IconSpark {}
                         h3 { "AI Studio" }
@@ -2194,14 +2330,15 @@ fn AiSidebar(
                     }
                 } else {
                     div { class: "msgs",
-                        for row in chat_rows(&messages.read()) {
+                        for row in chat_rows(&folded) {
                             match row {
                                 ChatRow::Msg(i) => {
-                                    let msg = messages.read()[i].clone();
+                                    let msg = folded[i].clone();
                                     rsx! { { render_chat_msg(messages, msg) } }
                                 }
                                 ChatRow::Tools { start, end } => {
-                                    rsx! { { render_tool_group(messages, start, end) } }
+                                    let group = folded[start..end].to_vec();
+                                    rsx! { { render_tool_group(messages, group) } }
                                 }
                             }
                         }
@@ -2273,6 +2410,7 @@ fn AiSidebar(
                         }
                     }
                 }
+            }
             }
         }
     }
@@ -2366,21 +2504,8 @@ fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent
             }
         }
         "text" => {
-            collapse_aside(messages);
-            let text = strip_tool_lines(&ev.text);
-            if text.is_empty() {
-                return;
-            }
-            if looks_like_tool_trace(&text) {
-                push_thought(messages, text);
-                return;
-            }
             let mut list = messages.write();
-            if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Bot) {
-                last.text.push_str(&text);
-            } else {
-                list.push(ChatMsg::bot(text));
-            }
+            append_model_chunk(&mut list, &ev.text, false);
         }
         "tool" => upsert_tool(messages, ev),
         "error" => {
@@ -2391,16 +2516,8 @@ fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent
             messages.write().push(ChatMsg::bot(format!("Error: {}", ev.text)));
         }
         "thought" => {
-            if ev.text.trim().is_empty() {
-                return;
-            }
             let mut list = messages.write();
-            if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Thought) {
-                last.text.push_str(&ev.text);
-            } else {
-                let n = list.len();
-                list.push(closed_thought(ev.text, n));
-            }
+            append_model_chunk(&mut list, &ev.text, true);
         }
         "note" => {
             if !ev.text.is_empty() {
@@ -2489,7 +2606,25 @@ fn chat_rows(msgs: &[ChatMsg]) -> Vec<ChatRow> {
 fn render_chat_msg(messages: Signal<Vec<ChatMsg>>, msg: ChatMsg) -> Element {
     match msg.role {
         ChatRole::User => rsx! { div { class: "bubble user", "{msg.text}" } },
-        ChatRole::Bot => rsx! { div { class: "bubble bot", "{msg.text}" } },
+        ChatRole::Bot => {
+            let (trace, visible) = detach_trace(&msg.text);
+            if trace.is_empty() {
+                rsx! { div { class: "bubble bot", "{msg.text}" } }
+            } else {
+                let visible = visible.clone();
+                rsx! {
+                    div { class: "bubble thought",
+                        button { class: "tool-head",
+                            span { class: "tool-caret", "▸" }
+                            span { "Thinking" }
+                        }
+                    }
+                    if !visible.is_empty() {
+                        div { class: "bubble bot", "{visible}" }
+                    }
+                }
+            }
+        }
         ChatRole::Status => rsx! { div { class: "bubble status", "{msg.text}" } },
         ChatRole::Thought => {
             let open = msg.open;
@@ -2513,8 +2648,7 @@ fn render_chat_msg(messages: Signal<Vec<ChatMsg>>, msg: ChatMsg) -> Element {
     }
 }
 
-fn render_tool_group(messages: Signal<Vec<ChatMsg>>, start: usize, end: usize) -> Element {
-    let group: Vec<ChatMsg> = messages.read()[start..end].to_vec();
+fn render_tool_group(messages: Signal<Vec<ChatMsg>>, group: Vec<ChatMsg>) -> Element {
     let n = group.len();
     let active = group.iter().any(|m| m.tool_status == "pending");
     let open = group.iter().any(|m| m.open);
@@ -2577,14 +2711,6 @@ fn toggle_msg(mut messages: Signal<Vec<ChatMsg>>, id: &str) {
     }
 }
 
-fn collapse_aside(mut messages: Signal<Vec<ChatMsg>>) {
-    for msg in messages.write().iter_mut() {
-        if matches!(msg.role, ChatRole::Tool | ChatRole::Thought) {
-            msg.open = false;
-        }
-    }
-}
-
 fn short_tool_name(raw: &str) -> String {
     let s = raw.rsplit([':', '/', '@']).next().unwrap_or(raw);
     s.rsplit("__").next().unwrap_or(s).trim().to_string()
@@ -2592,10 +2718,221 @@ fn short_tool_name(raw: &str) -> String {
 
 fn looks_like_tool_trace(text: &str) -> bool {
     let t = text.trim();
-    t.contains("function_call")
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains("function_call")
         || t.contains("tool_call")
         || t.contains("sessionUpdate")
-        || (t.starts_with('{') && t.contains("\"arguments\""))
+        || t.contains("session/prompt")
+        || t.contains("$schema")
+        || t.contains("json-schema.org")
+        || t.contains("\"parameters\"")
+        || t.contains("\"input_schema\"")
+        || t.contains("\"properties\"")
+        || t.contains("scheduler_")
+        || t.contains("Usage notes:")
+        || t.contains("fire_immediately")
+        || t.contains("main-agent")
+        || t.contains("\\\"parameters\\\"")
+        || t.contains("\\\"properties\\\"")
+        || t.contains("\\\"$schema\\\"")
+    {
+        return true;
+    }
+    let punct = t
+        .chars()
+        .filter(|c| matches!(c, '{' | '}' | '"' | '[' | ']' | ':'))
+        .count();
+    t.len() > 80 && punct * 4 > t.len()
+}
+
+/// More of a schema that is already sitting in Thinking.
+#[cfg_attr(not(test), allow(dead_code))]
+fn chunk_continues_trace(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if looks_like_tool_trace(t) {
+        return true;
+    }
+    matches!(
+        t.chars().next(),
+        Some('{' | '}' | '"' | '[' | ']' | ',' | ':' | '\\')
+    )
+}
+
+/// A schema dump belongs under Thinking. A spoken paragraph after it stays visible.
+fn detach_trace(text: &str) -> (String, String) {
+    let trimmed = text.trim();
+    if !looks_like_tool_trace(trimmed) {
+        return (String::new(), trimmed.to_string());
+    }
+    if let Some((trace, tail)) = split_spoken_tail(trimmed) {
+        return (trace, tail);
+    }
+    (trimmed.to_string(), String::new())
+}
+
+fn split_spoken_tail(text: &str) -> Option<(String, String)> {
+    for sep in ["\n\n", "\\n\\n"] {
+        if let Some(idx) = text.rfind(sep) {
+            let tail = text[idx + sep.len()..].trim();
+            if spoken_reply_text(tail) {
+                return Some((text[..idx].trim().to_string(), tail.to_string()));
+            }
+        }
+    }
+    if let Some(idx) = text.rfind('}') {
+        let tail = text[idx + 1..].trim().trim_start_matches("\\n").trim();
+        if spoken_reply_text(tail) {
+            return Some((text[..=idx].trim().to_string(), tail.to_string()));
+        }
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = chars.len();
+    while i > 0 && !matches!(chars[i - 1], '{' | '}' | '"' | '[' | ']' | '\\' | '$' | ':') {
+        i -= 1;
+    }
+    if i > 0 && i < chars.len() {
+        let tail: String = chars[i..].iter().collect();
+        let tail = tail.trim();
+        if spoken_reply_text(tail) {
+            let head: String = chars[..i].iter().collect();
+            return Some((head.trim().to_string(), tail.to_string()));
+        }
+    }
+    None
+}
+
+fn prose_paragraph(text: &str) -> bool {
+    let words = text.split_whitespace().count();
+    let punct = text
+        .chars()
+        .filter(|c| matches!(c, '{' | '}' | '"' | '[' | ']'))
+        .count();
+    words >= 6 && punct < 4 && !looks_like_tool_trace(text)
+}
+
+fn spoken_reply_text(text: &str) -> bool {
+    prose_paragraph(text) && !leak_marker(text)
+}
+
+fn leak_marker(text: &str) -> bool {
+    text.contains("$schema")
+        || text.contains("json-schema")
+        || text.contains("scheduler_")
+        || text.contains("Usage notes")
+        || text.contains("fire_immediately")
+        || text.contains("main-agent")
+        || text.contains("function_call")
+        || text.contains("tool_call")
+        || text.contains("stdout")
+}
+
+/// Short schema tokens stay inside Thinking. A full spoken sentence starts the reply.
+fn chunk_stays_in_trace(thought: &str, chunk: &str) -> bool {
+    looks_like_tool_trace(thought) && !spoken_reply_text(chunk)
+}
+
+fn bot_joins_trace(bot: &str, chunk: &str) -> bool {
+    if spoken_reply_text(bot) {
+        return false;
+    }
+    looks_like_tool_trace(bot)
+        || looks_like_tool_trace(chunk)
+        || looks_like_tool_trace(&format!("{bot}{chunk}"))
+}
+
+/// Append one streamed chunk, then hide any reply bubble that is a tool schema.
+fn append_model_chunk(list: &mut Vec<ChatMsg>, chunk: &str, as_thought: bool) {
+    let chunk = if as_thought {
+        chunk.trim().to_string()
+    } else {
+        strip_tool_lines(chunk)
+    };
+    if chunk.is_empty() {
+        return;
+    }
+    for msg in list.iter_mut() {
+        if matches!(msg.role, ChatRole::Tool | ChatRole::Thought) {
+            msg.open = false;
+        }
+    }
+    let append = match list.last() {
+        Some(last) if last.role == ChatRole::Thought => {
+            as_thought || chunk_stays_in_trace(&last.text, &chunk)
+        }
+        Some(last) if last.role == ChatRole::Bot => !as_thought || bot_joins_trace(&last.text, &chunk),
+        _ => false,
+    };
+    if append {
+        list.last_mut().unwrap().text.push_str(&chunk);
+    } else if as_thought {
+        let n = list.len();
+        list.push(closed_thought(chunk, n));
+    } else {
+        list.push(ChatMsg::bot(chunk));
+    }
+    fold_messages(list);
+}
+
+/// Every schema bubble becomes a collapsed Thinking row, not only the last one.
+fn fold_messages(list: &mut Vec<ChatMsg>) {
+    let mut i = 0;
+    while i < list.len() {
+        if list[i].role != ChatRole::Bot {
+            i += 1;
+            continue;
+        }
+        let (trace, visible) = detach_trace(&list[i].text);
+        if trace.is_empty() {
+            i += 1;
+            continue;
+        }
+        list[i] = closed_thought(trace, i);
+        if !visible.trim().is_empty() {
+            list.insert(i + 1, ChatMsg::bot(visible));
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i + 1 < list.len() {
+        if list[i].role == ChatRole::Thought && list[i + 1].role == ChatRole::Thought {
+            let text = std::mem::take(&mut list[i + 1].text);
+            list[i].text.push_str(&text);
+            list[i].open = false;
+            list.remove(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    peel_thought_replies(list);
+}
+
+fn peel_thought_replies(list: &mut Vec<ChatMsg>) {
+    let mut i = 0;
+    while i < list.len() {
+        if list[i].role != ChatRole::Thought {
+            i += 1;
+            continue;
+        }
+        let (trace, visible) = detach_trace(&list[i].text);
+        if trace.is_empty() || visible.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        list[i].text = trace;
+        list[i].open = false;
+        let already = list
+            .iter()
+            .any(|msg| msg.role == ChatRole::Bot && msg.text.contains(visible.trim()));
+        if !already {
+            list.insert(i + 1, ChatMsg::bot(visible));
+        }
+        i += 1;
+    }
 }
 
 fn closed_thought(text: String, n: usize) -> ChatMsg {
@@ -2608,16 +2945,6 @@ fn closed_thought(text: String, n: usize) -> ChatMsg {
         tool_args: String::new(),
         tool_result: String::new(),
         open: false,
-    }
-}
-
-fn push_thought(mut messages: Signal<Vec<ChatMsg>>, text: String) {
-    let mut list = messages.write();
-    if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Thought) {
-        last.text.push_str(&text);
-    } else {
-        let n = list.len();
-        list.push(closed_thought(text, n));
     }
 }
 
@@ -2637,6 +2964,13 @@ fn compact_json(value: &serde_json::Value) -> String {
 }
 
 fn show_timeline(save: &mut WorkspaceSave, clock: &Clock, timeline: EngineTimeline) {
+    let previous = save.engine.peek().clone();
+    if previous != timeline {
+        let mut undo = save.undo.peek().clone();
+        undo.checkpoint_named(previous, "Director");
+        save.undo.set(undo.clone());
+        tools::store_undo(&save.project_id.peek(), &undo);
+    }
     let end = timeline.duration().as_seconds();
     save.engine.set(timeline.clone());
     save.tracks.set(bind::tracks_from_timeline(&timeline));
@@ -2644,6 +2978,69 @@ fn show_timeline(save: &mut WorkspaceSave, clock: &Clock, timeline: EngineTimeli
         let mut duration = clock.duration;
         duration.set(end);
     }
+}
+
+fn merge_library(
+    mut library: Signal<Vec<MediaItem>>,
+    mut active: Signal<Option<String>>,
+    remote: Vec<MediaItem>,
+) {
+    let mut merged = library.peek().clone();
+    for item in remote {
+        if let Some(existing) = merged.iter_mut().find(|m| m.id == item.id) {
+            if !item.url.is_empty() && (existing.url.is_empty() || existing.url.starts_with("blob:"))
+            {
+                existing.url = item.url;
+            }
+            if existing.duration <= 0.05 && item.duration > 0.05 {
+                existing.duration = item.duration;
+            }
+        } else {
+            merged.push(item);
+        }
+    }
+    library.set(merged);
+    if active.peek().is_none() {
+        active.set(library.peek().first().map(|item| item.url.clone()));
+    }
+}
+
+fn frame_step(save: WorkspaceSave) -> f64 {
+    12.0 / save.engine.peek().frame_rate.as_f64().max(1.0)
+}
+
+fn background_label(color: &str) -> String {
+    match color {
+        "#000000" => "Black".into(),
+        "#ffffff" => "White".into(),
+        "#808080" => "Gray".into(),
+        "#1a1a1a" => "Charcoal".into(),
+        other => other.to_string(),
+    }
+}
+
+fn next_background(color: &str) -> &'static str {
+    match oc_core::canonical_color(color).as_str() {
+        "#000000" => "#ffffff",
+        "#ffffff" => "#808080",
+        "#808080" => "#1a1a1a",
+        _ => "#000000",
+    }
+}
+
+fn commit_mask(
+    save: WorkspaceSave,
+    library: &[MediaItem],
+    evt: &Event<dioxus::html::PointerData>,
+) {
+    let Some((clip_id, shape)) = media::mask_up(evt) else {
+        return;
+    };
+    live_note(
+        save,
+        library,
+        tools::set_mask_at(save, Some(&clip_id), "", playhead_now(), Some(shape)),
+    );
 }
 
 fn stop_chat(mut messages: Signal<Vec<ChatMsg>>, mut busy: Signal<bool>) {
@@ -2661,17 +3058,50 @@ fn clear_status(mut messages: Signal<Vec<ChatMsg>>) {
 
 fn finish_bot_text(mut messages: Signal<Vec<ChatMsg>>, text: String) {
     clear_status(messages);
-    if text.trim().is_empty() {
-        return;
-    }
     let mut list = messages.write();
-    if let Some(last) = list.last_mut().filter(|m| m.role == ChatRole::Bot) {
-        if last.text.trim().is_empty() {
-            last.text = text;
+    settle_reply(&mut list, &text);
+}
+
+fn settle_reply(list: &mut Vec<ChatMsg>, text: &str) {
+    fold_messages(list);
+    let (trace, visible) = detach_trace(text);
+    if !trace.is_empty() {
+        if let Some(thought) = list.iter_mut().rev().find(|msg| {
+            msg.role == ChatRole::Thought && traces_overlap(&msg.text, &trace)
+        }) {
+            if trace.len() > thought.text.len() {
+                thought.text = trace;
+            }
+            thought.open = false;
+        } else {
+            let n = list.len();
+            list.push(closed_thought(trace, n));
         }
+    }
+    let visible = visible.trim();
+    if visible.is_empty() {
         return;
     }
-    list.push(ChatMsg::bot(text));
+    if list.iter().any(|msg| msg.role == ChatRole::Bot && msg.text.contains(visible)) {
+        return;
+    }
+    list.push(ChatMsg::bot(visible.to_string()));
+}
+
+fn traces_overlap(existing: &str, incoming: &str) -> bool {
+    let a = existing.trim();
+    let b = incoming.trim();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a.contains(b) || b.contains(a) {
+        return true;
+    }
+    let n = a.chars().count().min(b.chars().count()).min(80);
+    if n < 40 {
+        return false;
+    }
+    a.chars().take(n).eq(b.chars().take(n))
 }
 
 fn send_prompt(
@@ -2713,7 +3143,9 @@ fn send_prompt(
         .filter(|m| matches!(m.role, ChatRole::User | ChatRole::Bot))
         .map(|m| (m.role == ChatRole::User, m.text.clone()))
         .collect();
-    let bin: Vec<(String, String, String, f64, String)> = use_context::<Signal<Vec<MediaItem>>>()
+    let library = use_context::<Signal<Vec<MediaItem>>>();
+    let active = use_context::<CtxActive>().0;
+    let bin: Vec<(String, String, String, f64, String)> = library
         .peek()
         .iter()
         .map(|item| {
@@ -2758,6 +3190,9 @@ fn send_prompt(
                     Err(_) => resp.timeline.clone(),
                 };
                 show_timeline(&mut save, &clock, timeline);
+                if let Ok(remote) = api::list_media(&pid).await {
+                    merge_library(library, active, remote);
+                }
                 finish_bot_text(
                     messages,
                     if resp.text.trim().is_empty() {
@@ -3203,5 +3638,97 @@ mod chat_tests {
         assert!(matches!(msg.role, ChatRole::Thought));
         assert!(!msg.open);
         assert!(looks_like_tool_trace(&msg.text));
+        let schema = "fields replace old values. Usage notes:\n{\"\\$schema\":\"http://json-schema.org/draft-07/schema#\",\"name\":\"scheduler_create\",\"parameters\":{\"properties\":{}}}";
+        assert!(looks_like_tool_trace(schema));
+        assert!(chunk_continues_trace("\"interval\""));
+        assert!(!chunk_continues_trace("through the drive, the newsroom"));
+        assert!(!looks_like_tool_trace(
+            "through the drive, the newsroom, and home. I'm building that into one short."
+        ));
+        assert!(!looks_like_tool_trace("Cut a 40s reel from the interview."));
+        let mixed = format!("{schema}\n\nthrough the drive, the newsroom, and home. I'm building that into one short.");
+        let (thought, visible) = detach_trace(&mixed);
+        assert!(thought.contains("scheduler_create"));
+        assert!(visible.contains("newsroom"));
+        let (only, rest) = detach_trace(schema);
+        assert!(rest.is_empty());
+        assert!(only.contains("Usage notes:"));
+    }
+
+    fn leaked_tool_schema() -> String {
+        concat!(
+            r#"place that runs a prompt on a recurring interval.\n"#,
+            r#"Usage notes:\n- Interval format: \"5m\" (minutes), \"2h\" (hours).\n"#,
+            r#""name":"scheduler_create","parameters":{"$schema":"http://json-schema.org/draft-07/schema#","properties":{"fire_immediately":{"type":"boolean"}}}"#,
+            r#","name":"scheduler_delete","name":"scheduler_list","name":"monitor","description":"Every stdout line is a main-agent wake. Print only DONE/FAILED/CANCELLED."}"#,
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn schema_dump_folds_out_of_the_reply() {
+        let dump = leaked_tool_schema();
+        assert!(looks_like_tool_trace(&dump));
+        assert!(dump.contains("\\\"5m\\\"") || dump.contains("\"5m\""));
+        let mut msgs = vec![
+            ChatMsg::user("Make a vlog from these clips"),
+            ChatMsg::bot(dump.clone()),
+            ChatMsg::user("and keep going"),
+        ];
+        fold_messages(&mut msgs);
+        assert!(msgs.iter().any(|m| {
+            m.role == ChatRole::Thought && !m.open && m.text.contains("scheduler_create")
+        }));
+        assert!(!msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("$schema")));
+        assert_eq!(msgs[0].text, "Make a vlog from these clips");
+        assert_eq!(msgs.last().unwrap().text, "and keep going");
+        assert!(matches!(msgs.last().unwrap().role, ChatRole::User));
+    }
+
+    #[test]
+    fn streamed_schema_tokens_collapse_and_the_reply_stays() {
+        let dump = leaked_tool_schema();
+        let mut msgs = vec![ChatMsg::user("Make a vlog from these clips")];
+        let mut rest = dump.as_str();
+        while !rest.is_empty() {
+            let n = rest.len().min(17);
+            let (chunk, tail) = rest.split_at(n);
+            append_model_chunk(&mut msgs, chunk, false);
+            rest = tail;
+        }
+        assert!(msgs.iter().any(|m| m.role == ChatRole::Thought && !m.open));
+        assert!(!msgs
+            .iter()
+            .any(|m| m.role == ChatRole::Bot && looks_like_tool_trace(&m.text)));
+        append_model_chunk(
+            &mut msgs,
+            "I'll cut a 40 second vlog from the clips you imported.",
+            false,
+        );
+        assert!(msgs.iter().any(|m| {
+            m.role == ChatRole::Bot && m.text.contains("40 second")
+        }));
+        settle_reply(&mut msgs, &format!("{dump}\n\nI'll cut a 40 second vlog from the clips you imported."));
+        assert_eq!(
+            msgs.iter().filter(|m| m.role == ChatRole::Thought).count(),
+            1
+        );
+        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("40 second")));
+        assert!(!msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("$schema")));
+    }
+
+    #[test]
+    fn reply_words_leave_the_schema_thought() {
+        let mut msgs = vec![ChatMsg::user("Make a vlog")];
+        append_model_chunk(&mut msgs, &leaked_tool_schema(), false);
+        for word in [
+            "I'll ", "cut ", "a ", "40 ", "second ", "vlog ", "from ", "the ", "clips.",
+        ] {
+            append_model_chunk(&mut msgs, word, false);
+        }
+        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("clips")));
+        assert!(!msgs
+            .iter()
+            .any(|m| m.role == ChatRole::Thought && m.text.contains("clips")));
     }
 }

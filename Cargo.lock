@@ -3071,6 +3071,7 @@ dependencies = [
  "oc-db",
  "oc-media",
  "oc-providers",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

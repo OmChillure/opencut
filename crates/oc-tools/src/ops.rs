@@ -1,4 +1,4 @@
-use oc_time::{Duration, Time};
+use oc_time::{Duration, FrameRate, Time};
 use oc_timeline::{
     AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook,
     Crop, Curves, Fx, Generator, Grade, Graphic, MarkerId, MediaId, Mix, PlaceMode,
@@ -370,6 +370,25 @@ pub enum Op {
         tolerance_frames: u32,
         beats: Vec<f64>,
     },
+    /// Store the project rate. Existing clips stay where they are.
+    SetFrameRate {
+        frame_rate: FrameRate,
+    },
+    /// Monitor and letterbox fill, `#rrggbb` or a named swatch.
+    SetBackground {
+        color: String,
+    },
+    /// Parse a `.cube` and attach it to one video clip.
+    ImportCube {
+        clip_id: ClipId,
+        text: String,
+    },
+    /// Split picture and sound at a join. `lead` and `tail` are seconds.
+    JlCut {
+        clip_id: ClipId,
+        lead: Duration,
+        tail: Duration,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -687,7 +706,11 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             let clip = timeline
                 .clip_mut(*clip_id)
                 .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            let kept = clip.look.grade.cube;
             clip.look.grade = *grade;
+            if clip.look.grade.cube.is_none() {
+                clip.look.grade.cube = kept;
+            }
             format!("grade on {clip_id}")
         }
         Op::SetFx { clip_id, fx } => {
@@ -980,7 +1003,11 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
                     continue;
                 };
                 if let Some(grade) = grade {
+                    let kept = clip.look.grade.cube;
                     clip.look.grade = *grade;
+                    if clip.look.grade.cube.is_none() {
+                        clip.look.grade.cube = kept;
+                    }
                 }
                 if let Some(fx) = fx {
                     clip.look.fx = *fx;
@@ -1000,6 +1027,26 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
         } => {
             let moved = snap_joins(timeline, *tolerance_frames, beats);
             format!("snapped {moved} cuts to the beat")
+        }
+        Op::SetFrameRate { frame_rate } => {
+            timeline.set_frame_rate(*frame_rate);
+            format!("frame rate {} fps", frame_rate.label())
+        }
+        Op::SetBackground { color } => {
+            timeline.set_background(color);
+            format!("background {}", timeline.background)
+        }
+        Op::ImportCube { clip_id, text } => {
+            let id = timeline.import_cube(*clip_id, text)?;
+            format!("cube {id} on {clip_id}")
+        }
+        Op::JlCut { clip_id, lead, tail } => {
+            let id = timeline.jl_cut(*clip_id, *lead, *tail)?;
+            format!(
+                "J/L {id} lead {:.2}s tail {:.2}s",
+                lead.as_seconds(),
+                tail.as_seconds()
+            )
         }
     };
     undo.label_last(&note);

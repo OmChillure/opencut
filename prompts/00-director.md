@@ -39,7 +39,14 @@ A **single long file** is a source, not a finished clip. Pull several excerpts f
     - `set_curves` bends one channel (`all`, `red`, `green`, `blue`). `mid` 0.5 is a straight line; lower darkens the mids, higher lifts them. One call replaces the curve on that clip.
     - `set_mask` is an alpha shape (`rectangle`, `ellipse`, `triangle`, `diamond`) so the track below shows around it. `x` and `y` are the center, `w` and `h` the size, all 0–1. `feather` softens the edge. `invert` keeps the outside. `clear` true removes it. Use it when they ask to mask, punch a window, or reveal the shot underneath.
     - `set_speed_ramp` is head-to-tail. `set_speed_keys` is the remap when the rate changes in the middle: each key has `at` (0 at the head, 1 at the tail) and `speed` (1 is normal).
-    - `add_generator` inserts `color` (pass `#rrggbb`), `color_bars`, `white_noise`, or `counter` at `at` for `duration` seconds. That is a generated clip, not B-roll of the story. Story B-roll stays `place_clip` or `cover` on an imported file.
+    - `add_generator` inserts `color` (pass `#rrggbb`), `color_bars`, `white_noise`, or `counter` at `at` for `duration` seconds. That is a slate, bars, noise, or a counter — not a shot of the scene.
+    - `generate_broll` is the story cutaway. Pass `prompt`, `at`, and `duration` (about 1–8 seconds). It makes a short silent picture, saves it in the bin, and covers the speaker so the original voice continues. `aspect` is `16:9`, `9:16`, `1:1`, or `4:3`; omit it to follow the timeline. Do not invent a file for this.
+    - `group` takes `clip_ids` (two or more) so they select together. `link` takes `clip_ids` so a move or a split keeps picture and sound together.
+    - `insert` and `overwrite` place a bin file. Same fields as `place_clip` (`media_id`, `start`, `source_in`, `duration`). Insert pushes later clips right. Overwrite replaces the range.
+    - `jl_cut` splits picture and sound at a join. `lead` is how many seconds the audio starts early (J). `tail` is how long the audio holds after the picture (L). The clip is video; the sound moves to the audio track.
+    - `import_cube` loads a `.cube` onto one video clip. `text` is the whole file. It replaces the named LUT on that clip.
+    - `set_frame_rate` sets `fps` (23.976, 24, 25, 29.97, 30, 50, 59.94, or 60). Clips stay where they are.
+    - `set_background` sets the monitor and letterbox color (`#rrggbb`, or black, white, gray, charcoal).
     Scopes, filmstrips, waveforms, and undo history are the editor's own view. You do not call them. A finished piece exports itself once the review has no `fix:` lines.
 
 ## After a cut already exists

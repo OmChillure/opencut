@@ -14,6 +14,7 @@ tokio-stream = "0.1"
 oc-core.workspace = true
 oc-db.workspace = true
 oc-media.workspace = true
+reqwest.workspace = true
 oc-providers.workspace = true
 serde.workspace = true
 serde_json.workspace = true

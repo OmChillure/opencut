@@ -380,9 +380,12 @@ pub struct Grade {
     pub gain: f32,
     #[serde(default)]
     pub lut: Lut,
+    /// Id into [`Timeline::cubes`]. When set, export uses that `.cube` instead of `lut`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cube: Option<u32>,
 }
 
-/// Named looks. Applied as filter chains, not a loaded .cube file.
+/// Named looks. A loaded `.cube` replaces the preset when [`Grade::cube`] is set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lut {
@@ -463,6 +466,7 @@ impl Grade {
             && self.gamma.abs() < 1e-4
             && self.gain.abs() < 1e-4
             && self.lut == Lut::None
+            && self.cube.is_none()
     }
 }
 
@@ -1074,9 +1078,19 @@ pub struct Timeline {
     /// Black bars top and bottom. The renderer draws them on export.
     #[serde(default)]
     pub letterbox: bool,
+    /// Monitor and letterbox fill. `#rrggbb`.
+    #[serde(default = "black_background")]
+    pub background: String,
+    /// Loaded `.cube` files. Clips point at one by [`Grade::cube`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cubes: Vec<crate::lut::CubeLut>,
     /// Last submit_edit plan. Revisions rebuild from this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_plan: Option<EditPlan>,
+}
+
+fn black_background() -> String {
+    "#000000".into()
 }
 
 impl Default for Timeline {
@@ -1102,8 +1116,18 @@ impl Timeline {
             mark_out: None,
             master: Mix::default(),
             letterbox: false,
+            background: black_background(),
+            cubes: Vec::new(),
             edit_plan: None,
         }
+    }
+
+    pub fn set_frame_rate(&mut self, rate: FrameRate) {
+        self.frame_rate = rate;
+    }
+
+    pub fn set_background(&mut self, color: &str) {
+        self.background = crate::canonical_color(color);
     }
 
     #[must_use]

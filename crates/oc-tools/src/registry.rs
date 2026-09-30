@@ -180,7 +180,7 @@ const ALL: &[ToolSpec] = &[
     ToolSpec {
         id: ToolId::DetachAudio,
         label: "Detach audio",
-        tip: "Copy this clip's audio onto an audio track",
+        tip: "Sound moves to the audio track",
         shortcut: Some("D"),
         kind: ToolKind::Action,
         group: ToolGroup::Cut,

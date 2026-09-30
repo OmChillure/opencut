@@ -14,8 +14,9 @@ pub use oc_tools::{
 };
 pub use oc_time::{Duration, FrameRate, Time};
 pub use oc_timeline::{
-    AlphaShape, AudioFx, CaptionCue, Clip, ClipId, ClipKind, ClipLook, Crop, CurvePoint, Curves,
-    CaptionStyle, Ease, EditPlan, EditSlot, Fx, Generator, Grade, Graphic, GraphicKind, GroupId, LinkId, Lut,
-    Marker, MarkerId, MaskShape, MediaId, Mix, PlaceMode, Project, ProjectId, SpeedKey, Timeline,
-    Track, TrackId, TrackKind, Transform, TransitionKind, UndoStack,
+    AlphaShape, AudioFx, CaptionCue, Clip, ClipId, ClipKind, ClipLook, Crop, CubeLut, CurvePoint,
+    Curves, CaptionStyle, Ease, EditPlan, EditSlot, Fx, Generator, Grade, Graphic, GraphicKind,
+    GroupId, LinkId, Lut, Marker, MarkerId, MaskShape, MediaId, Mix, PlaceMode, Project, ProjectId,
+    SpeedKey, Timeline, Track, TrackId, TrackKind, Transform, TransitionKind, UndoStack,
+    canonical_color, ffmpeg_color, parse_cube,
 };

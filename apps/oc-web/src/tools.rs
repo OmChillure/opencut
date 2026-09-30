@@ -580,6 +580,47 @@ pub fn set_mask_at(
     run_ops(save, vec![Op::SetMask { clip_id, mask }])
 }
 
+pub fn set_frame_rate(
+    save: WorkspaceSave,
+    rate: oc_core::FrameRate,
+) -> Result<Vec<String>, String> {
+    run_ops(save, vec![Op::SetFrameRate { frame_rate: rate }])
+}
+
+pub fn set_background(save: WorkspaceSave, color: &str) -> Result<Vec<String>, String> {
+    run_ops(save, vec![Op::SetBackground { color: color.to_string() }])
+}
+
+pub fn import_cube_text(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    text: String,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(save, vec![Op::ImportCube { clip_id, text }])
+}
+
+pub fn jl_at(
+    save: WorkspaceSave,
+    selected: Option<&str>,
+    track_id: &str,
+    at: f64,
+    lead: f64,
+    tail: f64,
+) -> Result<Vec<String>, String> {
+    let clip_id = selected_or_playhead(save, selected, track_id, at)?;
+    run_ops(
+        save,
+        vec![Op::JlCut {
+            clip_id,
+            lead: Duration::from_seconds(lead.max(0.0)),
+            tail: Duration::from_seconds(tail.max(0.0)),
+        }],
+    )
+}
+
 pub fn set_speed_keys_at(
     save: WorkspaceSave,
     selected: Option<&str>,

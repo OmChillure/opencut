@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use dioxus::html::PointerData;
 use dioxus::prelude::*;
@@ -1275,12 +1275,26 @@ fn seek_video(video: &HtmlVideoElement, time: f64, force: bool) {
 }
 
 pub fn css_filter(grade: oc_core::Grade, fx: oc_core::Fx) -> String {
-    let b = (1.0 + grade.exposure).clamp(0.2, 2.4);
-    let c = (1.0 + grade.contrast).clamp(0.2, 2.4);
-    let s = (1.0 + grade.saturation).clamp(0.0, 2.4);
+    let brightness = (1.0 + grade.exposure + grade.gain * 0.35 + grade.lift * 0.15).clamp(0.15, 2.8);
+    let contrast = (1.0 + grade.contrast + grade.gamma * 0.45).clamp(0.2, 2.8);
+    let saturation = (1.0 + grade.saturation).clamp(0.0, 2.6);
     let hue = grade.temperature * 18.0;
     let blur = fx.blur * 8.0;
-    format!("brightness({b:.3}) contrast({c:.3}) saturate({s:.3}) hue-rotate({hue:.1}deg) blur({blur:.2}px)")
+    let mut filter = format!(
+        "brightness({brightness:.3}) contrast({contrast:.3}) saturate({saturation:.3}) hue-rotate({hue:.1}deg) blur({blur:.2}px)"
+    );
+    if grade.cube.is_none() {
+        let named = match grade.lut {
+            oc_core::Lut::None => "",
+            oc_core::Lut::Film => " sepia(0.35) contrast(1.05) saturate(0.9)",
+            oc_core::Lut::Cool => " hue-rotate(14deg) saturate(1.08)",
+            oc_core::Lut::Warm => " sepia(0.28) saturate(1.12)",
+            oc_core::Lut::TealOrange => " hue-rotate(-10deg) saturate(1.28) contrast(1.06)",
+            oc_core::Lut::Mono => " grayscale(1)",
+        };
+        filter.push_str(named);
+    }
+    filter
 }
 
 fn mix_preview_css(
@@ -1405,6 +1419,9 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
     let mut graphics: Vec<(String, String)> = Vec::new();
     let mut next_url = String::new();
     let mut next_src = 0.0_f64;
+    let mut mask: Option<oc_core::AlphaShape> = None;
+    let mut cube_id: Option<u32> = None;
+    let mut look_clip = String::new();
 
     for track in &engine.tracks {
         if track.hidden || track.muted {
@@ -1422,6 +1439,9 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
                     pan_x = transform.x;
                     pan_y = transform.y;
                     filter = css_filter(clip.look.grade, clip.look.fx);
+                    mask = clip.look.mask;
+                    cube_id = clip.look.grade.cube;
+                    look_clip = clip.id.to_string();
                     opacity = fade;
                     vignette = clip.look.fx.vignette;
                     grain = clip.look.fx.grain;
@@ -1486,6 +1506,21 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
         }
     }
 
+    if let Some(clip) = selected_video(engine, t) {
+        filter = css_filter(clip.look.grade, clip.look.fx);
+        mask = clip.look.mask;
+        cube_id = clip.look.grade.cube;
+        look_clip = clip.id.to_string();
+        if let oc_core::ClipKind::Video { transform } = &clip.kind {
+            zoom = transform.scale;
+            pan_x = transform.x;
+            pan_y = transform.y;
+        }
+        vignette = clip.look.fx.vignette;
+        grain = clip.look.fx.grain;
+    }
+    remember_look(engine, &filter, cube_id, mask, &look_clip);
+
     if let Some(video) = preview_video() {
         let (a, mix_tf, clip_path, extra_filter) = mix_preview_css(kind, mix, opacity, &filter);
         let transform = if (zoom - 1.0).abs() > 0.01 || pan_x.abs() > 0.5 || pan_y.abs() > 0.5 {
@@ -1546,6 +1581,12 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
         set_class_off(".preview-grain", grain < 0.02);
     }
     if let Some(layer) = doc.query_selector(".preview-gfx").ok().flatten() {
+        let gfx_class = if engine.letterbox {
+            "preview-gfx letterboxed"
+        } else {
+            "preview-gfx"
+        };
+        let _ = layer.set_attribute("class", gfx_class);
         layer.set_inner_html("");
         for (cls, text) in graphics {
             if let Some(node) = doc.create_element("div").ok() {
@@ -1555,6 +1596,8 @@ pub fn apply_monitor_look(engine: &oc_core::Timeline, library: &[MediaItem], now
             }
         }
     }
+    paint_monitor_matte(&doc, engine.letterbox);
+    let _ = paint_grade_canvas();
 }
 
 pub fn sync_monitor(library: &[MediaItem], tracks: &[EditorTrack], now: f64, playing: bool) {
@@ -1887,4 +1930,584 @@ pub fn format_clock(secs: f64) -> String {
     let m = (total / 60.0) as u32;
     let s = (total % 60.0) as u32;
     format!("{m:02}:{s:02}")
+}
+
+const GRADE_W: u32 = 160;
+const GRADE_H: u32 = 90;
+
+#[derive(Clone)]
+struct LiveLook {
+    filter: String,
+    cube_id: Option<u32>,
+    cube: Option<oc_core::CubeLut>,
+    mask: Option<oc_core::AlphaShape>,
+    letterbox: bool,
+    background: String,
+    clip_id: String,
+}
+
+impl Default for LiveLook {
+    fn default() -> Self {
+        Self {
+            filter: "none".into(),
+            cube_id: None,
+            cube: None,
+            mask: None,
+            letterbox: false,
+            background: "#000000".into(),
+            clip_id: String::new(),
+        }
+    }
+}
+
+struct MaskGesture {
+    edge: String,
+    x0: f64,
+    y0: f64,
+    origin: oc_core::AlphaShape,
+    width: f64,
+    height: f64,
+}
+
+thread_local! {
+    static SELECTED: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LIVE: RefCell<LiveLook> = RefCell::new(LiveLook {
+        filter: String::new(),
+        cube_id: None,
+        cube: None,
+        mask: None,
+        letterbox: false,
+        background: String::new(),
+        clip_id: String::new(),
+    });
+    static GESTURE: RefCell<Option<MaskGesture>> = const { RefCell::new(None) };
+    static METER: RefCell<Option<web_sys::AnalyserNode>> = const { RefCell::new(None) };
+    static METER_CTX: RefCell<Option<web_sys::AudioContext>> = const { RefCell::new(None) };
+}
+
+pub struct MonitorChrome {
+    pub letterbox: bool,
+    pub mask: bool,
+    pub cube: bool,
+}
+
+/// What the monitor overlays should show for this playhead.
+/// `selected` wins when it is a video clip under the playhead.
+pub fn monitor_chrome(
+    engine: &oc_core::Timeline,
+    now: f64,
+    selected: Option<&str>,
+) -> MonitorChrome {
+    let t = oc_core::Time::from_seconds(now);
+    let mut mask = None;
+    let mut cube = None;
+    for track in &engine.tracks {
+        if track.hidden || track.muted {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.disabled || !clip.contains(t) {
+                continue;
+            }
+            if matches!(clip.kind, oc_core::ClipKind::Video { .. }) {
+                mask = clip.look.mask;
+                cube = clip.look.grade.cube;
+            }
+        }
+    }
+    if let Some(raw) = selected.and_then(|raw| Uuid::parse_str(raw).ok()) {
+        if let Some((_, clip)) = engine.find_clip(oc_core::ClipId::from_uuid(raw)) {
+            if !clip.disabled
+                && clip.contains(t)
+                && matches!(clip.kind, oc_core::ClipKind::Video { .. })
+            {
+                mask = clip.look.mask;
+                cube = clip.look.grade.cube;
+            }
+        }
+    }
+    MonitorChrome {
+        letterbox: engine.letterbox,
+        mask: mask.is_some(),
+        cube: cube.is_some(),
+    }
+}
+
+pub fn set_selected_clip(id: Option<String>) {
+    SELECTED.with(|slot| *slot.borrow_mut() = id.filter(|raw| !raw.is_empty()));
+}
+
+fn selected_video(engine: &oc_core::Timeline, at: oc_core::Time) -> Option<&oc_core::Clip> {
+    let raw = SELECTED.with(|slot| slot.borrow().clone())?;
+    let id = Uuid::parse_str(&raw).ok()?;
+    let (_, clip) = engine.find_clip(oc_core::ClipId::from_uuid(id))?;
+    if clip.disabled || !clip.contains(at) || !matches!(clip.kind, oc_core::ClipKind::Video { .. }) {
+        None
+    } else {
+        Some(clip)
+    }
+}
+
+fn remember_look(
+    engine: &oc_core::Timeline,
+    filter: &str,
+    cube_id: Option<u32>,
+    mask: Option<oc_core::AlphaShape>,
+    clip_id: &str,
+) {
+    LIVE.with(|slot| {
+        let mut look = slot.borrow_mut();
+        look.filter = filter.to_string();
+        look.mask = mask;
+        look.letterbox = engine.letterbox;
+        look.background = if engine.background.is_empty() {
+            "#000000".into()
+        } else {
+            engine.background.clone()
+        };
+        look.clip_id = clip_id.to_string();
+        if look.cube_id != cube_id {
+            look.cube = cube_id.and_then(|id| engine.cubes.iter().find(|cube| cube.id == id).cloned());
+            look.cube_id = cube_id;
+        }
+    });
+}
+
+fn paint_monitor_matte(doc: &web_sys::Document, letterbox: bool) {
+    let (mask, background, dragging) = LIVE.with(|slot| {
+        let look = slot.borrow();
+        (look.mask, look.background.clone(), GESTURE.with(|g| g.borrow().is_some()))
+    });
+    if let Some(host) = doc.query_selector(".preview-mask-host").ok().flatten() {
+        if let Some(mask) = mask {
+            host.set_inner_html(&mask_svg(&mask, &background));
+            set_class_off(".preview-mask-host", false);
+        } else {
+            host.set_inner_html("");
+            set_class_off(".preview-mask-host", true);
+        }
+    }
+    if let Some(bars) = doc.query_selector(".preview-letterbox").ok().flatten() {
+        let _ = bars.set_attribute(
+            "style",
+            &format!(
+                "background: linear-gradient(to bottom, {background} 12%, transparent 12%, transparent 88%, {background} 88%)"
+            ),
+        );
+    }
+    set_class_off(".preview-letterbox", !letterbox);
+    if !dragging {
+        if let Some(mask) = mask {
+            place_mask_box(&mask);
+            set_class_off("#mask-handles", false);
+        } else {
+            set_class_off("#mask-handles", true);
+        }
+    }
+}
+
+fn mask_svg(mask: &oc_core::AlphaShape, background: &str) -> String {
+    let (outside, inside) = if mask.invert {
+        ("black", "white")
+    } else {
+        ("white", "black")
+    };
+    let shape = match mask.shape {
+        oc_core::MaskShape::Ellipse => format!(
+            r#"<ellipse cx="{:.4}" cy="{:.4}" rx="{:.4}" ry="{:.4}" fill="{inside}"/>"#,
+            mask.x,
+            mask.y,
+            mask.w * 0.5,
+            mask.h * 0.5
+        ),
+        oc_core::MaskShape::Diamond => {
+            let hw = mask.w * 0.5;
+            let hh = mask.h * 0.5;
+            format!(
+                r#"<polygon points="{x:.4},{top:.4} {right:.4},{y:.4} {x:.4},{bottom:.4} {left:.4},{y:.4}" fill="{inside}"/>"#,
+                x = mask.x,
+                y = mask.y,
+                top = mask.y - hh,
+                right = mask.x + hw,
+                bottom = mask.y + hh,
+                left = mask.x - hw
+            )
+        }
+        oc_core::MaskShape::Triangle => {
+            let hw = mask.w * 0.5;
+            let hh = mask.h * 0.5;
+            format!(
+                r#"<polygon points="{x:.4},{top:.4} {right:.4},{bottom:.4} {left:.4},{bottom:.4}" fill="{inside}"/>"#,
+                x = mask.x,
+                top = mask.y - hh,
+                right = mask.x + hw,
+                left = mask.x - hw,
+                bottom = mask.y + hh
+            )
+        }
+        oc_core::MaskShape::Rectangle => format!(
+            r#"<rect x="{:.4}" y="{:.4}" width="{:.4}" height="{:.4}" fill="{inside}"/>"#,
+            mask.x - mask.w * 0.5,
+            mask.y - mask.h * 0.5,
+            mask.w,
+            mask.h
+        ),
+    };
+    let blur = if mask.feather > 0.01 {
+        format!(
+            r#"<filter id="oc-feather"><feGaussianBlur stdDeviation="{:.4}"/></filter>"#,
+            mask.feather * 0.04
+        )
+    } else {
+        String::new()
+    };
+    let filter = if mask.feather > 0.01 {
+        r#" filter="url(#oc-feather)""#
+    } else {
+        ""
+    };
+    format!(
+        r#"<svg viewBox="0 0 1 1" preserveAspectRatio="none"><defs>{blur}<mask id="oc-matte" maskContentUnits="objectBoundingBox"><g{filter}><rect x="0" y="0" width="1" height="1" fill="{outside}"/>{shape}</g></mask></defs><rect x="0" y="0" width="1" height="1" fill="{background}" mask="url(#oc-matte)"/></svg>"#
+    )
+}
+
+fn place_mask_box(mask: &oc_core::AlphaShape) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(box_el) = doc.get_element_by_id("mask-box") else {
+        return;
+    };
+    let left = (mask.x - mask.w * 0.5) * 100.0;
+    let top = (mask.y - mask.h * 0.5) * 100.0;
+    let _ = box_el.set_attribute(
+        "style",
+        &format!(
+            "left:{left:.2}%;top:{top:.2}%;width:{:.2}%;height:{:.2}%",
+            mask.w * 100.0,
+            mask.h * 100.0
+        ),
+    );
+}
+
+pub fn mask_down(evt: &Event<PointerData>) {
+    let Some(edge) = pointer_edge(evt) else {
+        return;
+    };
+    let Some(origin) = LIVE.with(|slot| slot.borrow().mask) else {
+        return;
+    };
+    let origin_pt = evt.client_coordinates();
+    let x0 = origin_pt.x;
+    let y0 = origin_pt.y;
+    let (width, height) = monitor_size();
+    GESTURE.with(|slot| {
+        *slot.borrow_mut() = Some(MaskGesture {
+            edge,
+            x0,
+            y0,
+            origin,
+            width,
+            height,
+        })
+    });
+}
+
+pub fn mask_move(evt: &Event<PointerData>) {
+    let Some(next) = dragged_mask(evt) else {
+        return;
+    };
+    place_mask_box(&next);
+    let background = LIVE.with(|slot| slot.borrow().background.clone());
+    if let Some(host) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(".preview-mask-host").ok().flatten())
+    {
+        host.set_inner_html(&mask_svg(&next, &background));
+    }
+}
+
+pub fn mask_up(evt: &Event<PointerData>) -> Option<(String, oc_core::AlphaShape)> {
+    let shape = dragged_mask(evt);
+    let clip_id = LIVE.with(|slot| slot.borrow().clip_id.clone());
+    GESTURE.with(|slot| *slot.borrow_mut() = None);
+    let shape = shape?;
+    if clip_id.is_empty() {
+        None
+    } else {
+        Some((clip_id, shape))
+    }
+}
+
+fn dragged_mask(evt: &Event<PointerData>) -> Option<oc_core::AlphaShape> {
+    GESTURE.with(|slot| {
+        let gesture = slot.borrow();
+        let gesture = gesture.as_ref()?;
+        let point = evt.client_coordinates();
+        let dx = ((point.x - gesture.x0) / gesture.width.max(1.0)) as f32;
+        let dy = ((point.y - gesture.y0) / gesture.height.max(1.0)) as f32;
+        let mut shape = gesture.origin;
+        match gesture.edge.as_str() {
+            "e" => {
+                shape.w += dx;
+                shape.x += dx * 0.5;
+            }
+            "w" => {
+                shape.w -= dx;
+                shape.x += dx * 0.5;
+            }
+            "s" => {
+                shape.h += dy;
+                shape.y += dy * 0.5;
+            }
+            "n" => {
+                shape.h -= dy;
+                shape.y += dy * 0.5;
+            }
+            "ne" => {
+                shape.w += dx;
+                shape.x += dx * 0.5;
+                shape.h -= dy;
+                shape.y += dy * 0.5;
+            }
+            "nw" => {
+                shape.w -= dx;
+                shape.x += dx * 0.5;
+                shape.h -= dy;
+                shape.y += dy * 0.5;
+            }
+            "se" => {
+                shape.w += dx;
+                shape.x += dx * 0.5;
+                shape.h += dy;
+                shape.y += dy * 0.5;
+            }
+            "sw" => {
+                shape.w -= dx;
+                shape.x += dx * 0.5;
+                shape.h += dy;
+                shape.y += dy * 0.5;
+            }
+            _ => {
+                shape.x += dx;
+                shape.y += dy;
+            }
+        }
+        shape.w = shape.w.clamp(0.05, 1.0);
+        shape.h = shape.h.clamp(0.05, 1.0);
+        shape.x = shape.x.clamp(shape.w * 0.5, 1.0 - shape.w * 0.5);
+        shape.y = shape.y.clamp(shape.h * 0.5, 1.0 - shape.h * 0.5);
+        Some(shape)
+    })
+}
+
+fn pointer_edge(evt: &Event<PointerData>) -> Option<String> {
+    let data = evt.data();
+    let native = data.downcast::<web_sys::PointerEvent>()?;
+    let target = native.target()?.dyn_into::<web_sys::Element>().ok()?;
+    let el = if target.has_attribute("data-edge") {
+        target
+    } else {
+        target.closest("[data-edge]").ok().flatten()?
+    };
+    el.get_attribute("data-edge")
+}
+
+fn monitor_size() -> (f64, f64) {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(".monitor").ok().flatten())
+        .map(|el| {
+            let rect = el.get_bounding_client_rect();
+            (rect.width().max(1.0), rect.height().max(1.0))
+        })
+        .unwrap_or((16.0, 9.0))
+}
+
+pub fn graded_frame() -> Option<Vec<u8>> {
+    paint_grade_canvas()
+}
+
+fn paint_grade_canvas() -> Option<Vec<u8>> {
+    let video = preview_video()?;
+    if video.ready_state() < 2 {
+        set_class_off("#grade-canvas", true);
+        return None;
+    }
+    let doc = web_sys::window()?.document()?;
+    let canvas = doc
+        .get_element_by_id("grade-canvas")?
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .ok()?;
+    canvas.set_width(GRADE_W);
+    canvas.set_height(GRADE_H);
+    let ctx = canvas
+        .get_context("2d")
+        .ok()
+        .flatten()?
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .ok()?;
+    let (filter, show_cube) = LIVE.with(|slot| {
+        let look = slot.borrow();
+        (look.filter.clone(), look.cube_id.is_some())
+    });
+    let _ = ctx.set_filter(&filter);
+    ctx.draw_image_with_html_video_element_and_dw_and_dh(
+        &video,
+        0.0,
+        0.0,
+        GRADE_W as f64,
+        GRADE_H as f64,
+    )
+    .ok()?;
+    let _ = ctx.set_filter("none");
+    let image = ctx
+        .get_image_data(0.0, 0.0, GRADE_W as f64, GRADE_H as f64)
+        .ok()?;
+    let mut pixels = image.data().0;
+    apply_live_pixels(&mut pixels, GRADE_W, GRADE_H);
+    set_class_off("#grade-canvas", !show_cube);
+    if show_cube {
+        let array = js_sys::Uint8ClampedArray::from(pixels.as_slice());
+        if let Ok(painted) = web_sys::ImageData::new_with_js_u8_clamped_array_and_sh(
+            &array,
+            GRADE_W,
+            GRADE_H,
+        ) {
+            let _ = ctx.put_image_data(&painted, 0.0, 0.0);
+        }
+    }
+    Some(pixels)
+}
+
+fn apply_live_pixels(pixels: &mut [u8], width: u32, height: u32) {
+    LIVE.with(|slot| {
+        let look = slot.borrow();
+        if let Some(cube) = look.cube.as_ref() {
+            for chunk in pixels.chunks_mut(4) {
+                if chunk.len() < 3 {
+                    break;
+                }
+                let sample = cube.sample(
+                    chunk[0] as f32 / 255.0,
+                    chunk[1] as f32 / 255.0,
+                    chunk[2] as f32 / 255.0,
+                );
+                chunk[0] = (sample[0].clamp(0.0, 1.0) * 255.0) as u8;
+                chunk[1] = (sample[1].clamp(0.0, 1.0) * 255.0) as u8;
+                chunk[2] = (sample[2].clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        }
+        let bg = hex_rgb(&look.background);
+        if let Some(mask) = look.mask {
+            for y in 0..height {
+                for x in 0..width {
+                    let u = (x as f32 + 0.5) / width as f32;
+                    let v = (y as f32 + 0.5) / height as f32;
+                    let inside = shape_contains(mask, u, v);
+                    let cover = if mask.invert { inside } else { !inside };
+                    if cover {
+                        let i = ((y * width + x) * 4) as usize;
+                        pixels[i] = bg.0;
+                        pixels[i + 1] = bg.1;
+                        pixels[i + 2] = bg.2;
+                    }
+                }
+            }
+        }
+        if look.letterbox {
+            let bar = ((height as f32) * 0.12).round() as u32;
+            for y in 0..height {
+                if y >= bar && y + bar < height {
+                    continue;
+                }
+                for x in 0..width {
+                    let i = ((y * width + x) * 4) as usize;
+                    pixels[i] = bg.0;
+                    pixels[i + 1] = bg.1;
+                    pixels[i + 2] = bg.2;
+                }
+            }
+        }
+    });
+}
+
+fn shape_contains(mask: oc_core::AlphaShape, u: f32, v: f32) -> bool {
+    let hw = (mask.w * 0.5).max(0.001);
+    let hh = (mask.h * 0.5).max(0.001);
+    let nx = (u - mask.x) / hw;
+    let ny = (v - mask.y) / hh;
+    match mask.shape {
+        oc_core::MaskShape::Rectangle => nx.abs() <= 1.0 && ny.abs() <= 1.0,
+        oc_core::MaskShape::Ellipse => nx * nx + ny * ny <= 1.0,
+        oc_core::MaskShape::Diamond => nx.abs() + ny.abs() <= 1.0,
+        oc_core::MaskShape::Triangle => {
+            let t = (ny + 1.0) * 0.5;
+            t >= 0.0 && t <= 1.0 && nx.abs() <= t
+        }
+    }
+}
+
+fn hex_rgb(color: &str) -> (u8, u8, u8) {
+    let hex = oc_core::canonical_color(color);
+    let bytes = hex.trim_start_matches('#');
+    let parse = |range: std::ops::Range<usize>| {
+        u8::from_str_radix(bytes.get(range).unwrap_or("00"), 16).unwrap_or(0)
+    };
+    (parse(0..2), parse(2..4), parse(4..6))
+}
+
+pub fn resume_meter() {
+    ensure_meter();
+    METER_CTX.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            let _ = ctx.resume();
+        }
+    });
+}
+
+pub fn ensure_meter() {
+    if METER.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
+    let Some(video) = preview_video() else {
+        return;
+    };
+    let Ok(ctx) = web_sys::AudioContext::new() else {
+        return;
+    };
+    let _ = ctx.resume();
+    METER_CTX.with(|slot| *slot.borrow_mut() = Some(ctx.clone()));
+    let media: &web_sys::HtmlMediaElement = video.unchecked_ref();
+    let Ok(source) = ctx.create_media_element_source(media) else {
+        return;
+    };
+    let Ok(analyser) = ctx.create_analyser() else {
+        return;
+    };
+    analyser.set_fft_size(256);
+    let dest = ctx.destination();
+    let node: &web_sys::AudioNode = dest.unchecked_ref();
+    // The element can be captured once. If the graph does not reach the
+    // speakers, connect the source straight through so playback stays audible.
+    if source.connect_with_audio_node(&analyser).is_err()
+        || analyser.connect_with_audio_node(node).is_err()
+    {
+        let _ = source.connect_with_audio_node(node);
+        return;
+    }
+    METER.with(|slot| *slot.borrow_mut() = Some(analyser));
+}
+
+pub fn meter_peak() -> f32 {
+    METER.with(|slot| {
+        let held = slot.borrow();
+        let Some(analyser) = held.as_ref() else {
+            return 0.0;
+        };
+        let bins = analyser.frequency_bin_count() as usize;
+        let mut data = vec![0u8; bins.max(1)];
+        analyser.get_byte_frequency_data(&mut data);
+        data.into_iter().max().unwrap_or(0) as f32 / 255.0
+    })
 }

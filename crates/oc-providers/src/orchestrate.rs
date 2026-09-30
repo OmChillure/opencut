@@ -88,11 +88,11 @@ async fn run_provider(
         return match id {
             ProviderId::Claude => {
                 emit(events, ChatEvent::status("ACP adapter missing — `claude -p`")).await;
-                claude_print(prompt).await
+                claude_print(prompt, frames).await
             }
             ProviderId::Openai => {
                 emit(events, ChatEvent::status("ACP adapter missing — `codex exec`")).await;
-                codex_print(prompt).await
+                codex_print(prompt, frames).await
             }
             ProviderId::Xai => Err(LlmError::Message(format!("ACP adapter missing: {bin}"))),
         };
@@ -109,7 +109,7 @@ async fn run_provider(
                     ChatEvent::status("ACP adapter missing — `claude -p`"),
                 )
                 .await;
-                claude_print(prompt).await
+                claude_print(prompt, frames).await
             }
             ProviderId::Openai => {
                 tracing::warn!("{err}; falling back to `codex exec`");
@@ -118,7 +118,7 @@ async fn run_provider(
                     ChatEvent::status("ACP adapter missing — `codex exec`"),
                 )
                 .await;
-                codex_print(prompt).await
+                codex_print(prompt, frames).await
             }
         },
     }
@@ -436,30 +436,214 @@ fn parse_tool_reply(text: String) -> LlmReply {
     }
 }
 
-async fn claude_print(prompt: &str) -> Result<String, LlmError> {
-    let out = tokio::process::Command::new("claude")
-        .args(["-p", "--output-format", "text", prompt])
-        .output()
-        .await
+async fn claude_print(prompt: &str, frames: &[PromptImage]) -> Result<String, LlmError> {
+    if frames.is_empty() {
+        let out = tokio::process::Command::new("claude")
+            .args(["-p", "--output-format", "text", prompt])
+            .output()
+            .await
+            .map_err(|e| {
+                LlmError::Message(format!("spawn claude: {e}. Run `claude auth login` first."))
+            })?;
+        if !out.status.success() {
+            return Err(LlmError::Message(String::from_utf8_lossy(&out.stderr).into()));
+        }
+        return Ok(String::from_utf8_lossy(&out.stdout).into());
+    }
+    let paths = write_stills(frames).await?;
+    let prompt = prompt_with_stills(prompt, &paths, frames);
+    let message = claude_stream_message(&prompt, frames);
+    let mut child = tokio::process::Command::new("claude")
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--allowedTools",
+            "Read",
+            "--dangerously-skip-permissions",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| {
-            LlmError::Message(format!("spawn claude: {e}. Run `claude auth login` first."))
+            LlmError::Message(format!(
+                "spawn claude: {e}. The stills are on disk ({}) but were not sent.",
+                still_list(&paths)
+            ))
         })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(message.as_bytes()).await.map_err(|e| {
+            LlmError::Message(format!(
+                "claude stdin: {e}. Stills were not dropped on purpose; see {}",
+                still_list(&paths)
+            ))
+        })?;
+    }
+    let out = child.wait_with_output().await.map_err(|e| {
+        LlmError::Message(format!(
+            "claude: {e}. Stills are at {}",
+            still_list(&paths)
+        ))
+    })?;
     if !out.status.success() {
-        return Err(LlmError::Message(String::from_utf8_lossy(&out.stderr).into()));
+        return Err(LlmError::Message(format!(
+            "{}\nStills were attached at {}.",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            still_list(&paths)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    claude_stream_text(&stdout).ok_or_else(|| {
+        LlmError::Message(format!(
+            "claude returned no text for the stills at {}. Raw: {}",
+            still_list(&paths),
+            stdout.chars().take(400).collect::<String>()
+        ))
+    })
+}
+
+async fn codex_print(prompt: &str, frames: &[PromptImage]) -> Result<String, LlmError> {
+    let paths = write_stills(frames).await?;
+    let mut cmd = tokio::process::Command::new("codex");
+    cmd.arg("exec").arg("--skip-git-repo-check");
+    for path in &paths {
+        cmd.arg("-i").arg(path);
+    }
+    cmd.arg(prompt);
+    let out = cmd.output().await.map_err(|e| {
+        LlmError::Message(format!(
+            "spawn codex: {e}. Run `codex` to login first.{}",
+            if paths.is_empty() {
+                String::new()
+            } else {
+                format!(" Stills are at {}.", still_list(&paths))
+            }
+        ))
+    })?;
+    if !out.status.success() {
+        return Err(LlmError::Message(format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            if paths.is_empty() {
+                String::new()
+            } else {
+                format!("\nStills were attached at {}.", still_list(&paths))
+            }
+        )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into())
 }
 
-async fn codex_print(prompt: &str) -> Result<String, LlmError> {
-    let out = tokio::process::Command::new("codex")
-        .args(["exec", "--skip-git-repo-check", prompt])
-        .output()
-        .await
-        .map_err(|e| LlmError::Message(format!("spawn codex: {e}. Run `codex` to login first.")))?;
-    if !out.status.success() {
-        return Err(LlmError::Message(String::from_utf8_lossy(&out.stderr).into()));
+async fn write_stills(frames: &[PromptImage]) -> Result<Vec<std::path::PathBuf>, LlmError> {
+    if frames.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into())
+    let dir = std::env::temp_dir().join(format!("oc-see-{}", std::process::id()));
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| LlmError::Message(format!("see temp dir: {e}")))?;
+    let mut paths = Vec::with_capacity(frames.len());
+    for (i, frame) in frames.iter().enumerate() {
+        let path = dir.join(format!("see-{i}.jpg"));
+        tokio::fs::write(&path, &frame.jpeg)
+            .await
+            .map_err(|e| LlmError::Message(format!("see still: {e}")))?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn prompt_with_stills(prompt: &str, paths: &[std::path::PathBuf], frames: &[PromptImage]) -> String {
+    let mut out = prompt.to_string();
+    out.push_str("\n\nStills for this turn (also attached). Read the file if the image block is missing:\n");
+    for (path, frame) in paths.iter().zip(frames) {
+        out.push_str(&format!("- {} — {}\n", path.display(), frame.caption));
+    }
+    out
+}
+
+fn still_list(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn claude_stream_message(prompt: &str, frames: &[PromptImage]) -> String {
+    let mut content = vec![serde_json::json!({ "type": "text", "text": prompt })];
+    for frame in frames {
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": crate::acp::encode_b64(&frame.jpeg),
+            }
+        }));
+    }
+    let message = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content }
+    });
+    format!("{message}\n")
+}
+
+fn claude_stream_text(stdout: &str) -> Option<String> {
+    let mut assistant = String::new();
+    let mut result = None;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("result") => {
+                if let Some(text) = value.get("result").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        result = Some(text.to_string());
+                    }
+                }
+                if result.is_none() {
+                    if let Some(text) = message_text(value.get("message")) {
+                        result = Some(text);
+                    }
+                }
+            }
+            Some("assistant") => {
+                if let Some(text) = message_text(value.get("message")) {
+                    assistant.push_str(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+    result.filter(|text| !text.trim().is_empty()).or_else(|| {
+        if assistant.trim().is_empty() {
+            None
+        } else {
+            Some(assistant)
+        }
+    })
+}
+
+fn message_text(message: Option<&Value>) -> Option<String> {
+    let content = message?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let mut out = String::new();
+    for block in content.as_array()? {
+        if block.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                out.push_str(text);
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[cfg(test)]
@@ -496,5 +680,22 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn claude_stream_keeps_the_result_and_the_still() {
+        let text = claude_stream_text(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"looking\"}]}}\n{\"type\":\"result\",\"result\":\"cut on the smile\"}\n",
+        );
+        assert_eq!(text.as_deref(), Some("cut on the smile"));
+        let message = claude_stream_message(
+            "look",
+            &[PromptImage {
+                caption: "wide".into(),
+                jpeg: vec![1, 2, 3],
+            }],
+        );
+        assert!(message.contains("\"media_type\":\"image/jpeg\""));
+        assert!(message.contains("look"));
     }
 }

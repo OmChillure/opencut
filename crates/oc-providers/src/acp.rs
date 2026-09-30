@@ -367,13 +367,28 @@ fn looks_like_tool_trace(text: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    t.contains("function_call")
+    if t.contains("function_call")
         || t.contains("\"type\":\"function\"")
         || t.contains("\"type\": \"function\"")
         || t.contains("tool_call")
         || t.contains("sessionUpdate")
         || t.contains("session/prompt")
+        || t.contains("$schema")
+        || t.contains("json-schema.org")
+        || t.contains("\"parameters\"")
+        || t.contains("\"input_schema\"")
+        || t.contains("\"properties\"")
+        || t.contains("scheduler_")
+        || t.contains("Usage notes:")
         || (t.starts_with('{') && t.contains("\"name\"") && t.contains("\"arguments\""))
+    {
+        return true;
+    }
+    let punct = t
+        .chars()
+        .filter(|c| matches!(c, '{' | '}' | '"' | '[' | ']' | ':'))
+        .count();
+    t.len() > 80 && punct * 4 > t.len()
 }
 
 fn content_text(v: &Value) -> Option<String> {
@@ -615,7 +630,13 @@ mod tests {
         assert!(looks_like_tool_trace(
             r#"{"type":"function_call","name":"read_file","arguments":{}}"#
         ));
+        assert!(looks_like_tool_trace(
+            r#"Usage notes: {"$schema":"http://json-schema.org/draft-07/schema#","name":"scheduler_create","parameters":{"properties":{}}}"#
+        ));
         assert!(!looks_like_tool_trace("Cut a 40s reel from the interview."));
+        assert!(!looks_like_tool_trace(
+            "through the drive, the newsroom, and home. I'm building that into one short."
+        ));
     }
 
     #[test]

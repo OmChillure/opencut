@@ -57,6 +57,9 @@ pub(crate) async fn call_tool(
     if name == "submit_edit" || name == "revise_edit" {
         return apply_submitted_plan(db, project_id, name, &call.arguments, &media, &speech, &looks).await;
     }
+    if name == "generate_broll" {
+        return generate_broll(db, project_id, &mut project.timeline, &call.arguments).await;
+    }
     if name == "snap_cuts_to_beats" {
         let raw = call
             .arguments
@@ -111,6 +114,211 @@ pub(crate) async fn call_tool(
     }
     tracing::info!(project = %project_id, tool = name, note = %applied.note, "applied");
     Ok(applied.note)
+}
+
+/// Silent cutaway from grok-imagine-video, saved into the bin, then covered over `at`.
+async fn generate_broll(
+    db: &Db,
+    project_id: Uuid,
+    timeline: &mut Timeline,
+    arguments: &Value,
+) -> Result<String, String> {
+    let prompt = arguments
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "generate_broll needs a prompt".to_string())?;
+    let at = arguments
+        .get("at")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "generate_broll needs at".to_string())?
+        .max(0.0);
+    let requested = arguments
+        .get("duration")
+        .and_then(Value::as_f64)
+        .unwrap_or(4.0)
+        .clamp(1.0, 8.0)
+        .round() as u32;
+    let aspect = broll_aspect(
+        timeline,
+        arguments.get("aspect").and_then(Value::as_str),
+    );
+    let key = std::env::var("XAI_API_KEY").map_err(|_| {
+        "XAI_API_KEY is not set. Add it to .env to generate B-roll.".to_string()
+    })?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let started = client
+        .post("https://api.x.ai/v1/videos/generations")
+        .bearer_auth(&key)
+        .json(&serde_json::json!({
+            "model": "grok-imagine-video-1.5",
+            "prompt": prompt,
+            "duration": requested,
+            "aspect_ratio": aspect,
+            "resolution": "480p",
+            "generate_audio": false,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("video request failed: {e}"))?;
+    if !started.status().is_success() {
+        let status = started.status();
+        let body = started.text().await.unwrap_or_default();
+        return Err(format!("video request {status}: {body}"));
+    }
+    let started: Value = started.json().await.map_err(|e| e.to_string())?;
+    let request_id = started
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "video request returned no request_id".to_string())?
+        .to_string();
+    let mut video_url = None;
+    let mut seconds = f64::from(requested);
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let polled = client
+            .get(format!("https://api.x.ai/v1/videos/{request_id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .map_err(|e| format!("video poll failed: {e}"))?;
+        if !polled.status().is_success() {
+            let status = polled.status();
+            let body = polled.text().await.unwrap_or_default();
+            return Err(format!("video poll {status}: {body}"));
+        }
+        let body: Value = polled.json().await.map_err(|e| e.to_string())?;
+        match body.get("status").and_then(Value::as_str).unwrap_or("pending") {
+            "done" => {
+                video_url = body
+                    .pointer("/video/url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(dur) = body.pointer("/video/duration").and_then(Value::as_f64) {
+                    if dur > 0.2 {
+                        seconds = dur;
+                    }
+                }
+                break;
+            }
+            "expired" => return Err("video request expired".into()),
+            "failed" => {
+                let detail = body
+                    .get("error")
+                    .or_else(|| body.get("message"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "failed".into());
+                return Err(format!("video generation failed: {detail}"));
+            }
+            _ => {}
+        }
+    }
+    let video_url = video_url.ok_or_else(|| "video generation timed out".to_string())?;
+    let bytes = client
+        .get(&video_url)
+        .send()
+        .await
+        .map_err(|e| format!("video download failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("video download failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("video download failed: {e}"))?;
+    if bytes.len() < 32 {
+        return Err("video download was empty".into());
+    }
+    let media_id = Uuid::now_v7();
+    let filename = format!("broll-{media_id}.mp4");
+    let local_key = oc_db::local_media_key(project_id, media_id, &filename);
+    let object_key = oc_media::object_key(
+        oc_media::ObjectKind::Raw,
+        oc_core::ProjectId::from_uuid(project_id),
+        MediaId::from_uuid(media_id),
+        &filename,
+    );
+    oc_db::insert_media(db, project_id, media_id, &local_key, &filename, "video/mp4")
+        .await
+        .map_err(|e| e.to_string())?;
+    let stored_key = match oc_db::R2::from_env().await {
+        Ok(r2) => match r2
+            .put_bytes(&object_key, bytes.to_vec(), "video/mp4")
+            .await
+        {
+            Ok(()) => object_key,
+            Err(err) => {
+                tracing::warn!("b-roll R2 put failed, keeping a local file: {err}");
+                write_local_media(&local_key, &bytes).await?;
+                local_key
+            }
+        },
+        Err(err) => {
+            tracing::info!("b-roll staying local: {err}");
+            write_local_media(&local_key, &bytes).await?;
+            local_key
+        }
+    };
+    oc_db::set_media_r2_key(db, media_id, &stored_key)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
+    oc_db::set_media_duration(db, media_id, ticks.max(1))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut undo = UndoStack::new();
+    let applied = apply(
+        timeline,
+        &mut undo,
+        Op::Cover {
+            media_id: MediaId::from_uuid(media_id),
+            at: Time::from_seconds(at),
+            source_in: Time::ZERO,
+            duration: oc_core::Duration::from_seconds(seconds),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    oc_db::save_timeline(db, project_id, timeline)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "generated b-roll {media_id} ({seconds:.1}s, {aspect}) — {}",
+        applied.note
+    ))
+}
+
+fn broll_aspect(timeline: &Timeline, requested: Option<&str>) -> String {
+    if let Some(raw) = requested.map(str::trim).filter(|text| !text.is_empty()) {
+        let key = raw.replace(' ', "");
+        if matches!(key.as_str(), "16:9" | "9:16" | "1:1" | "4:3") {
+            return key;
+        }
+    }
+    let ratio = timeline.width.max(1) as f64 / timeline.height.max(1) as f64;
+    if (ratio - 1.0).abs() < 0.08 {
+        "1:1".into()
+    } else if ratio > 1.0 && (ratio - 4.0 / 3.0).abs() < (ratio - 16.0 / 9.0).abs() && ratio < 1.5
+    {
+        "4:3".into()
+    } else if ratio < 1.0 {
+        "9:16".into()
+    } else {
+        "16:9".into()
+    }
+}
+
+async fn write_local_media(key: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = oc_db::local_media_path(key).ok_or_else(|| "bad local media key".to_string())?;
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tokio::fs::write(path, bytes)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) async fn queue_export(

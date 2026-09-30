@@ -1,11 +1,13 @@
 mod edit;
 mod ids;
+mod lut;
 mod model;
 mod project;
 mod undo;
 
 pub use ids::{ClipId, GroupId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
 pub use edit::PlaceMode;
+pub use lut::{CubeLut, canonical_color, cube_text, ffmpeg_color, parse_cube};
 pub use model::{
     AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipKind, ClipLook, Crop,
     CurvePoint, Curves, Ease, EditPlan, EditSlot, Fx, Generator, Grade, Graphic, GraphicKind, Lut,
@@ -40,6 +42,8 @@ pub enum TimelineError {
     InvalidSpeed,
     #[error("no gap at that time")]
     NoGap,
+    #[error("{0}")]
+    Message(String),
 }
 
 pub type Result<T> = std::result::Result<T, TimelineError>;

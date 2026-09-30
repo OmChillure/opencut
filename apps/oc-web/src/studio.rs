@@ -1,7 +1,7 @@
 //! Editor surfaces modeled on Kdenlive: audio mixer, curves, alpha shapes,
 //! scopes, generators, time remap, undo history, multicam, and the rendered file.
 
-use crate::media::{Clock, MediaItem, preview_video};
+use crate::media::{self, Clock, MediaItem, capture_pointer, preview_video};
 use crate::tools;
 use crate::WorkspaceSave;
 use dioxus::prelude::*;
@@ -44,6 +44,7 @@ pub fn Mixer() -> Element {
                 }
                 div { class: "mixer-strip master",
                     span { class: "mixer-name", "Master" }
+                    MasterMeter {}
                     span { class: "mixer-db", "{master:+.1} dB" }
                     input {
                         r#type: "range",
@@ -102,19 +103,27 @@ fn MixerStrip(track_id: String, name: String, muted: bool, mix: Mix) -> Element 
                     title: "Solo. Shift-click adds another solo.",
                     onclick: move |evt| {
                         let shift = evt.modifiers().shift();
-                        let tl = save.engine.peek();
                         let me = parse_track(&id_solo);
-                        for track in tl.tracks.iter().filter(|t| t.kind == TrackKind::Audio) {
-                            let on = if track.id == me {
-                                !track.mix.solo
-                            } else if shift {
-                                track.mix.solo
-                            } else {
-                                false
-                            };
-                            if on != track.mix.solo {
-                                let _ = tools::set_mix(save, Some(track.id), Mix { solo: on, ..track.mix });
-                            }
+                        let changes: Vec<_> = {
+                            let tl = save.engine.peek();
+                            tl.tracks
+                                .iter()
+                                .filter(|t| t.kind == TrackKind::Audio)
+                                .filter_map(|track| {
+                                    let on = if track.id == me {
+                                        !track.mix.solo
+                                    } else if shift {
+                                        track.mix.solo
+                                    } else {
+                                        false
+                                    };
+                                    (on != track.mix.solo)
+                                        .then_some((track.id, Mix { solo: on, ..track.mix }))
+                                })
+                                .collect()
+                        };
+                        for (id, mix) in changes {
+                            let _ = tools::set_mix(save, Some(id), mix);
                         }
                     },
                     "S"
@@ -153,6 +162,24 @@ fn MixerStrip(track_id: String, name: String, muted: bool, mix: Mix) -> Element 
     }
 }
 
+#[component]
+fn MasterMeter() -> Element {
+    let mut peak = use_signal(|| 0.0_f32);
+    use_future(move || async move {
+        loop {
+            media::resume_meter();
+            peak.set(media::meter_peak());
+            gloo_timers::future::TimeoutFuture::new(80).await;
+        }
+    });
+    let height = format!("height:{:.0}%", (*peak.read() * 100.0).clamp(0.0, 100.0));
+    rsx! {
+        div { class: "mixer-meter", title: "Level of what the monitor is playing",
+            div { class: "mixer-meter-fill", style: "{height}" }
+        }
+    }
+}
+
 fn parse_track(raw: &str) -> oc_core::TrackId {
     uuid::Uuid::parse_str(raw)
         .map(oc_core::TrackId::from_uuid)
@@ -163,10 +190,38 @@ fn parse_track(raw: &str) -> oc_core::TrackId {
 pub fn CurvesPanel(selected: String, track: String, at: f64) -> Element {
     let save = use_context::<WorkspaceSave>();
     let mut channel = use_signal(|| "all".to_string());
-    let mut mid = use_signal(|| 0.5_f32);
+    let mut points = use_signal(|| curve_ends());
+    let mut drag = use_signal(|| None::<usize>);
     let ch = channel.read().clone();
+    let selected_load = selected.clone();
     let selected_reset = selected.clone();
     let track_reset = track.clone();
+    use_effect(move || {
+        let name = channel.read().clone();
+        let clip = selected_load.clone();
+        let loaded = save
+            .engine
+            .read()
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find(|clip_row| clip_row.id.to_string() == clip)
+            .map(|clip_row| match name.as_str() {
+                "red" => clip_row.look.curves.red.clone(),
+                "green" => clip_row.look.curves.green.clone(),
+                "blue" => clip_row.look.curves.blue.clone(),
+                _ => clip_row.look.curves.all.clone(),
+            })
+            .filter(|pts| pts.len() >= 2)
+            .unwrap_or_else(curve_ends);
+        points.set(loaded);
+    });
+    let dots = points.read().clone();
+    let poly = dots
+        .iter()
+        .map(|point| format!("{:.4},{:.4}", point.x, 1.0 - point.y))
+        .collect::<Vec<_>>()
+        .join(" ");
     rsx! {
         div { class: "card-list",
             div { class: "mixer-title", "Curves" }
@@ -179,40 +234,113 @@ pub fn CurvesPanel(selected: String, track: String, at: f64) -> Element {
                     }
                 }
             }
-            input {
-                r#type: "range",
-                min: "0",
-                max: "1",
-                step: "0.02",
-                value: "{mid}",
-                title: "Output of the midpoint. 0.5 is a straight line.",
-                oninput: move |evt| {
-                    let y = evt.value().parse().unwrap_or(0.5);
-                    mid.set(y);
-                    let points = vec![
-                        CurvePoint { x: 0.0, y: 0.0 },
-                        CurvePoint { x: 0.5, y },
-                        CurvePoint { x: 1.0, y: 1.0 },
-                    ];
+            svg {
+                class: "curve-pad",
+                view_box: "0 0 1 1",
+                preserve_aspect_ratio: "none",
+                onpointerdown: move |evt| {
+                    capture_pointer(&evt);
+                    let Some((x, y)) = curve_point(&evt) else { return };
+                    let mut next = points.peek().clone();
+                    if let Some(hit) = nearest_point(&next, x, y) {
+                        drag.set(Some(hit));
+                    } else {
+                        next.push(CurvePoint { x, y });
+                        next.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+                        let hit = nearest_point(&next, x, y).unwrap_or(0);
+                        points.set(next);
+                        drag.set(Some(hit));
+                    }
+                },
+                onpointermove: move |evt| {
+                    let Some(index) = *drag.peek() else { return };
+                    let Some((x, y)) = curve_point(&evt) else { return };
+                    let mut next = points.peek().clone();
+                    let last = next.len().saturating_sub(1);
+                    let Some(point) = next.get_mut(index) else { return };
+                    if index == 0 {
+                        point.x = 0.0;
+                    } else if index == last {
+                        point.x = 1.0;
+                    } else {
+                        point.x = x.clamp(0.02, 0.98);
+                    }
+                    point.y = y.clamp(0.0, 1.0);
+                    points.set(next);
+                },
+                onpointerup: move |_| {
+                    if drag.peek().is_none() {
+                        return;
+                    }
+                    drag.set(None);
+                    let mut next = points.peek().clone();
+                    if let Some(first) = next.first_mut() {
+                        first.x = 0.0;
+                    }
+                    if let Some(last) = next.last_mut() {
+                        last.x = 1.0;
+                    }
+                    next.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+                    points.set(next.clone());
                     let curves = match channel.peek().as_str() {
-                        "red" => Curves { red: points, ..Curves::default() },
-                        "green" => Curves { green: points, ..Curves::default() },
-                        "blue" => Curves { blue: points, ..Curves::default() },
-                        _ => Curves { all: points, ..Curves::default() },
+                        "red" => Curves { red: next, ..Curves::default() },
+                        "green" => Curves { green: next, ..Curves::default() },
+                        "blue" => Curves { blue: next, ..Curves::default() },
+                        _ => Curves { all: next, ..Curves::default() },
                     };
                     let _ = tools::set_curves_at(save, Some(&selected), &track, at, curves);
                 },
+                polyline { points: "{poly}", fill: "none", stroke: "currentColor", "stroke-width": "0.012" }
+                for point in dots {
+                    circle {
+                        cx: "{point.x}",
+                        cy: "{1.0 - point.y}",
+                        r: "0.028",
+                    }
+                }
             }
             button {
                 class: "btn btn-ghost",
                 onclick: move |_| {
-                    mid.set(0.5);
+                    drag.set(None);
+                    points.set(curve_ends());
                     let _ = tools::set_curves_at(save, Some(&selected_reset), &track_reset, at, Curves::default());
                 },
                 "Reset curve"
             }
         }
     }
+}
+
+fn curve_ends() -> Vec<CurvePoint> {
+    vec![
+        CurvePoint { x: 0.0, y: 0.0 },
+        CurvePoint { x: 1.0, y: 1.0 },
+    ]
+}
+
+fn nearest_point(points: &[CurvePoint], x: f32, y: f32) -> Option<usize> {
+    points.iter().enumerate().find_map(|(index, point)| {
+        let dx = point.x - x;
+        let dy = point.y - y;
+        (dx * dx + dy * dy < 0.08 * 0.08).then_some(index)
+    })
+}
+
+fn curve_point(evt: &Event<PointerData>) -> Option<(f32, f32)> {
+    let data = evt.data();
+    let native = data.downcast::<web_sys::PointerEvent>()?;
+    let target = native.target()?.dyn_into::<web_sys::Element>().ok()?;
+    let svg = if target.tag_name().eq_ignore_ascii_case("svg") {
+        target
+    } else {
+        target.closest("svg").ok().flatten()?
+    };
+    let rect = svg.get_bounding_client_rect();
+    let point = evt.client_coordinates();
+    let px = ((point.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0) as f32;
+    let py = (1.0 - ((point.y - rect.top()) / rect.height().max(1.0))).clamp(0.0, 1.0) as f32;
+    Some((px, py))
 }
 
 #[component]
@@ -471,20 +599,20 @@ pub fn paint_scopes() {
     };
     let w = canvas.width() as f64;
     let h = canvas.height() as f64;
-    let _ = ctx.draw_image_with_html_video_element_and_dw_and_dh(&video, 0.0, 0.0, 80.0, 45.0);
-    let Ok(data) = ctx.get_image_data(0.0, 0.0, 80.0, 45.0) else {
+    let Some(px) = media::graded_frame() else {
         return;
     };
-    let px = data.data();
     ctx.set_fill_style_str("#111");
     ctx.fill_rect(0.0, 0.0, w, h);
     // Waveform (luma) on the left third, parade in the middle, vectorscope on the right.
-    for y in 0..45 {
-        for x in 0..80 {
-            let i = ((y * 80 + x) * 4) as usize;
+    for y in (0..90).step_by(2) {
+        for x in (0..160).step_by(2) {
+            let i = ((y * 160 + x) * 4) as usize;
             if i + 2 >= px.len() {
                 continue;
             }
+            let x = x / 2;
+            let y = y / 2;
             let r = px[i] as f64;
             let g = px[i + 1] as f64;
             let b = px[i + 2] as f64;
@@ -593,13 +721,15 @@ pub fn ExportPlayer() -> Element {
             button {
                 class: "btn btn-primary",
                 onclick: move |_| {
-                    let tl = save.engine.peek();
-                    let preset = if tl.height > tl.width {
-                        oc_core::ExportPreset::Vertical1080
-                    } else if tl.width == tl.height {
-                        oc_core::ExportPreset::Square1080
-                    } else {
-                        oc_core::ExportPreset::Youtube1080
+                    let preset = {
+                        let tl = save.engine.peek();
+                        if tl.height > tl.width {
+                            oc_core::ExportPreset::Vertical1080
+                        } else if tl.width == tl.height {
+                            oc_core::ExportPreset::Square1080
+                        } else {
+                            oc_core::ExportPreset::Youtube1080
+                        }
                     };
                     match tools::run_ops(save, vec![oc_core::Op::Export { preset }]) {
                         Ok(_) => {

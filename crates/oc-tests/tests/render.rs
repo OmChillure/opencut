@@ -159,6 +159,62 @@ fn graph_draws_title_and_grade() {
 }
 
 #[test]
+fn letterbox_and_cube_follow_the_timeline() {
+    let mut tl = Timeline::default();
+    tl.letterbox = true;
+    tl.set_background("#1a1a1a");
+    let track = tl.first_track(TrackKind::Video).unwrap().id;
+    let mid = MediaId::new();
+    let clip = tl.add_clip(track, video_on(mid, 0.0, 2.0)).unwrap();
+    tl.import_cube(
+        clip,
+        "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join("oc-render-cube");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("a.mp4");
+    std::fs::write(&path, b"x").unwrap();
+    let mut media = HashMap::new();
+    media.insert(mid, source(mid, path));
+    let compiled = compile(&tl, &media, ExportPreset::Youtube1080, &dir).unwrap();
+    assert!(
+        compiled.filter.contains("lut3d=file="),
+        "{}",
+        compiled.filter
+    );
+    assert!(
+        compiled.filter.contains("0x1a1a1a"),
+        "{}",
+        compiled.filter
+    );
+    assert!(dir.join("lut-1.cube").is_file());
+}
+
+#[test]
+fn linked_audio_silences_the_picture_voice() {
+    let mut tl = Timeline::default();
+    let track = tl.first_track(TrackKind::Video).unwrap().id;
+    let mid = MediaId::new();
+    let clip = tl.add_clip(track, video_on(mid, 0.0, 2.0)).unwrap();
+    tl.detach_audio(clip).unwrap();
+    let dir = std::env::temp_dir().join("oc-render-link");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("a.mp4");
+    std::fs::write(&path, b"x").unwrap();
+    let mut media = HashMap::new();
+    media.insert(mid, source(mid, path));
+    let compiled = compile(&tl, &media, ExportPreset::Youtube1080, &dir).unwrap();
+    assert!(
+        !compiled.filter.contains("asplit"),
+        "picture voice and the audio track must not both take the file: {}",
+        compiled.filter
+    );
+    assert!(compiled.filter.contains("anullsrc"), "{}", compiled.filter);
+    assert!(compiled.filter.contains("atrim="), "{}", compiled.filter);
+}
+
+#[test]
 fn bakes_two_shots_with_ffmpeg() {
     if !ffmpeg_available() {
         return;

@@ -54,11 +54,14 @@ pub fn compile(
         l
     };
 
+    let bg = oc_timeline::ffmpeg_color(&timeline.background);
+    let cube_files = write_cubes(timeline, work)?;
+
     let mut vcur = if base.is_empty() {
         let d = timeline.duration().as_seconds().max(0.1);
         let lab = next_label();
         fc.push_str(&format!(
-            "color=c=black:s={width}x{height}:d={d:.4}:r={fps}[{lab}];"
+            "color=c={bg}:s={width}x{height}:d={d:.4}:r={fps}[{lab}];"
         ));
         lab
     } else {
@@ -71,6 +74,8 @@ pub fn compile(
             width,
             height,
             fps,
+            &cube_files,
+            &bg,
         )?
     };
 
@@ -84,13 +89,14 @@ pub fn compile(
         width,
         height,
         fps,
+        &cube_files,
     )?;
     vcur = overlay_graphics(&mut fc, &mut next_label, timeline, &vcur, width, height)?;
     if timeline.letterbox && height > 8 {
         let bar = ((height as f32) * 0.12).round() as u32;
         let lab = next_label();
         fc.push_str(&format!(
-            "[{vcur}]drawbox=x=0:y=0:w=iw:h={bar}:color=black@1:t=fill,drawbox=x=0:y=ih-{bar}:w=iw:h={bar}:color=black@1:t=fill[{lab}];"
+            "[{vcur}]drawbox=x=0:y=0:w=iw:h={bar}:color={bg}@1:t=fill,drawbox=x=0:y=ih-{bar}:w=iw:h={bar}:color={bg}@1:t=fill[{lab}];"
         ));
         vcur = lab;
     }
@@ -181,6 +187,23 @@ fn has_graphics(timeline: &Timeline) -> bool {
     })
 }
 
+fn write_cubes(
+    timeline: &Timeline,
+    work: &Path,
+) -> Result<HashMap<u32, PathBuf>, RenderError> {
+    let mut files = HashMap::new();
+    if timeline.cubes.is_empty() {
+        return Ok(files);
+    }
+    std::fs::create_dir_all(work)?;
+    for cube in &timeline.cubes {
+        let path = work.join(format!("lut-{}.cube", cube.id));
+        std::fs::write(&path, oc_timeline::cube_text(cube))?;
+        files.insert(cube.id, path);
+    }
+    Ok(files)
+}
+
 fn stitch_base(
     fc: &mut String,
     next_label: &mut impl FnMut() -> String,
@@ -190,10 +213,12 @@ fn stitch_base(
     width: u32,
     height: u32,
     fps: f64,
+    cubes: &HashMap<u32, PathBuf>,
+    bg: &str,
 ) -> Result<String, RenderError> {
     let mut acc: Option<(String, f64)> = None;
     for clip in clips {
-        let v = picture_branch(fc, next_label, clip, media, index_of, width, height, fps)?;
+        let v = picture_branch(fc, next_label, clip, media, index_of, width, height, fps, cubes)?;
         let dur = clip.duration.as_seconds();
         match acc {
             None => {
@@ -202,7 +227,7 @@ fn stitch_base(
                     let pad = next_label();
                     let joined = next_label();
                     fc.push_str(&format!(
-                        "color=c=black:s={width}x{height}:d={start:.4}:r={fps}[{pad}];[{pad}][{v}]concat=n=2:v=1:a=0[{joined}];"
+                        "color=c={bg}:s={width}x{height}:d={start:.4}:r={fps}[{pad}];[{pad}][{v}]concat=n=2:v=1:a=0[{joined}];"
                     ));
                     acc = Some((joined, start + dur));
                 } else {
@@ -234,7 +259,7 @@ fn stitch_base(
                     let pad = next_label();
                     let joined = next_label();
                     fc.push_str(&format!(
-                        "color=c=black:s={width}x{height}:d={gap:.4}:r={fps}[{pad}];[{left}][{pad}]concat=n=2:v=1:a=0[{joined}];"
+                        "color=c={bg}:s={width}x{height}:d={gap:.4}:r={fps}[{pad}];[{left}][{pad}]concat=n=2:v=1:a=0[{joined}];"
                     ));
                     left = joined;
                     left_end += gap;
@@ -276,6 +301,7 @@ fn picture_branch(
     width: u32,
     height: u32,
     fps: f64,
+    cubes: &HashMap<u32, PathBuf>,
 ) -> Result<String, RenderError> {
     let dur = clip.duration.as_seconds().max(0.04);
     let mut chain = if let Some(generated) = &clip.look.generator {
@@ -329,7 +355,8 @@ fn picture_branch(
             }
         }
     }
-    chain.push_str(&eq_filters(&clip.look.grade, &clip.look.fx));
+    let cube_file = clip.look.grade.cube.and_then(|id| cubes.get(&id)).filter(|path| path.is_file());
+    chain.push_str(&eq_filters(&clip.look.grade, &clip.look.fx, cube_file.map(PathBuf::as_path)));
     chain.push_str(&curves_filter(&clip.look.curves));
     chain.push_str(&mask_filter(clip.look.mask.as_ref(), width, height));
     let fi = clip.look.fade_in.as_seconds();
@@ -542,9 +569,16 @@ fn ease_expr(ease: oc_timeline::Ease, p: &str) -> String {
     }
 }
 
-fn eq_filters(grade: &oc_timeline::Grade, fx: &oc_timeline::Fx) -> String {
+fn eq_filters(grade: &oc_timeline::Grade, fx: &oc_timeline::Fx, cube_file: Option<&Path>) -> String {
     let mut s = String::new();
-    if !grade.is_identity() {
+    let numeric = grade.exposure.abs() > 1e-4
+        || grade.contrast.abs() > 1e-4
+        || grade.saturation.abs() > 1e-4
+        || grade.temperature.abs() > 1e-3
+        || grade.lift.abs() > 1e-3
+        || grade.gamma.abs() > 1e-3
+        || grade.gain.abs() > 1e-3;
+    if numeric {
         let b = (grade.exposure * 0.45).clamp(-1.0, 1.0);
         let c = (1.0 + grade.contrast).clamp(0.2, 3.0);
         let sat = (1.0 + grade.saturation).clamp(0.0, 3.0);
@@ -563,6 +597,10 @@ fn eq_filters(grade: &oc_timeline::Grade, fx: &oc_timeline::Fx) -> String {
                 ",colorbalance=rs={lift:.3}:gs={lift:.3}:bs={lift:.3}:rm={gamma:.3}:gm={gamma:.3}:bm={gamma:.3}:rh={gain:.3}:gh={gain:.3}:bh={gain:.3}"
             ));
         }
+    }
+    if let Some(path) = cube_file {
+        s.push_str(&format!(",lut3d=file={}", escape_path(path)));
+    } else if grade.lut != oc_timeline::Lut::None {
         s.push_str(lut_filter(grade.lut));
     }
     if fx.grain > 0.02 {
@@ -625,6 +663,7 @@ fn overlay_broll(
     width: u32,
     height: u32,
     fps: f64,
+    cubes: &HashMap<u32, PathBuf>,
 ) -> Result<String, RenderError> {
     let program = base_clips(timeline);
     let mut cur = base.to_string();
@@ -642,7 +681,7 @@ fn overlay_broll(
             if program.iter().any(|c| c.id == clip.id) {
                 continue;
             }
-            let v = picture_branch(fc, next_label, clip, media, index_of, width, height, fps)?;
+            let v = picture_branch(fc, next_label, clip, media, index_of, width, height, fps, cubes)?;
             let shifted = next_label();
             let start = clip.start.as_seconds();
             fc.push_str(&format!(
@@ -803,6 +842,9 @@ fn stitch_audio(
         *need.entry(idx).or_insert(0) += 1;
     };
     for clip in &program {
+        if linked_audio_voice(timeline, clip) {
+            continue;
+        }
         if let Some(idx) = audio_index(clip, media, index_of) {
             note(idx);
         }
@@ -846,15 +888,19 @@ fn stitch_audio(
         if start - cursor > 0.05 {
             pieces.push(silence(fc, next_label, start - cursor));
         }
-        pieces.push(voice_piece(
-            fc,
-            next_label,
-            clip,
-            media,
-            index_of,
-            &mut pools,
-            dur,
-        ));
+        if linked_audio_voice(timeline, clip) {
+            pieces.push(silence(fc, next_label, dur));
+        } else {
+            pieces.push(voice_piece(
+                fc,
+                next_label,
+                clip,
+                media,
+                index_of,
+                &mut pools,
+                dur,
+            ));
+        }
         cursor = start + dur;
     }
     if total - cursor > 0.05 {
@@ -941,6 +987,18 @@ fn stitch_audio(
         program_label = out;
     }
     Some(program_label)
+}
+
+fn linked_audio_voice(timeline: &Timeline, clip: &Clip) -> bool {
+    let Some(link) = clip.link_id else {
+        return false;
+    };
+    timeline.tracks.iter().flat_map(|track| track.clips.iter()).any(|other| {
+        other.id != clip.id
+            && other.link_id == Some(link)
+            && !other.disabled
+            && matches!(other.kind, ClipKind::Audio { volume, .. } if volume > 0.02)
+    })
 }
 
 fn audio_index(

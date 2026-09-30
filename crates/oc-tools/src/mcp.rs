@@ -674,6 +674,89 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 ),
             ]),
         },
+        McpTool {
+            name: "group".into(),
+            description: "Group two or more clips so they select together.".into(),
+            input_schema: object(&[(
+                "clip_ids",
+                (
+                    json!({ "type": "array", "items": { "type": "string" } }),
+                    "Clip ids",
+                ),
+                true,
+            )]),
+        },
+        McpTool {
+            name: "link".into(),
+            description: "Link clips so a move or split keeps them together. Picture and its sound.".into(),
+            input_schema: object(&[(
+                "clip_ids",
+                (
+                    json!({ "type": "array", "items": { "type": "string" } }),
+                    "Clip ids",
+                ),
+                true,
+            )]),
+        },
+        McpTool {
+            name: "insert".into(),
+            description: "Insert a take and push later clips right. Same fields as place_clip.".into(),
+            input_schema: object(&[
+                ("media_id", str_prop("Media id from the bin"), true),
+                ("start", num_prop("Timeline start in seconds"), true),
+                ("source_in", num_prop("In-point in the source file, seconds"), false),
+                ("duration", num_prop("Take length in seconds"), false),
+                ("track_id", str_prop("Track id, or omit for the first matching track"), false),
+            ]),
+        },
+        McpTool {
+            name: "overwrite".into(),
+            description: "Overwrite the timeline with a take. Same fields as place_clip.".into(),
+            input_schema: object(&[
+                ("media_id", str_prop("Media id from the bin"), true),
+                ("start", num_prop("Timeline start in seconds"), true),
+                ("source_in", num_prop("In-point in the source file, seconds"), false),
+                ("duration", num_prop("Take length in seconds"), false),
+                ("track_id", str_prop("Track id, or omit for the first matching track"), false),
+            ]),
+        },
+        McpTool {
+            name: "jl_cut".into(),
+            description: "Split picture and sound at a join. lead is how early the audio starts (J). tail is how long the audio holds after the picture (L), in seconds. The clip must be video; sound moves to the audio track.".into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Video clip id"), true),
+                ("lead", num_prop("Audio lead in seconds (J-cut). 0 if unused"), false),
+                ("tail", num_prop("Audio tail in seconds (L-cut). 0 if unused"), false),
+            ]),
+        },
+        McpTool {
+            name: "set_frame_rate".into(),
+            description: "Set the project frame rate. Existing clips stay put. fps is 23.976, 24, 25, 29.97, 30, 50, 59.94, or 60.".into(),
+            input_schema: object(&[("fps", num_prop("Frames per second"), true)]),
+        },
+        McpTool {
+            name: "set_background".into(),
+            description: "Monitor and letterbox color. #rrggbb, or black, white, gray, charcoal.".into(),
+            input_schema: object(&[("color", str_prop("#rrggbb or a name"), true)]),
+        },
+        McpTool {
+            name: "import_cube".into(),
+            description: "Load a .cube LUT onto one video clip. Pass the file text. Replaces the named LUT preset on that clip.".into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Video clip id"), true),
+                ("text", str_prop("Full .cube file text"), true),
+            ]),
+        },
+        McpTool {
+            name: "generate_broll".into(),
+            description: "Generate a short silent cutaway with grok-imagine-video, save it in the bin, and cover the speaker with it so the original voice continues. prompt describes the picture. at is the timeline time. duration is seconds (about 1–8). aspect is 16:9, 9:16, 1:1, or 4:3; omit it to follow the timeline.".into(),
+            input_schema: object(&[
+                ("prompt", str_prop("What the cutaway shows"), true),
+                ("at", num_prop("Timeline time in seconds"), true),
+                ("duration", num_prop("Seconds, about 1 to 8"), true),
+                ("aspect", str_prop("16:9, 9:16, 1:1, or 4:3"), false),
+            ]),
+        },
     ]);
     out
 }
@@ -1119,6 +1202,55 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 target_seconds,
             })
         }
+        "insert" | "overwrite" => Ok(Op::PlaceMedia {
+            media_id: media_id(&call.arguments, "media_id")?,
+            track_id: optional_track(&call.arguments, "track_id"),
+            start: seconds(&call.arguments, "start").unwrap_or(Time::ZERO),
+            duration: call
+                .arguments
+                .get("duration")
+                .and_then(Value::as_f64)
+                .map(Duration::from_seconds)
+                .unwrap_or(Duration::ZERO),
+            source_in: seconds(&call.arguments, "source_in").unwrap_or(Time::ZERO),
+            kind: TrackKind::Video,
+            mode: if call.name == "overwrite" {
+                TimelineEditMode::Overwrite
+            } else {
+                TimelineEditMode::Insert
+            },
+        }),
+        "jl_cut" => Ok(Op::JlCut {
+            clip_id: clip_id(&call.arguments, "clip_id")?,
+            lead: Duration::from_seconds(number(&call.arguments, "lead").unwrap_or(0.0).max(0.0)),
+            tail: Duration::from_seconds(number(&call.arguments, "tail").unwrap_or(0.0).max(0.0)),
+        }),
+        "set_frame_rate" => Ok(Op::SetFrameRate {
+            frame_rate: oc_time::FrameRate::nearest(number(&call.arguments, "fps")?),
+        }),
+        "set_background" => {
+            let color = call
+                .arguments
+                .get("color")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing color".to_string())?;
+            Ok(Op::SetBackground {
+                color: color.to_string(),
+            })
+        }
+        "import_cube" => {
+            let text = call
+                .arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| text.contains("LUT_3D_SIZE"))
+                .ok_or_else(|| "import_cube needs the .cube text".to_string())?;
+            Ok(Op::ImportCube {
+                clip_id: clip_id(&call.arguments, "clip_id")?,
+                text: text.to_string(),
+            })
+        }
+        "generate_broll" => Err("generate_broll is handled by the host".into()),
         other => Err(format!("unknown tool {other}")),
     }
 }
@@ -1380,6 +1512,7 @@ fn grade_from(args: &Value) -> Grade {
         gamma: number(args, "gamma").unwrap_or(0.0) as f32,
         gain: number(args, "gain").unwrap_or(0.0) as f32,
         lut: lut_from(args.get("lut").and_then(Value::as_str).unwrap_or("none")),
+        cube: None,
     }
 }
 
@@ -1392,16 +1525,7 @@ fn batch(args: &Value) -> bool {
 }
 
 fn clip_ids_of(args: &Value) -> Vec<ClipId> {
-    args.get("clip_ids")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(Value::as_str)
-                .filter_map(|raw| Uuid::parse_str(raw).ok())
-                .map(ClipId::from_uuid)
-                .collect()
-        })
-        .unwrap_or_default()
+    args.get("clip_ids").map(parse_id_list).unwrap_or_default()
 }
 
 fn lut_from(raw: &str) -> Lut {
@@ -1477,19 +1601,87 @@ mod parse_tests {
         };
         assert!(matches!(inspect_from_mcp(&call), Some(Inspect::ListCues { .. })));
     }
+
+    #[test]
+    fn group_link_insert_overwrite_and_jl_parse() {
+        let a = "11111111-1111-1111-1111-111111111111";
+        let b = "22222222-2222-2222-2222-222222222222";
+        let grouped = op_from_mcp(&McpCall {
+            name: "group".into(),
+            arguments: json!({ "clip_ids": format!("{a},{b}") }),
+        })
+        .unwrap();
+        assert!(matches!(grouped, Op::Group { clip_ids } if clip_ids.len() == 2));
+        let linked = op_from_mcp(&McpCall {
+            name: "link".into(),
+            arguments: json!({ "clip_ids": format!("[\"{a}\",\"{b}\"]") }),
+        })
+        .unwrap();
+        assert!(matches!(linked, Op::Link { .. }));
+        let inserted = op_from_mcp(&McpCall {
+            name: "insert".into(),
+            arguments: json!({ "media_id": a, "start": 1.0, "duration": 2.0 }),
+        })
+        .unwrap();
+        assert!(matches!(
+            inserted,
+            Op::PlaceMedia { mode: TimelineEditMode::Insert, .. }
+        ));
+        let overwritten = op_from_mcp(&McpCall {
+            name: "overwrite".into(),
+            arguments: json!({ "media_id": a, "start": 1.0 }),
+        })
+        .unwrap();
+        assert!(matches!(
+            overwritten,
+            Op::PlaceMedia { mode: TimelineEditMode::Overwrite, .. }
+        ));
+        let jl = op_from_mcp(&McpCall {
+            name: "jl_cut".into(),
+            arguments: json!({ "clip_id": a, "lead": 0.4, "tail": 0.2 }),
+        })
+        .unwrap();
+        assert!(matches!(jl, Op::JlCut { .. }));
+        let rate = op_from_mcp(&McpCall {
+            name: "set_frame_rate".into(),
+            arguments: json!({ "fps": 24 }),
+        })
+        .unwrap();
+        assert!(matches!(rate, Op::SetFrameRate { frame_rate } if frame_rate == oc_time::FrameRate::FPS_24));
+        assert!(mcp_tools().iter().any(|tool| tool.name == "generate_broll"));
+        assert!(mcp_tools().iter().any(|tool| tool.name == "import_cube"));
+    }
 }
 
 fn clip_ids(args: &Value, key: &str) -> Result<Vec<ClipId>, String> {
-    let arr = args
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("missing {key}"))?;
-    arr.iter()
-        .filter_map(Value::as_str)
-        .map(|raw| {
-            Uuid::parse_str(raw)
+    let Some(value) = args.get(key) else {
+        return Err(format!("missing {key}"));
+    };
+    let ids = parse_id_list(value);
+    if ids.is_empty() {
+        return Err(format!("missing {key}"));
+    }
+    Ok(ids)
+}
+
+/// A JSON array, a JSON-array string, or comma-separated uuids.
+fn parse_id_list(value: &Value) -> Vec<ClipId> {
+    match value {
+        Value::Array(rows) => rows.iter().flat_map(parse_id_list).collect(),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('[') {
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    return parse_id_list(&parsed);
+                }
+            }
+            trimmed
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|part| !part.is_empty())
+                .filter_map(|part| Uuid::parse_str(part.trim()).ok())
                 .map(ClipId::from_uuid)
-                .map_err(|_| format!("bad {key}"))
-        })
-        .collect()
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
