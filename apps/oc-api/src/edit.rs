@@ -60,6 +60,9 @@ pub(crate) async fn call_tool(
     if name == "generate_broll" {
         return generate_broll(db, project_id, &mut project.timeline, &call.arguments).await;
     }
+    if name == "add_design" {
+        return add_design(db, project_id, &mut project.timeline, &call.arguments).await;
+    }
     if name == "snap_cuts_to_beats" {
         let raw = call
             .arguments
@@ -116,37 +119,9 @@ pub(crate) async fn call_tool(
     Ok(applied.note)
 }
 
-/// Silent cutaway from grok-imagine-video, saved into the bin, then covered over `at`.
-async fn generate_broll(
-    db: &Db,
-    project_id: Uuid,
-    timeline: &mut Timeline,
-    arguments: &Value,
-) -> Result<String, String> {
-    let prompt = arguments
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| "generate_broll needs a prompt".to_string())?;
-    let at = arguments
-        .get("at")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| "generate_broll needs at".to_string())?
-        .max(0.0);
-    let requested = arguments
-        .get("duration")
-        .and_then(Value::as_f64)
-        .unwrap_or(4.0)
-        .clamp(1.0, 8.0)
-        .round() as u32;
-    let aspect = broll_aspect(
-        timeline,
-        arguments.get("aspect").and_then(Value::as_str),
-    );
-    let key = std::env::var("XAI_API_KEY").map_err(|_| {
-        "XAI_API_KEY is not set. Add it to .env to generate B-roll.".to_string()
-    })?;
+/// Silent clip from grok-imagine-video. Returns the file bytes and its duration.
+async fn imagine_video(prompt: &str, requested: u32, aspect: &str) -> Result<(Vec<u8>, f64), String> {
+    let key = std::env::var("XAI_API_KEY").map_err(|_| "XAI_API_KEY is not set".to_string())?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(90))
         .build()
@@ -231,6 +206,46 @@ async fn generate_broll(
     if bytes.len() < 32 {
         return Err("video download was empty".into());
     }
+    Ok((bytes.to_vec(), seconds))
+}
+
+/// Silent cutaway from grok-imagine-video, saved into the bin, then covered over `at`.
+async fn generate_broll(
+    db: &Db,
+    project_id: Uuid,
+    timeline: &mut Timeline,
+    arguments: &Value,
+) -> Result<String, String> {
+    let prompt = arguments
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "generate_broll needs a prompt".to_string())?;
+    let at = arguments
+        .get("at")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "generate_broll needs at".to_string())?
+        .max(0.0);
+    let requested = arguments
+        .get("duration")
+        .and_then(Value::as_f64)
+        .unwrap_or(4.0)
+        .clamp(1.0, 8.0)
+        .round() as u32;
+    let aspect = broll_aspect(
+        timeline,
+        arguments.get("aspect").and_then(Value::as_str),
+    );
+    let (bytes, seconds) = imagine_video(prompt, requested, &aspect)
+        .await
+        .map_err(|err| {
+            if err == "XAI_API_KEY is not set" {
+                "XAI_API_KEY is not set. Add it to .env to generate B-roll.".to_string()
+            } else {
+                err
+            }
+        })?;
     let media_id = Uuid::now_v7();
     let filename = format!("broll-{media_id}.mp4");
     let local_key = oc_db::local_media_key(project_id, media_id, &filename);
@@ -287,6 +302,129 @@ async fn generate_broll(
         "generated b-roll {media_id} ({seconds:.1}s, {aspect}) — {}",
         applied.note
     ))
+}
+
+/// Illustration of the thing being explained. A short animation, a label, and a layout.
+async fn add_design(
+    db: &Db,
+    project_id: Uuid,
+    timeline: &mut Timeline,
+    arguments: &Value,
+) -> Result<String, String> {
+    let prompt = arguments
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "add_design needs a prompt".to_string())?;
+    let at = arguments
+        .get("at")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "add_design needs at".to_string())?
+        .max(0.0);
+    let requested = arguments
+        .get("duration")
+        .and_then(Value::as_f64)
+        .unwrap_or(4.0)
+        .clamp(2.0, 15.0)
+        .round() as u32;
+    let text = arguments
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let layout = design_layout(arguments.get("layout").and_then(Value::as_str));
+    let aspect = broll_aspect(timeline, arguments.get("aspect").and_then(Value::as_str));
+    let (bytes, seconds) = imagine_video(&design_prompt(prompt), requested, &aspect)
+        .await
+        .map_err(|err| {
+            if err == "XAI_API_KEY is not set" {
+                "XAI_API_KEY is not set. Add it to .env to draw motion design.".to_string()
+            } else {
+                err
+            }
+        })?;
+    let media_id = Uuid::now_v7();
+    let filename = format!("design-{media_id}.mp4");
+    let local_key = oc_db::local_media_key(project_id, media_id, &filename);
+    let object_key = oc_media::object_key(
+        oc_media::ObjectKind::Raw,
+        oc_core::ProjectId::from_uuid(project_id),
+        MediaId::from_uuid(media_id),
+        &filename,
+    );
+    oc_db::insert_media(db, project_id, media_id, &local_key, &filename, "video/mp4")
+        .await
+        .map_err(|e| e.to_string())?;
+    let stored_key = match oc_db::R2::from_env().await {
+        Ok(r2) => match r2
+            .put_bytes(&object_key, bytes.to_vec(), "video/mp4")
+            .await
+        {
+            Ok(()) => object_key,
+            Err(err) => {
+                tracing::warn!("design R2 put failed, keeping a local file: {err}");
+                write_local_media(&local_key, &bytes).await?;
+                local_key
+            }
+        },
+        Err(err) => {
+            tracing::info!("design staying local: {err}");
+            write_local_media(&local_key, &bytes).await?;
+            local_key
+        }
+    };
+    oc_db::set_media_r2_key(db, media_id, &stored_key)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
+    oc_db::set_media_duration(db, media_id, ticks.max(1))
+        .await
+        .map_err(|e| e.to_string())?;
+    oc_db::set_media_status(db, media_id, "ready")
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut undo = UndoStack::new();
+    let applied = apply(
+        timeline,
+        &mut undo,
+        Op::AddDesign {
+            media_id: MediaId::from_uuid(media_id),
+            at: Time::from_seconds(at),
+            duration: oc_core::Duration::from_seconds(seconds),
+            layout,
+            text,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    oc_db::save_timeline(db, project_id, timeline)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "design {media_id} ({layout:?}, {seconds:.1}s, {aspect}) — {}",
+        applied.note
+    ))
+}
+
+fn design_layout(raw: Option<&str>) -> oc_core::DesignLayout {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "behind" | "back" | "text_behind" | "under" => oc_core::DesignLayout::Behind,
+        "beside" | "side" | "split" => oc_core::DesignLayout::Beside,
+        _ => oc_core::DesignLayout::Cutaway,
+    }
+}
+
+fn design_prompt(subject: &str) -> String {
+    format!(
+        "Full-frame flat motion graphic on one solid background color. \
+         The artwork touches the left, right, top, and bottom edges. \
+         No empty margin, no border, no watermark, no letters, no numbers, no people. \
+         Animate the subject itself happening across the whole clip: \
+         the first stroke at the start, the finished form filling the frame at the end. \
+         If this is a chart pattern or a diagram, draw that diagram forming, \
+         not a real-world object with the same name. {subject}"
+    )
 }
 
 fn broll_aspect(timeline: &Timeline, requested: Option<&str>) -> String {

@@ -748,6 +748,31 @@ pub fn mcp_tools() -> Vec<McpTool> {
             ]),
         },
         McpTool {
+            name: "add_design".into(),
+            description: "Animate what the person is explaining, full frame, for the whole spoken line. \
+                 A bullish flag is that chart pattern drawing itself (pole, flag, breakout), not a flag on a pole. \
+                 A house rises until it fills the frame. \
+                 prompt is the motion across the clip. The subject fills the frame. No letters and no numbers. \
+                 text is the short label, the real words, drawn by the editor. Omit text to show the animation alone. \
+                 at is the timeline start. duration is the length of that spoken line, up to 15 seconds. \
+                 layout: cutaway (animation fills the frame, voice continues), \
+                 beside (animation on the empty side, person stays large), \
+                 behind (animation and words fill the frame, person stays in a corner in front of the words). \
+                 Call see at the start, middle, and end of the line first, then pick the layout from those frames."
+                .into(),
+            input_schema: object(&[
+                ("prompt", str_prop("How the subject builds across the clip until it fills the frame, with no words in the picture"), true),
+                ("at", num_prop("Timeline start in seconds"), true),
+                ("duration", num_prop("Length of the spoken line in seconds, up to 15"), false),
+                ("text", str_prop("Short label, the words they actually said"), false),
+                (
+                    "layout",
+                    str_prop("cutaway, beside, or behind"),
+                    false,
+                ),
+            ]),
+        },
+        McpTool {
             name: "generate_broll".into(),
             description: "Generate a short silent cutaway with grok-imagine-video, save it in the bin, and cover the speaker with it so the original voice continues. prompt describes the picture. at is the timeline time. duration is seconds (about 1–8). aspect is 16:9, 9:16, 1:1, or 4:3; omit it to follow the timeline.".into(),
             input_schema: object(&[
@@ -1159,7 +1184,12 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 })
                 .to_string();
             Ok(Op::AddGraphic {
-                graphic: Graphic { kind, text },
+                graphic: Graphic {
+                    kind,
+                    text,
+                    x: None,
+                    y: None,
+                },
                 start: seconds(&call.arguments, "start").unwrap_or(Time::ZERO),
                 duration: call
                     .arguments
@@ -1251,6 +1281,7 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
             })
         }
         "generate_broll" => Err("generate_broll is handled by the host".into()),
+        "add_design" => Err("add_design is handled by the host".into()),
         other => Err(format!("unknown tool {other}")),
     }
 }
@@ -1649,6 +1680,12 @@ mod parse_tests {
         .unwrap();
         assert!(matches!(rate, Op::SetFrameRate { frame_rate } if frame_rate == oc_time::FrameRate::FPS_24));
         assert!(mcp_tools().iter().any(|tool| tool.name == "generate_broll"));
+        assert!(mcp_tools().iter().any(|tool| tool.name == "add_design"));
+        assert!(op_from_mcp(&McpCall {
+            name: "add_design".into(),
+            arguments: json!({ "prompt": "a house", "at": 1.0 }),
+        })
+        .is_err());
         assert!(mcp_tools().iter().any(|tool| tool.name == "import_cube"));
     }
 }
