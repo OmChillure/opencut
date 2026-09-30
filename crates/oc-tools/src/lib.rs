@@ -12,7 +12,8 @@ pub use intent::{Intent, is_director_request, parse_intent};
 pub use mcp::{inspect_from_mcp, Inspect, McpCall, McpTool, mcp_tools, op_from_mcp};
 pub use plan::{build_plan, plan_from_value, revise_plan, SourceWindow};
 pub use ops::{
-    AppliedOp, AssembleItem, AssembleStyle, Excerpt, ExportPreset, Op, OpError, TimeRange,
+    AppliedOp, AssembleItem, AssembleStyle, DesignLayout, Excerpt, ExportPreset, Op, OpError,
+    TimeRange,
     TimelineEditMode, apply, asks_for_judgment, choose_piece, excerpts_for_request,
     pick_reel_excerpts, revises_existing_cut, PiecePick, SourceBeat,
 };

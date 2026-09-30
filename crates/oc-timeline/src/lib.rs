@@ -10,7 +10,8 @@ pub use edit::PlaceMode;
 pub use lut::{CubeLut, canonical_color, cube_text, ffmpeg_color, parse_cube};
 pub use model::{
     AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipKind, ClipLook, Crop,
-    CurvePoint, Curves, Ease, EditPlan, EditSlot, Fx, Generator, Grade, Graphic, GraphicKind, Lut,
+    CurvePoint, Curves, Ease, EditPlan, EditSlot, FrameCard, Fx, Generator, Grade, Graphic,
+    GraphicKind, Lut,
     Marker, MaskShape, Mix, SpeedKey, Timeline, Track, TrackKind, Transform, TransitionKind,
 };
 pub use project::Project;

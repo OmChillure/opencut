@@ -1,9 +1,9 @@
 use oc_time::{Duration, FrameRate, Time};
 use oc_timeline::{
     AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook,
-    Crop, Curves, Fx, Generator, Grade, Graphic, MarkerId, MediaId, Mix, PlaceMode,
-    SpeedKey, Timeline, TimelineError, Track, TrackId, TrackKind, Transform, TransitionKind,
-    UndoStack,
+    Crop, Curves, Ease, FrameCard, Fx, Generator, Grade, Graphic, GraphicKind, MarkerId, MediaId,
+    Mix, PlaceMode, SpeedKey, Timeline, TimelineError, Track, TrackId, TrackKind, Transform,
+    TransitionKind, UndoStack,
 };
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +67,18 @@ pub enum OpError {
 }
 
 pub type Result<T> = std::result::Result<T, OpError>;
+
+/// Where an explanation drawing sits while the person keeps talking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignLayout {
+    /// The drawing fills the frame. The voice continues.
+    Cutaway,
+    /// The drawing sits on the empty side. The person stays large.
+    Beside,
+    /// The drawing and the words fill the frame. The person stays in front, in a corner.
+    Behind,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -329,6 +341,15 @@ pub enum Op {
         start: Time,
         duration: Duration,
         track_id: Option<TrackId>,
+    },
+    /// An illustration of what is being said: a chart, a house, a diagram.
+    /// The still is already in the bin. This places it, the label, and the person.
+    AddDesign {
+        media_id: MediaId,
+        at: Time,
+        duration: Duration,
+        layout: DesignLayout,
+        text: String,
     },
     /// Kdenlive mixer: track fader, balance, and solo. `None` track is the master fader.
     SetMix {
@@ -873,6 +894,13 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             }
             format!("volume {volume:.2} on {clip_id}")
         }
+        Op::AddDesign {
+            media_id,
+            at,
+            duration,
+            layout,
+            text,
+        } => place_design(timeline, *media_id, *at, *duration, *layout, text)?,
         Op::AddGraphic {
             graphic,
             start,
@@ -1146,6 +1174,117 @@ fn clip_for_media(
         disabled: false,
         look: ClipLook::default(),
     }
+}
+
+fn place_design(
+    timeline: &mut Timeline,
+    media_id: MediaId,
+    at: Time,
+    duration: Duration,
+    layout: DesignLayout,
+    text: &str,
+) -> Result<String> {
+    let seconds = duration.as_seconds().clamp(1.2, 15.0);
+    let duration = Duration::from_seconds(seconds);
+    let design_track = named_video_track(timeline, "Design");
+    let mut picture = clip_for_media(media_id, at, duration, TrackKind::Video, Time::ZERO);
+    picture.look.overlay = true;
+    picture.look.fade_in = Duration::from_seconds(0.35);
+    picture.look.fade_out = Duration::from_seconds(0.35);
+    match layout {
+        DesignLayout::Cutaway | DesignLayout::Behind => {
+            picture.look.move_to = Some(Transform {
+                x: 0.0,
+                y: 0.0,
+                scale: 1.08,
+                rotation: 0.0,
+            });
+            picture.look.move_ease = Some(Ease::Out);
+        }
+        DesignLayout::Beside => {
+            picture.look.card = Some(FrameCard {
+                x: 0.52,
+                y: 0.10,
+                w: 0.44,
+                h: 0.80,
+            });
+        }
+    }
+    let design_id = timeline.place_clip(design_track, picture, PlaceMode::Normal)?;
+    let label = text.trim();
+    if !label.is_empty() {
+        let (kind, x, y) = match layout {
+            DesignLayout::Behind => (GraphicKind::LowerThird, Some(0.28), Some(0.42)),
+            DesignLayout::Beside => (GraphicKind::LowerThird, Some(0.74), Some(0.86)),
+            DesignLayout::Cutaway => (GraphicKind::LowerThird, None, None),
+        };
+        let gfx = named_video_track(timeline, "GFX");
+        let mut clip = clip_for_media(MediaId::new(), at, duration, TrackKind::Video, Time::ZERO);
+        clip.media_id = None;
+        clip.kind = ClipKind::Graphic {
+            graphic: Graphic {
+                kind,
+                text: label.to_string(),
+                x,
+                y,
+            },
+        };
+        timeline.place_clip(gfx, clip, PlaceMode::Normal)?;
+    }
+    let pip = speaker_under(timeline, at).and_then(|speaker| {
+        speaker.media_id.map(|media| {
+            (
+                media,
+                speaker.source_time_at(at).unwrap_or(speaker.source_in),
+            )
+        })
+    });
+    if layout == DesignLayout::Behind {
+        if let Some((speaker_media, source_in)) = pip {
+            let front = named_video_track(timeline, "Front");
+            let mut pip = clip_for_media(speaker_media, at, duration, TrackKind::Video, source_in);
+            pip.look.overlay = true;
+            pip.look.fade_in = Duration::from_seconds(0.25);
+            pip.look.fade_out = Duration::from_seconds(0.25);
+            pip.look.card = Some(FrameCard {
+                x: 0.56,
+                y: 0.18,
+                w: 0.38,
+                h: 0.64,
+            });
+            timeline.place_clip(front, pip, PlaceMode::Normal)?;
+        }
+    }
+    Ok(format!(
+        "design {layout:?} {design_id} at {:.2}s for {seconds:.1}s",
+        at.as_seconds()
+    ))
+}
+
+fn named_video_track(timeline: &mut Timeline, name: &str) -> TrackId {
+    if let Some(track) = timeline
+        .tracks
+        .iter()
+        .find(|track| track.kind == TrackKind::Video && track.name == name)
+    {
+        return track.id;
+    }
+    timeline.add_track(TrackKind::Video, name)
+}
+
+fn speaker_under(timeline: &Timeline, at: Time) -> Option<&Clip> {
+    timeline.tracks.iter().find_map(|track| {
+        if track.kind != TrackKind::Video || matches!(track.name.as_str(), "Design" | "Front" | "GFX")
+        {
+            return None;
+        }
+        track.clips.iter().find(|clip| {
+            !clip.disabled
+                && clip.media_id.is_some()
+                && clip.contains(at)
+                && matches!(clip.kind, ClipKind::Video { .. })
+        })
+    })
 }
 
 fn overlay_track(timeline: &mut Timeline) -> TrackId {

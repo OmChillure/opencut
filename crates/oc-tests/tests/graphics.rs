@@ -2,9 +2,10 @@
 
 use oc_compositor::{Layer, plan_frame};
 use oc_core::{
-    ClipKind, Duration, Graphic, GraphicKind, Op, Time, Timeline, TrackKind, UndoStack, apply,
+    ClipKind, DesignLayout, Duration, Graphic, GraphicKind, MediaId, Op, Time, Timeline, TrackKind,
+    UndoStack, apply,
 };
-use oc_tests::video;
+use oc_tests::{video, video_on};
 
 #[test]
 fn title_lands_on_a_second_video_track() {
@@ -147,6 +148,86 @@ fn clear_timeline_drops_graphics() {
     .unwrap();
     apply(&mut tl, &mut undo, Op::ClearTimeline).unwrap();
     assert!(tl.tracks.iter().all(|t| t.clips.is_empty()));
+}
+
+#[test]
+fn explanation_drawing_sits_behind_the_speaker() {
+    let mut tl = Timeline::default();
+    let mut undo = UndoStack::new();
+    let v1 = tl.first_track(TrackKind::Video).unwrap().id;
+    let speaker = MediaId::new();
+    tl.add_clip(v1, video_on(speaker, 0.0, 8.0)).unwrap();
+    apply(
+        &mut tl,
+        &mut undo,
+        Op::AddDesign {
+            media_id: MediaId::new(),
+            at: Time::from_seconds(1.5),
+            duration: Duration::from_seconds(3.0),
+            layout: DesignLayout::Behind,
+            text: "Head and shoulders".into(),
+        },
+    )
+    .unwrap();
+    let design = tl.tracks.iter().find(|t| t.name == "Design").unwrap();
+    assert!(design.clips[0].look.overlay);
+    assert!(design.clips[0].look.move_to.is_some());
+    let front = tl.tracks.iter().find(|t| t.name == "Front").unwrap();
+    assert_eq!(front.clips[0].media_id, Some(speaker));
+    assert!(front.clips[0].look.card.is_some());
+    let label = tl
+        .tracks
+        .iter()
+        .flat_map(|t| &t.clips)
+        .find(|c| matches!(c.kind, ClipKind::Graphic { .. }))
+        .unwrap();
+    match &label.kind {
+        ClipKind::Graphic { graphic } => {
+            assert_eq!(graphic.text, "Head and shoulders");
+            assert_eq!(graphic.kind, GraphicKind::LowerThird);
+            assert_eq!(graphic.x, Some(0.28));
+            assert_eq!(graphic.y, Some(0.42));
+        }
+        other => panic!("{other:?}"),
+    }
+    let review = oc_core::review_cut(
+        &tl,
+        &[oc_core::Spoken {
+            media: speaker,
+            start: 0.0,
+            end: 8.0,
+            text: "this is a head and shoulders pattern".into(),
+        }],
+        "show the pattern",
+    );
+    assert!(
+        !review.text.contains("stacked"),
+        "the corner window is the same person, not a second talk track: {}",
+        review.text
+    );
+}
+
+#[test]
+fn house_drawing_sits_beside_the_speaker() {
+    let mut tl = Timeline::default();
+    let mut undo = UndoStack::new();
+    let v1 = tl.first_track(TrackKind::Video).unwrap().id;
+    tl.add_clip(v1, video(0.0, 8.0)).unwrap();
+    apply(
+        &mut tl,
+        &mut undo,
+        Op::AddDesign {
+            media_id: MediaId::new(),
+            at: Time::from_seconds(2.0),
+            duration: Duration::from_seconds(4.0),
+            layout: DesignLayout::Beside,
+            text: "Three-bed house".into(),
+        },
+    )
+    .unwrap();
+    let design = tl.tracks.iter().find(|t| t.name == "Design").unwrap();
+    assert!(design.clips[0].look.card.is_some());
+    assert!(tl.tracks.iter().all(|t| t.name != "Front"));
 }
 
 #[test]

@@ -209,7 +209,11 @@ fn reversed(a: &str, b: &str) -> bool {
 fn video_clips(timeline: &Timeline) -> Vec<&Clip> {
     let mut clips = Vec::new();
     for track in &timeline.tracks {
-        if track.kind != TrackKind::Video || track.hidden {
+        if track.kind != TrackKind::Video
+            || track.hidden
+            || track.name == "Design"
+            || track.name == "Front"
+        {
             continue;
         }
         for clip in &track.clips {

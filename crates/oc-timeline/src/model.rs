@@ -512,6 +512,12 @@ pub struct Graphic {
     pub kind: GraphicKind,
     #[serde(default)]
     pub text: String,
+    /// Center of the label, 0–1 across the frame. None keeps the kind's usual spot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f32>,
+    /// Center of the label, 0–1 down the frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f32>,
 }
 
 impl Graphic {
@@ -520,6 +526,8 @@ impl Graphic {
         Self {
             kind: GraphicKind::Title,
             text: text.into(),
+            x: None,
+            y: None,
         }
     }
 
@@ -528,6 +536,8 @@ impl Graphic {
         Self {
             kind: GraphicKind::LowerThird,
             text: text.into(),
+            x: None,
+            y: None,
         }
     }
 
@@ -536,6 +546,8 @@ impl Graphic {
         Self {
             kind: GraphicKind::Card,
             text: text.into(),
+            x: None,
+            y: None,
         }
     }
 
@@ -544,6 +556,8 @@ impl Graphic {
         Self {
             kind: GraphicKind::Shape,
             text: String::new(),
+            x: None,
+            y: None,
         }
     }
 
@@ -552,6 +566,8 @@ impl Graphic {
         Self {
             kind: GraphicKind::Sticker,
             text: text.into(),
+            x: None,
+            y: None,
         }
     }
 }
@@ -596,11 +612,30 @@ pub struct ClipLook {
     /// Color, bars, noise, or a counter. No media file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generator: Option<Generator>,
+    /// When set, this picture is a card on top of the frame instead of the full frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<FrameCard>,
+    /// Fade the clip's own alpha so an overlay dissolves over the picture under it.
+    #[serde(default, skip_serializing_if = "skip_false")]
+    pub overlay: bool,
     /// Overrides `TransitionKind::mix_seconds` when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_ease: Option<Ease>,
+}
+
+fn skip_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A picture placed on top of the frame. `x` and `y` are the top-left, 0–1.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrameCard {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 /// Rectangle inside the frame, each edge 0–1.
