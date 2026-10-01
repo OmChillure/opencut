@@ -51,13 +51,8 @@ impl AcpClient {
                         continue;
                     }
                     tracing::warn!(acp_stderr = %line, "acp");
-                    let lower = line.to_ascii_lowercase();
-                    if lower.contains("error")
-                        || lower.contains("fail")
-                        || lower.contains("panic")
-                        || lower.contains("denied")
-                    {
-                        emit(ev.as_ref(), ChatEvent::status(format!("acp: {line}"))).await;
+                    if let Some(note) = stderr_chat_note(&line) {
+                        emit(ev.as_ref(), ChatEvent::status(note)).await;
                     }
                 }
             });
@@ -380,6 +375,9 @@ fn looks_like_tool_trace(text: &str) -> bool {
         || t.contains("\"properties\"")
         || t.contains("scheduler_")
         || t.contains("Usage notes:")
+        || t.contains("fire_immediately")
+        || t.contains("main-agent")
+        || escaped_schema_dump(t)
         || (t.starts_with('{') && t.contains("\"name\"") && t.contains("\"arguments\""))
     {
         return true;
@@ -389,6 +387,86 @@ fn looks_like_tool_trace(text: &str) -> bool {
         .filter(|c| matches!(c, '{' | '}' | '"' | '[' | ']' | ':'))
         .count();
     t.len() > 80 && punct * 4 > t.len()
+}
+
+fn escaped_schema_dump(text: &str) -> bool {
+    let breaks = text.matches("\\n").count();
+    breaks >= 3
+        && text.len() > 80
+        && (text.contains('"') || text.contains('{') || text.contains("\\\""))
+}
+
+/// Drop a leaked tool schema from the finished turn. A spoken sentence after it stays.
+pub fn user_visible_text(text: String) -> String {
+    let trimmed = text.trim();
+    if !looks_like_tool_trace(trimmed) {
+        return trimmed.to_string();
+    }
+    for sep in ["\n\n", "\\n\\n"] {
+        if let Some(idx) = trimmed.rfind(sep) {
+            let tail = trimmed[idx + sep.len()..].trim();
+            if reply_sentence(tail) {
+                return tail.to_string();
+            }
+        }
+    }
+    if let Some(idx) = trimmed.rfind('}') {
+        let tail = trimmed[idx + 1..].trim().trim_start_matches("\\n").trim();
+        if reply_sentence(tail) {
+            return tail.to_string();
+        }
+    }
+    String::new()
+}
+
+fn reply_sentence(text: &str) -> bool {
+    text.split_whitespace().count() >= 6 && !looks_like_tool_trace(text) && !schema_phrase(text)
+}
+
+fn schema_phrase(text: &str) -> bool {
+    text.contains("$schema")
+        || text.contains("json-schema")
+        || text.contains("scheduler_")
+        || text.contains("Usage notes")
+        || text.contains("fire_immediately")
+        || text.contains("main-agent")
+        || text.contains("function_call")
+        || text.contains("tool_call")
+        || text.contains("stdout")
+        || text.contains("recurring interval")
+        || text.contains("fields replace")
+}
+
+/// CLI tracing on stderr. Info lines carry ANSI codes, request ids, and
+/// encrypted blobs. A short real failure can still be shown.
+fn stderr_chat_note(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || cli_noise(line) || line.len() > 240 {
+        return None;
+    }
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("error")
+        || lower.contains("fail")
+        || lower.contains("panic")
+        || lower.contains("denied")
+    {
+        return Some(format!("acp: {line}"));
+    }
+    None
+}
+
+fn cli_noise(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("sampling.request")
+        || lower.contains("cli-chat-proxy")
+        || lower.contains("auth_prefix")
+        || lower.contains("encrypted_content")
+        || lower.contains("sse_chunk")
+        || lower.contains("api_backend")
+        || line.contains("[0m")
+        || line.contains("[32m")
+        || line.contains("[2m")
+        || line.contains('\u{1b}')
 }
 
 fn content_text(v: &Value) -> Option<String> {
@@ -637,6 +715,35 @@ mod tests {
         assert!(!looks_like_tool_trace(
             "through the drive, the newsroom, and home. I'm building that into one short."
         ));
+        let dump = concat!(
+            "place that runs a prompt on a recurring interval.\\n",
+            "Usage notes:\\n- Interval format: \\\"5m\\\"\\n",
+            "fields replace old values.\\n",
+            r#"{"$schema":"http://json-schema.org/draft-07/schema#","name":"scheduler_create","parameters":{"fire_immediately":true}}"#,
+        );
+        assert!(looks_like_tool_trace(dump));
+        let visible = user_visible_text(format!(
+            "{dump}\n\nI'll cut a 40 second vlog from the clips you imported."
+        ));
+        assert_eq!(visible, "I'll cut a 40 second vlog from the clips you imported.");
+        assert!(user_visible_text(dump.to_string()).is_empty());
+        assert_eq!(
+            user_visible_text("I'll cut a 40 second vlog from the clips.".into()),
+            "I'll cut a 40 second vlog from the clips."
+        );
+    }
+
+    #[test]
+    fn cli_logs_stay_out_of_chat() {
+        let log = "acp: [2m2026-10-01T08:59:20Z[0m [32m INFO[0m sampling.request model=grok-4.7 auth_prefix=hidden sse_chunk encrypted_content api_backend=responses";
+        assert!(cli_noise(log));
+        assert!(stderr_chat_note(log).is_none());
+        assert!(stderr_chat_note("INFO sampling.request base_url=https://cli-chat-proxy.grok.com/v1").is_none());
+        assert_eq!(
+            stderr_chat_note("Error: grok is not logged in").as_deref(),
+            Some("acp: Error: grok is not logged in")
+        );
+        assert!(!cli_noise("ACP grok · grok-4.7"));
     }
 
     #[test]

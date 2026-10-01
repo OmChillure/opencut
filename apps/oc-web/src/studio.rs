@@ -1,7 +1,7 @@
 //! Editor surfaces modeled on Kdenlive: audio mixer, curves, alpha shapes,
 //! scopes, generators, time remap, undo history, multicam, and the rendered file.
 
-use crate::media::{self, Clock, MediaItem, capture_pointer, preview_video};
+use crate::media::{self, Clock, MediaItem, capture_pointer};
 use crate::tools;
 use crate::WorkspaceSave;
 use dioxus::prelude::*;
@@ -282,12 +282,21 @@ pub fn CurvesPanel(selected: String, track: String, at: f64) -> Element {
                     }
                     next.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
                     points.set(next.clone());
-                    let curves = match channel.peek().as_str() {
-                        "red" => Curves { red: next, ..Curves::default() },
-                        "green" => Curves { green: next, ..Curves::default() },
-                        "blue" => Curves { blue: next, ..Curves::default() },
-                        _ => Curves { all: next, ..Curves::default() },
-                    };
+                    let mut curves = save
+                        .engine
+                        .peek()
+                        .tracks
+                        .iter()
+                        .flat_map(|row| row.clips.iter())
+                        .find(|clip_row| clip_row.id.to_string() == selected)
+                        .map(|clip_row| clip_row.look.curves.clone())
+                        .unwrap_or_default();
+                    match channel.peek().as_str() {
+                        "red" => curves.red = next,
+                        "green" => curves.green = next,
+                        "blue" => curves.blue = next,
+                        _ => curves.all = next,
+                    }
                     let _ = tools::set_curves_at(save, Some(&selected), &track, at, curves);
                 },
                 polyline { points: "{poly}", fill: "none", stroke: "currentColor", "stroke-width": "0.012" }
@@ -349,8 +358,26 @@ pub fn MaskPanel(selected: String, track: String, at: f64) -> Element {
     let mut shape = use_signal(|| MaskShape::Rectangle);
     let mut feather = use_signal(|| 0.0_f32);
     let mut invert = use_signal(|| false);
+    let mut mask_x = use_signal(|| 0.5_f32);
+    let mut mask_y = use_signal(|| 0.5_f32);
+    let mut mask_w = use_signal(|| 0.5_f32);
+    let mut mask_h = use_signal(|| 0.5_f32);
+    let selected_load = selected.clone();
     let selected_clear = selected.clone();
     let track_clear = track.clone();
+    use_effect(move || {
+        let id = selected_load.clone();
+        let mask = save.engine.read().tracks.iter().flat_map(|row| row.clips.iter()).find(|clip| clip.id.to_string() == id).and_then(|clip| clip.look.mask);
+        if let Some(mask) = mask {
+            shape.set(mask.shape);
+            feather.set(mask.feather);
+            invert.set(mask.invert);
+            mask_x.set(mask.x);
+            mask_y.set(mask.y);
+            mask_w.set(mask.w);
+            mask_h.set(mask.h);
+        }
+    });
     rsx! {
         div { class: "card-list",
             div { class: "mixer-title", "Alpha shapes" }
@@ -387,10 +414,10 @@ pub fn MaskPanel(selected: String, track: String, at: f64) -> Element {
                 onclick: move |_| {
                     let mask = AlphaShape {
                         shape: *shape.peek(),
-                        x: 0.5,
-                        y: 0.5,
-                        w: 0.5,
-                        h: 0.5,
+                        x: *mask_x.peek(),
+                        y: *mask_y.peek(),
+                        w: *mask_w.peek(),
+                        h: *mask_h.peek(),
                         feather: *feather.peek(),
                         invert: *invert.peek(),
                     };
@@ -409,6 +436,40 @@ pub fn MaskPanel(selected: String, track: String, at: f64) -> Element {
     }
 }
 
+fn remap_speeds(clip: &oc_core::Clip) -> (f32, f32, f32) {
+    let start = if clip.speed.is_finite() && clip.speed > 0.05 {
+        clip.speed
+    } else {
+        1.0
+    };
+    if clip.look.speed_keys.len() >= 2 {
+        let keys = &clip.look.speed_keys;
+        let start = keys
+            .iter()
+            .min_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|key| key.speed)
+            .unwrap_or(start);
+        let end = keys
+            .iter()
+            .max_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|key| key.speed)
+            .unwrap_or(start);
+        let mid = keys
+            .iter()
+            .min_by(|a, b| {
+                (a.at - 0.5)
+                    .abs()
+                    .partial_cmp(&(b.at - 0.5).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|key| key.speed)
+            .unwrap_or((start + end) * 0.5);
+        return (start, mid, end);
+    }
+    let end = clip.look.speed_to.unwrap_or(start);
+    (start, (start + end) * 0.5, end)
+}
+
 fn shape_name(shape: MaskShape) -> &'static str {
     match shape {
         MaskShape::Rectangle => "Rectangle",
@@ -421,8 +482,27 @@ fn shape_name(shape: MaskShape) -> &'static str {
 #[component]
 pub fn TimeRemap(selected: String, track: String, at: f64) -> Element {
     let save = use_context::<WorkspaceSave>();
+    let mut start_speed = use_signal(|| 1.0_f32);
     let mut mid_speed = use_signal(|| 1.0_f32);
     let mut end_speed = use_signal(|| 1.0_f32);
+    let selected_load = selected.clone();
+    use_effect(move || {
+        let id = selected_load.clone();
+        let Some((start, mid, end)) = save
+            .engine
+            .read()
+            .tracks
+            .iter()
+            .flat_map(|row| row.clips.iter())
+            .find(|clip| clip.id.to_string() == id)
+            .map(remap_speeds)
+        else {
+            return;
+        };
+        start_speed.set(start);
+        mid_speed.set(mid);
+        end_speed.set(end);
+    });
     rsx! {
         div { class: "card-list",
             div { class: "mixer-title", "Time remap" }
@@ -444,7 +524,7 @@ pub fn TimeRemap(selected: String, track: String, at: f64) -> Element {
                 class: "btn btn-primary",
                 onclick: move |_| {
                     let keys = vec![
-                        SpeedKey { at: 0.0, speed: 1.0 },
+                        SpeedKey { at: 0.0, speed: *start_speed.peek() },
                         SpeedKey { at: 0.5, speed: *mid_speed.peek() },
                         SpeedKey { at: 1.0, speed: *end_speed.peek() },
                     ];
@@ -553,10 +633,10 @@ pub fn Scopes() -> Element {
                 canvas {
                     id: "scope-canvas",
                     width: "280",
-                    height: "120",
+                    height: "168",
                     class: "scope-canvas",
                 }
-                p { class: "mixer-note", "Waveform, RGB parade, and vectorscope of the current monitor frame." }
+                p { class: "mixer-note", "Waveform, RGB parade, vectorscope, and histogram of the current monitor frame." }
             }
         }
     }
@@ -576,12 +656,6 @@ fn ensure_scopes() {
 }
 
 pub fn paint_scopes() {
-    let Some(video) = preview_video() else {
-        return;
-    };
-    if video.ready_state() < 2 {
-        return;
-    }
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
@@ -602,8 +676,10 @@ pub fn paint_scopes() {
     let Some(px) = media::graded_frame() else {
         return;
     };
+    let plot_h = (h - 42.0).max(48.0);
     ctx.set_fill_style_str("#111");
     ctx.fill_rect(0.0, 0.0, w, h);
+    let mut bins = [0u32; 32];
     // Waveform (luma) on the left third, parade in the middle, vectorscope on the right.
     for y in (0..90).step_by(2) {
         for x in (0..160).step_by(2) {
@@ -617,8 +693,10 @@ pub fn paint_scopes() {
             let g = px[i + 1] as f64;
             let b = px[i + 2] as f64;
             let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+            let bin = (luma * 31.0).clamp(0.0, 31.0) as usize;
+            bins[bin] = bins[bin].saturating_add(1);
             ctx.set_fill_style_str("rgba(180,220,180,0.35)");
-            ctx.fill_rect(x as f64 * 0.9, (1.0 - luma) * (h - 4.0), 1.0, 1.0);
+            ctx.fill_rect(x as f64 * 0.9, (1.0 - luma) * (plot_h - 4.0), 1.0, 1.0);
             ctx.set_fill_style_str("rgba(220,80,80,0.45)");
             ctx.fill_rect(90.0 + (r / 255.0) * 50.0, y as f64 * 2.4, 1.0, 1.0);
             ctx.set_fill_style_str("rgba(80,200,80,0.45)");
@@ -628,8 +706,14 @@ pub fn paint_scopes() {
             let uu = (b - luma * 255.0) / 255.0;
             let vv = (r - luma * 255.0) / 255.0;
             ctx.set_fill_style_str("rgba(240,220,120,0.8)");
-            ctx.fill_rect(210.0 + uu * 28.0, 60.0 - vv * 28.0, 1.5, 1.5);
+            ctx.fill_rect(210.0 + uu * 28.0, (plot_h * 0.5) - vv * 28.0, 1.5, 1.5);
         }
+    }
+    let peak = bins.iter().copied().max().unwrap_or(1).max(1) as f64;
+    ctx.set_fill_style_str("rgba(220,220,220,0.85)");
+    for (i, count) in bins.iter().enumerate() {
+        let bar = (*count as f64 / peak) * 32.0;
+        ctx.fill_rect(6.0 + i as f64 * 8.4, h - 6.0 - bar, 6.0, bar);
     }
 }
 
@@ -707,63 +791,6 @@ pub fn MulticamBank() -> Element {
                 }
             }
             p { class: "mixer-note", "Audio stays on the track you already mixed. Cutting only changes the picture." }
-        }
-    }
-}
-
-#[component]
-pub fn ExportPlayer() -> Element {
-    let save = use_context::<WorkspaceSave>();
-    let mut url = use_signal(String::new);
-    let mut note = use_signal(|| String::new());
-    rsx! {
-        div { class: "export-play",
-            button {
-                class: "btn btn-primary",
-                onclick: move |_| {
-                    let preset = {
-                        let tl = save.engine.peek();
-                        if tl.height > tl.width {
-                            oc_core::ExportPreset::Vertical1080
-                        } else if tl.width == tl.height {
-                            oc_core::ExportPreset::Square1080
-                        } else {
-                            oc_core::ExportPreset::Youtube1080
-                        }
-                    };
-                    match tools::run_ops(save, vec![oc_core::Op::Export { preset }]) {
-                        Ok(_) => {
-                            note.set("Rendering. The file plays here when the worker finishes.".into());
-                            let pid = save.project_id.peek().clone();
-                            spawn(async move {
-                                for _ in 0..60 {
-                                    gloo_timers::future::TimeoutFuture::new(2000).await;
-                                    let file = format!("http://127.0.0.1:8787/v1/projects/{pid}/export");
-                                    if reqwest::Client::new().head(&file).send().await.ok().is_some_and(|r| r.status().is_success()) {
-                                        url.set(file);
-                                        note.set("Play after render".into());
-                                        return;
-                                    }
-                                }
-                                note.set("The render did not show up yet. Check the worker.".into());
-                            });
-                        }
-                        Err(err) => note.set(err),
-                    }
-                },
-                "Export"
-            }
-            if !note.read().is_empty() {
-                span { class: "mixer-note", "{note}" }
-            }
-            if !url.read().is_empty() {
-                video {
-                    class: "export-video",
-                    src: "{url}",
-                    controls: true,
-                    playsinline: true,
-                }
-            }
         }
     }
 }

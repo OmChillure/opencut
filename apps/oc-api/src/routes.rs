@@ -2,7 +2,7 @@ use crate::edit::{self, hydrate_op, look_by_media, speech_by_media};
 use crate::state::AppState;
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use futures_util::StreamExt;
@@ -38,6 +38,9 @@ impl From<oc_db::DbError> for ApiError {
     fn from(value: oc_db::DbError) -> Self {
         match value {
             oc_db::DbError::NotFound => Self::new(StatusCode::NOT_FOUND, "not found"),
+            oc_db::DbError::BadUser => {
+                Self::new(StatusCode::BAD_REQUEST, "sign in with an email")
+            }
             other => Self::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         }
     }
@@ -1199,6 +1202,75 @@ pub async fn transcribe_media(
     .await?;
     oc_db::set_media_status(&state.db, media_id, "transcribing").await?;
     Ok(Json(serde_json::json!({ "job_id": job })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct UserQuery {
+    user: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CreateChatBody {
+    user: String,
+    title: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SaveChatBody {
+    user: String,
+    #[serde(default)]
+    messages: Vec<oc_db::ChatMessageInput>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ChatDetail {
+    #[serde(flatten)]
+    chat: oc_db::ChatRow,
+    messages: Vec<oc_db::ChatMessageInput>,
+}
+
+pub async fn list_chats(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<UserQuery>,
+) -> ApiResult<Json<Vec<oc_db::ChatRow>>> {
+    Ok(Json(oc_db::list_chats(&state.db, id, &query.user).await?))
+}
+
+pub async fn create_chat(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateChatBody>,
+) -> ApiResult<Json<oc_db::ChatRow>> {
+    let chat = oc_db::create_chat(&state.db, id, &body.user, body.title.as_deref()).await?;
+    tracing::info!(project = %id, chat = %chat.id, "chat created");
+    Ok(Json(chat))
+}
+
+pub async fn get_chat(
+    State(state): State<AppState>,
+    Path((id, chat_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<UserQuery>,
+) -> ApiResult<Json<ChatDetail>> {
+    let (chat, messages) = oc_db::get_chat(&state.db, id, chat_id, &query.user).await?;
+    Ok(Json(ChatDetail { chat, messages }))
+}
+
+pub async fn save_chat_messages(
+    State(state): State<AppState>,
+    Path((id, chat_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<SaveChatBody>,
+) -> ApiResult<Json<oc_db::ChatRow>> {
+    let chat = oc_db::save_chat_messages(
+        &state.db,
+        id,
+        chat_id,
+        &body.user,
+        &body.messages,
+    )
+    .await?;
+    tracing::info!(project = %id, chat = %chat_id, n = body.messages.len(), "chat saved");
+    Ok(Json(chat))
 }
 
 #[cfg(test)]

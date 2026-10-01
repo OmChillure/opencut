@@ -6,7 +6,7 @@ mod state;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
@@ -14,7 +14,8 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use crate::routes::{
-    apply_ops, chat, complete_upload, create_project, delete_project, get_project, health,
+    apply_ops, chat, complete_upload, create_chat, create_project, delete_project, get_chat,
+    get_project, health, list_chats, save_chat_messages,
     get_export, get_media_file, head_export, list_ai_providers, list_media, list_projects,
     patch_media, put_media_bytes, generate_captions, register_media, request_upload,
     transcribe_media, update_project,
@@ -57,6 +58,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/projects/{id}/ops", post(apply_ops))
         .route("/v1/ai/providers", get(list_ai_providers))
         .route("/v1/projects/{id}/chat", post(chat))
+        .route("/v1/projects/{id}/chats", get(list_chats).post(create_chat))
+        .route("/v1/projects/{id}/chats/{chat_id}", get(get_chat))
+        .route(
+            "/v1/projects/{id}/chats/{chat_id}/messages",
+            put(save_chat_messages),
+        )
         .route("/v1/projects/{id}/media", get(list_media).post(register_media))
         .route("/v1/projects/{id}/media/upload", post(request_upload))
         .route(

@@ -143,6 +143,56 @@ mod tests {
     }
 
     #[test]
+    fn source_time_follows_a_constant_rate() {
+        let mut clip = video_clip(0.0, 4.0);
+        clip.source_in = Time::from_seconds(10.0);
+        clip.speed = 2.0;
+        let at = clip.source_time_at(Time::from_seconds(1.0)).unwrap();
+        assert!((at.as_seconds() - 12.0).abs() < 1e-3);
+        assert!((clip.speed_at(Time::from_seconds(1.0)) - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn source_time_integrates_a_speed_ramp() {
+        let mut clip = video_clip(0.0, 4.0);
+        clip.look.speed_to = Some(3.0);
+        let at = clip.source_time_at(Time::from_seconds(2.0)).unwrap();
+        assert!((at.as_seconds() - 3.0).abs() < 1e-2, "{}", at.as_seconds());
+    }
+
+    #[test]
+    fn split_a_doubled_clip_uses_source_time() {
+        let mut tl = Timeline::default();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let mut clip = video_clip(0.0, 4.0);
+        clip.speed = 2.0;
+        clip.source_in = Time::from_seconds(10.0);
+        let id = tl.add_clip(track, clip).unwrap();
+        let right = tl.split(id, Time::from_seconds(1.0)).unwrap();
+        let right = tl.find_clip(right).unwrap().1;
+        assert!((right.source_in.as_seconds() - 12.0).abs() < 1e-2, "{}", right.source_in.as_seconds());
+        tl.merge_with_next(id).unwrap();
+        let joined = tl.find_clip(id).unwrap().1;
+        assert!((joined.duration.as_seconds() - 4.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn split_follows_a_speed_ramp() {
+        let mut tl = Timeline::default();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let mut clip = video_clip(0.0, 4.0);
+        clip.look.speed_to = Some(3.0);
+        let id = tl.add_clip(track, clip).unwrap();
+        let right_id = tl.split(id, Time::from_seconds(2.0)).unwrap();
+        let right = tl.find_clip(right_id).unwrap().1;
+        assert!((right.source_in.as_seconds() - 3.0).abs() < 0.05, "{}", right.source_in.as_seconds());
+        assert!((right.speed - 2.0).abs() < 0.05, "right starts at the cut speed {}", right.speed);
+        let left = tl.find_clip(id).unwrap().1;
+        assert!((left.look.speed_to.unwrap_or(0.0) - 2.0).abs() < 0.05);
+        tl.merge_with_next(id).unwrap();
+    }
+
+    #[test]
     fn mixer_unity_is_zero_db() {
         let tl = Timeline::default();
         assert!((tl.master.linear() - 1.0).abs() < 1e-4);

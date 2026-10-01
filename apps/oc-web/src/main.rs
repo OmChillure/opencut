@@ -17,6 +17,7 @@ use media::{
     playhead_now, preview_video, reset_tick_clock, ruler_marks_nle, scroll_left,
     apply_monitor_look,
     seek_by, max_timeline_h, program_end, set_media_duration, set_playhead, sync_monitor, timeline_end,
+    uses_wall_clock,
     timeline_viewport_h, timeline_viewport_w, update_drag,
     capture_pointer, clamp_pps, video_duration_from_src,
 };
@@ -25,7 +26,7 @@ use oc_core::{
 };
 use oc_core::TimelineEditMode;
 use oc_tools::{ToolId, actions as cut_actions, modes as edit_tools, track_actions};
-use pages::{Login, NewProject, Projects};
+use pages::{Export, Login, NewProject, Projects};
 use toast::{ToastProvider, show_toast};
 
 const CSS: &str = include_str!("../assets/style.css");
@@ -40,6 +41,8 @@ pub enum Route {
     NewProject {},
     #[route("/:id/workspace")]
     Workspace { id: String },
+    #[route("/:id/export")]
+    Export { id: String },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -345,6 +348,9 @@ fn Workspace(id: String) -> Element {
         win.set_onbeforeunload(Some(handler));
         closure.forget();
     });
+    use_effect(move || {
+        install_studio_shortcut(ai_open);
+    });
 
     use_future(move || async move {
         let pid = project_id.peek().clone();
@@ -392,18 +398,23 @@ fn Workspace(id: String) -> Element {
                 playing.set(false);
                 continue;
             }
-            let before = playhead_now().min(end);
+            let parked = playhead_now().min(end);
+            let before = if uses_wall_clock(&engine.peek(), parked) {
+                advance_playhead(end).min(end)
+            } else {
+                parked
+            };
             if before >= end - 0.02 {
                 set_playhead(end);
                 paint_playhead(end);
-                sync_monitor(&library.peek(), &tracks.peek(), end, false);
+                sync_monitor(&engine.peek(), &library.peek(), &tracks.peek(), end, false);
                 let mut playing = clock.playing;
                 playing.set(false);
                 let mut current = clock.current;
                 current.set(end);
                 continue;
             }
-            sync_monitor(&library.peek(), &tracks.peek(), before, true);
+            sync_monitor(&engine.peek(), &library.peek(), &tracks.peek(), before, true);
             apply_monitor_look(
                 &engine.peek(),
                 &library.peek(),
@@ -423,7 +434,7 @@ fn Workspace(id: String) -> Element {
                     playing.set(false);
                     let parked = playhead_now().min(end);
                     set_playhead(parked);
-                    sync_monitor(&library.peek(), &tracks.peek(), parked, false);
+                    sync_monitor(&engine.peek(), &library.peek(), &tracks.peek(), parked, false);
                     paint_playhead(parked);
                     let mut current = clock.current;
                     current.set(parked);
@@ -554,6 +565,7 @@ fn drag_chip(drag: Signal<Option<DragSession>>) -> Element {
 
 #[component]
 fn Header(name: Signal<String>) -> Element {
+    let nav = navigator();
     let project_id = use_context::<CtxProject>().0;
     let save = use_context::<WorkspaceSave>();
     let held = use_context::<CtxHeld>().0;
@@ -595,7 +607,18 @@ fn Header(name: Signal<String>) -> Element {
                     onclick: move |_| save_held_imports(held, library, tracks, save),
                     "Save progress"
                 }
-                studio::ExportPlayer {}
+                button {
+                    class: "btn btn-primary",
+                    onclick: move |_| {
+                        if !confirm_leave(held) {
+                            return;
+                        }
+                        nav.push(Route::Export {
+                            id: project_id.peek().clone(),
+                        });
+                    },
+                    "Export"
+                }
             }
         }
     }
@@ -1233,7 +1256,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
             return;
         }
         let now = *clock.current.read();
-        sync_monitor(&library.read(), &tracks.read(), now, false);
+        sync_monitor(&save.engine.read(), &library.read(), &tracks.read(), now, false);
         apply_monitor_look(&save.engine.read(), &library.read(), now, false);
     });
 
@@ -1300,8 +1323,14 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                                     &library.read(),
                                     now,
                                 ) {
+                                    let rate = if shot.speed.is_finite() && shot.speed > 0.0 {
+                                        shot.speed.clamp(0.25, 4.0)
+                                    } else {
+                                        1.0
+                                    };
                                     video.set_current_time(
-                                        (shot.source_in + (now - shot.start)).max(0.0),
+                                        (shot.source_in + (now - shot.start).max(0.0) * rate)
+                                            .max(0.0),
                                     );
                                 }
                             }
@@ -1324,6 +1353,12 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                         preload: "auto",
                         playsinline: true,
                         muted: true,
+                    }
+                    canvas {
+                        id: "program-canvas",
+                        class: "program-canvas off",
+                        width: "420",
+                        height: "236",
                     }
                     canvas {
                         id: "grade-canvas",
@@ -2250,6 +2285,10 @@ fn AiSidebar(
     let mut model_id = use_signal(|| "grok-4.6".to_string());
     let mut model_name = use_signal(|| "Grok 4.6".to_string());
     let busy = use_signal(|| false);
+    let mut chats = use_signal(Vec::<api::ChatSummary>::new);
+    let mut chat_id = use_signal(|| None::<String>);
+    let mut chat_menu = use_signal(|| false);
+    let open_gen = use_signal(|| 0u32);
 
     // A schema dump already stored as a reply collapses on the next render,
     // including a chat that was open before this build loaded.
@@ -2274,6 +2313,33 @@ fn AiSidebar(
             providers.set(list);
         }
     });
+    let project_for_chats = save.project_id;
+    use_future(move || async move {
+        let pid = project_for_chats.peek().clone();
+        let Some(user) = auth::current_email() else {
+            return;
+        };
+        let Ok(remote) = api::list_chats(&pid, &user).await else {
+            return;
+        };
+        let current = chat_id.peek().clone();
+        let local = chats.peek().clone();
+        let merged = merge_remote_chats(remote, &local, current.as_deref());
+        chats.set(merged);
+        if chat_id.peek().is_some() {
+            return;
+        }
+        let Some(first) = chats.peek().first().cloned() else {
+            return;
+        };
+        chat_id.set(Some(first.id.clone()));
+        if let Ok(detail) = api::get_chat(&pid, &first.id, &user).await {
+            if chat_id.peek().as_deref() != Some(first.id.as_str()) {
+                return;
+            }
+            apply_stored(&mut messages, detail.messages);
+        }
+    });
     let suggestions = [
         ("Split at playhead", "split"),
         ("Merge clips", "merge"),
@@ -2288,6 +2354,15 @@ fn AiSidebar(
 
     let open = *ai_open.read();
     let panel_w = if open { *ai_width.read() } else { 40.0 };
+    let current_chat = chat_id.read().clone();
+    let saved_chats = chats.read().clone();
+    let chat_title = saved_chats
+        .iter()
+        .find(|row| Some(&row.id) == current_chat.as_ref())
+        .map(|row| row.title.clone())
+        .unwrap_or_else(|| "New chat".into());
+    let menu_open = *chat_menu.read();
+    let running = *busy.read();
     let mut folded = messages.read().clone();
     fold_messages(&mut folded);
     let chat_empty = folded.is_empty();
@@ -2319,11 +2394,66 @@ fn AiSidebar(
                     }
                 }
                 if open {
-                    div { class: "ai-title ai-copy",
-                        span { "AI Studio" }
-                        span { class: "badge", "Beta" }
+                    div { class: "ai-head-actions ai-copy",
+                        button {
+                            class: "chat-switch",
+                            title: "Saved chats",
+                            onclick: move |_| {
+                                let next = !*chat_menu.peek();
+                                chat_menu.set(next);
+                            },
+                            span { "{chat_title}" }
+                            span { class: "chat-caret", if menu_open { "▴" } else { "▾" } }
+                        }
+                        button {
+                            class: "chat-new",
+                            title: "New chat",
+                            disabled: running,
+                            onclick: move |_| start_new_chat(
+                                chat_id,
+                                chats,
+                                messages,
+                                draft,
+                                chat_menu,
+                                busy,
+                                save.project_id.peek().clone(),
+                            ),
+                            "New"
+                        }
                     }
                     span { class: "kbd", "Ctrl+K" }
+                }
+            }
+            if open && menu_open {
+                div { class: "chat-menu",
+                    if saved_chats.is_empty() {
+                        p { class: "chat-menu-empty", "No saved chats yet" }
+                    }
+                    for chat in saved_chats {
+                        {
+                            let id = chat.id.clone();
+                            let selected = current_chat.as_deref() == Some(id.as_str());
+                            let pid = save.project_id.peek().clone();
+                            rsx! {
+                                button {
+                                    class: if selected { "on" } else { "" },
+                                    disabled: running,
+                                    onclick: move |_| open_saved_chat(
+                                        id.clone(),
+                                        chat_id,
+                                        chats,
+                                        messages,
+                                        draft,
+                                        chat_menu,
+                                        open_gen,
+                                        busy,
+                                        pid.clone(),
+                                    ),
+                                    "{chat.title}"
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if open {
@@ -2381,6 +2511,7 @@ fn AiSidebar(
                 }
                 div { class: "ai-input",
                     input {
+                        id: "ai-prompt",
                         placeholder: "Make a vlog from these clips…",
                         value: "{draft}",
                         oninput: move |e| draft.set(e.value()),
@@ -2395,6 +2526,8 @@ fn AiSidebar(
                                     provider_id,
                                     model_id,
                                     busy,
+                                    chat_id,
+                                    chats,
                                 );
                             }
                         },
@@ -2403,7 +2536,7 @@ fn AiSidebar(
                         button {
                             class: "send pause",
                             title: "Stop the chat",
-                            onclick: move |_| stop_chat(messages, busy),
+                            onclick: move |_| stop_chat(messages),
                             "Pause"
                         }
                     } else {
@@ -2419,6 +2552,8 @@ fn AiSidebar(
                                 provider_id,
                                 model_id,
                                 busy,
+                                chat_id,
+                                chats,
                             ),
                             IconSend {}
                         }
@@ -2507,7 +2642,7 @@ fn ProviderPicker(
 fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent) {
     match ev.kind.as_str() {
         "status" => {
-            if ev.text.trim().is_empty() {
+            if ev.text.trim().is_empty() || is_acp_log(&ev.text) {
                 return;
             }
             let mut list = messages.write();
@@ -2518,6 +2653,9 @@ fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent
             }
         }
         "text" => {
+            if is_acp_log(&ev.text) {
+                return;
+            }
             let mut list = messages.write();
             append_model_chunk(&mut list, &ev.text, false);
         }
@@ -2530,11 +2668,14 @@ fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent
             messages.write().push(ChatMsg::bot(format!("Error: {}", ev.text)));
         }
         "thought" => {
+            if is_acp_log(&ev.text) {
+                return;
+            }
             let mut list = messages.write();
             append_model_chunk(&mut list, &ev.text, true);
         }
         "note" => {
-            if !ev.text.is_empty() {
+            if !ev.text.is_empty() && !is_acp_log(&ev.text) {
                 messages.write().push(ChatMsg::status(ev.text));
             }
         }
@@ -2622,7 +2763,15 @@ fn render_chat_msg(messages: Signal<Vec<ChatMsg>>, msg: ChatMsg) -> Element {
         ChatRole::User => rsx! { div { class: "bubble user", "{msg.text}" } },
         ChatRole::Bot => {
             let (trace, visible) = detach_trace(&msg.text);
-            if trace.is_empty() {
+            let hide = !trace.is_empty()
+                || looks_like_tool_trace(&msg.text)
+                || leak_marker(&msg.text);
+            let visible = if looks_like_tool_trace(&visible) || leak_marker(&visible) {
+                String::new()
+            } else {
+                visible
+            };
+            if !hide {
                 rsx! { div { class: "bubble bot", "{msg.text}" } }
             } else {
                 let visible = visible.clone();
@@ -2730,6 +2879,21 @@ fn short_tool_name(raw: &str) -> String {
     s.rsplit("__").next().unwrap_or(s).trim().to_string()
 }
 
+/// Grok CLI tracing that was forwarded into the chat. Not a reply.
+fn is_acp_log(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("sampling.request")
+        || lower.contains("cli-chat-proxy")
+        || lower.contains("auth_prefix")
+        || lower.contains("encrypted_content")
+        || lower.contains("sse_chunk")
+        || lower.contains("api_backend")
+        || text.contains("[0m")
+        || text.contains("[32m")
+        || text.contains("[2m")
+        || text.contains('\u{1b}')
+}
+
 fn looks_like_tool_trace(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
@@ -2737,6 +2901,8 @@ fn looks_like_tool_trace(text: &str) -> bool {
     }
     if t.contains("function_call")
         || t.contains("tool_call")
+        || t.contains("\"type\":\"function\"")
+        || t.contains("\"type\": \"function\"")
         || t.contains("sessionUpdate")
         || t.contains("session/prompt")
         || t.contains("$schema")
@@ -2751,6 +2917,7 @@ fn looks_like_tool_trace(text: &str) -> bool {
         || t.contains("\\\"parameters\\\"")
         || t.contains("\\\"properties\\\"")
         || t.contains("\\\"$schema\\\"")
+        || escaped_schema_dump(t)
     {
         return true;
     }
@@ -2761,8 +2928,15 @@ fn looks_like_tool_trace(text: &str) -> bool {
     t.len() > 80 && punct * 4 > t.len()
 }
 
+/// The Grok tool list arrives as one long line with literal `\n` and quotes.
+fn escaped_schema_dump(text: &str) -> bool {
+    let breaks = text.matches("\\n").count();
+    breaks >= 3
+        && text.len() > 80
+        && (text.contains('"') || text.contains('{') || text.contains("\\\""))
+}
+
 /// More of a schema that is already sitting in Thinking.
-#[cfg_attr(not(test), allow(dead_code))]
 fn chunk_continues_trace(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
@@ -2843,6 +3017,15 @@ fn leak_marker(text: &str) -> bool {
         || text.contains("function_call")
         || text.contains("tool_call")
         || text.contains("stdout")
+        || text.contains("recurring interval")
+        || text.contains("fields replace")
+        || text.contains("Interval format")
+        || text.contains("Create-only")
+        || text.contains("long-running script")
+        || text.contains("Use this tool when")
+        || text.contains("omitted ones")
+        || text.contains("auto-expire")
+        || text.contains("timeout_ms")
 }
 
 /// Short schema tokens stay inside Thinking. A full spoken sentence starts the reply.
@@ -2894,6 +3077,7 @@ fn append_model_chunk(list: &mut Vec<ChatMsg>, chunk: &str, as_thought: bool) {
 
 /// Every schema bubble becomes a collapsed Thinking row, not only the last one.
 fn fold_messages(list: &mut Vec<ChatMsg>) {
+    list.retain(|msg| msg.role == ChatRole::User || msg.role == ChatRole::Tool || !is_acp_log(&msg.text));
     let mut i = 0;
     while i < list.len() {
         if list[i].role != ChatRole::Bot {
@@ -2922,7 +3106,83 @@ fn fold_messages(list: &mut Vec<ChatMsg>) {
             i += 1;
         }
     }
+    absorb_trace_fragments(list);
     peel_thought_replies(list);
+}
+
+/// A tool row can split one schema dump into several bubbles. Pull those
+/// pieces into the one Thinking row for this turn. A spoken reply stays put.
+fn absorb_trace_fragments(list: &mut Vec<ChatMsg>) {
+    let mut start = 0;
+    while start < list.len() {
+        if list[start].role == ChatRole::User {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < list.len() && list[end].role != ChatRole::User {
+            end += 1;
+        }
+        let span = &list[start..end];
+        let has_schema = span.iter().any(|msg| {
+            matches!(msg.role, ChatRole::Bot | ChatRole::Thought)
+                && looks_like_tool_trace(&msg.text)
+        });
+        let pieces: Vec<usize> = (start..end)
+            .filter(|&i| has_schema && should_fold_into_trace(&list[i]))
+            .collect();
+        if pieces.len() > 1 {
+            let id = pieces
+                .iter()
+                .find_map(|&i| {
+                    (list[i].role == ChatRole::Thought && !list[i].tool_id.is_empty())
+                        .then(|| list[i].tool_id.clone())
+                })
+                .unwrap_or_else(|| format!("thought-{start}"));
+            let mut trace = String::new();
+            for &i in &pieces {
+                trace.push_str(&list[i].text);
+            }
+            let mut out = Vec::with_capacity(end - start);
+            let mut placed = false;
+            for i in start..end {
+                if pieces.contains(&i) {
+                    if !placed {
+                        let mut thought = closed_thought(trace.clone(), start);
+                        thought.tool_id = id.clone();
+                        out.push(thought);
+                        placed = true;
+                    }
+                } else {
+                    out.push(list[i].clone());
+                }
+            }
+            if list[start..end] != out[..] {
+                list.splice(start..end, out.iter().cloned());
+                end = start + out.len();
+            }
+        }
+        start = end;
+    }
+}
+
+fn should_fold_into_trace(msg: &ChatMsg) -> bool {
+    match msg.role {
+        ChatRole::Thought => looks_like_tool_trace(&msg.text),
+        ChatRole::Bot => {
+            let t = msg.text.trim();
+            let lower = t.starts_with(|c: char| c.is_lowercase());
+            if spoken_reply_text(t) && !lower {
+                return false;
+            }
+            looks_like_tool_trace(t)
+                || chunk_continues_trace(t)
+                || leak_marker(t)
+                || t.matches("\\n").count() >= 2
+                || lower
+        }
+        _ => false,
+    }
 }
 
 fn peel_thought_replies(list: &mut Vec<ChatMsg>) {
@@ -2975,6 +3235,54 @@ fn compact_json(value: &serde_json::Value) -> String {
         return String::new();
     }
     serde_json::to_string(value).unwrap_or_default()
+}
+
+fn install_studio_shortcut(mut ai_open: Signal<bool>) {
+    use std::cell::Cell;
+    thread_local! {
+        static INSTALLED: Cell<bool> = const { Cell::new(false) };
+    }
+    if INSTALLED.with(|flag| flag.replace(true)) {
+        return;
+    }
+    let Some(win) = web_sys::window() else {
+        INSTALLED.with(|flag| flag.set(false));
+        return;
+    };
+    let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
+        let key = event.key();
+        if !(event.ctrl_key() || event.meta_key()) || event.alt_key() || !key.eq_ignore_ascii_case("k") {
+            return;
+        }
+        event.prevent_default();
+        ai_open.set(true);
+        let focus = wasm_bindgen::closure::Closure::once(|| {
+            let Some(el) = web_sys::window()
+                .and_then(|window| window.document())
+                .and_then(|doc| doc.get_element_by_id("ai-prompt"))
+            else {
+                return;
+            };
+            if let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() {
+                let _ = el.focus();
+            }
+        });
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                focus.as_ref().unchecked_ref(),
+                40,
+            );
+        }
+        focus.forget();
+    }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
+    if win
+        .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
+        .is_err()
+    {
+        INSTALLED.with(|flag| flag.set(false));
+        return;
+    }
+    closure.forget();
 }
 
 fn show_timeline(save: &mut WorkspaceSave, clock: &Clock, timeline: EngineTimeline) {
@@ -3057,11 +3365,10 @@ fn commit_mask(
     );
 }
 
-fn stop_chat(mut messages: Signal<Vec<ChatMsg>>, mut busy: Signal<bool>) {
+fn stop_chat(mut messages: Signal<Vec<ChatMsg>>) {
     api::request_chat_stop();
     clear_status(messages);
     messages.write().push(ChatMsg::status("Stopped".to_string()));
-    busy.set(false);
 }
 
 fn clear_status(mut messages: Signal<Vec<ChatMsg>>) {
@@ -3093,7 +3400,7 @@ fn settle_reply(list: &mut Vec<ChatMsg>, text: &str) {
         }
     }
     let visible = visible.trim();
-    if visible.is_empty() {
+    if visible.is_empty() || looks_like_tool_trace(visible) || leak_marker(visible) {
         return;
     }
     if list.iter().any(|msg| msg.role == ChatRole::Bot && msg.text.contains(visible)) {
@@ -3118,6 +3425,217 @@ fn traces_overlap(existing: &str, incoming: &str) -> bool {
     a.chars().take(n).eq(b.chars().take(n))
 }
 
+fn short_api_error(err: &str) -> String {
+    if err.contains("404") {
+        return "the API needs a restart before chats can be saved".into();
+    }
+    err.split(" for url").next().unwrap_or(err).trim().to_string()
+}
+
+fn persistable(list: &[ChatMsg]) -> Vec<api::StoredMsg> {
+    let mut folded = list.to_vec();
+    fold_messages(&mut folded);
+    folded.into_iter().filter_map(stored_from_msg).collect()
+}
+
+fn stored_from_msg(msg: ChatMsg) -> Option<api::StoredMsg> {
+    let role = match msg.role {
+        ChatRole::User => "user",
+        ChatRole::Bot => "assistant",
+        ChatRole::Tool => "tool",
+        ChatRole::Thought => "thought",
+        ChatRole::Status => return None,
+    };
+    if is_acp_log(&msg.text) || is_acp_log(&msg.tool_result) {
+        return None;
+    }
+    if msg.text.trim().is_empty() && msg.role != ChatRole::Tool {
+        return None;
+    }
+    Some(api::StoredMsg {
+        role: role.into(),
+        text: msg.text,
+        tool_id: msg.tool_id,
+        tool_name: msg.tool_name,
+        tool_status: msg.tool_status,
+        tool_args: msg.tool_args,
+        tool_result: msg.tool_result,
+    })
+}
+
+fn msg_from_stored(msg: api::StoredMsg, n: usize) -> Option<ChatMsg> {
+    match msg.role.as_str() {
+        "user" => Some(ChatMsg::user(msg.text)),
+        "assistant" | "bot" => Some(ChatMsg::bot(msg.text)),
+        "thought" => {
+            let mut thought = closed_thought(msg.text, n);
+            if !msg.tool_id.is_empty() {
+                thought.tool_id = msg.tool_id;
+            }
+            Some(thought)
+        }
+        "tool" => Some(ChatMsg {
+            role: ChatRole::Tool,
+            text: msg.text,
+            tool_id: msg.tool_id,
+            tool_name: msg.tool_name,
+            tool_status: if msg.tool_status.is_empty() {
+                "done".into()
+            } else {
+                msg.tool_status
+            },
+            tool_args: msg.tool_args,
+            tool_result: msg.tool_result,
+            open: false,
+        }),
+        _ => None,
+    }
+}
+
+fn apply_stored(messages: &mut Signal<Vec<ChatMsg>>, rows: Vec<api::StoredMsg>) {
+    let mut next = Vec::new();
+    for (n, row) in rows.into_iter().enumerate() {
+        if let Some(msg) = msg_from_stored(row, n) {
+            next.push(msg);
+        }
+    }
+    messages.set(next);
+}
+
+fn merge_remote_chats(
+    remote: Vec<api::ChatSummary>,
+    local: &[api::ChatSummary],
+    current: Option<&str>,
+) -> Vec<api::ChatSummary> {
+    let mut out = remote;
+    if let Some(id) = current {
+        if !out.iter().any(|row| row.id == id) {
+            if let Some(found) = local.iter().find(|row| row.id == id) {
+                out.insert(0, found.clone());
+            }
+        }
+    }
+    out
+}
+
+fn remember_summary(chats: &mut Signal<Vec<api::ChatSummary>>, chat: api::ChatSummary) {
+    let mut list = chats.peek().clone();
+    list.retain(|row| row.id != chat.id);
+    list.insert(0, chat);
+    chats.set(list);
+}
+
+async fn store_snap(
+    project_id: &str,
+    bound: &mut Option<String>,
+    mut chat_id: Signal<Option<String>>,
+    mut chats: Signal<Vec<api::ChatSummary>>,
+    snap: Vec<api::StoredMsg>,
+) -> Result<String, String> {
+    let user = auth::current_email().ok_or_else(|| "Sign in to keep chats.".to_string())?;
+    let id = if let Some(id) = bound.clone() {
+        id
+    } else {
+        let chat = api::create_chat(project_id, &user).await?;
+        let id = chat.id.clone();
+        *bound = Some(id.clone());
+        if chat_id.peek().is_none() {
+            chat_id.set(Some(id.clone()));
+        }
+        remember_summary(&mut chats, chat);
+        id
+    };
+    let chat = api::save_chat(project_id, &id, &user, &snap).await?;
+    remember_summary(&mut chats, chat);
+    Ok(id)
+}
+
+fn start_new_chat(
+    mut chat_id: Signal<Option<String>>,
+    mut chats: Signal<Vec<api::ChatSummary>>,
+    mut messages: Signal<Vec<ChatMsg>>,
+    mut draft: Signal<String>,
+    mut chat_menu: Signal<bool>,
+    busy: Signal<bool>,
+    project_id: String,
+) {
+    if *busy.peek() {
+        return;
+    }
+    chat_menu.set(false);
+    let Some(user) = auth::current_email() else {
+        messages.write().push(ChatMsg::status("Sign in to keep chats."));
+        return;
+    };
+    spawn(async move {
+        match api::create_chat(&project_id, &user).await {
+            Ok(chat) => {
+                chat_id.set(Some(chat.id.clone()));
+                remember_summary(&mut chats, chat);
+                messages.set(Vec::new());
+                draft.set(String::new());
+            }
+            Err(err) => {
+                messages.write().push(ChatMsg::status(format!(
+                    "Could not start a chat — {}",
+                    short_api_error(&err)
+                )));
+            }
+        }
+    });
+}
+
+fn open_saved_chat(
+    id: String,
+    mut chat_id: Signal<Option<String>>,
+    mut chats: Signal<Vec<api::ChatSummary>>,
+    mut messages: Signal<Vec<ChatMsg>>,
+    mut draft: Signal<String>,
+    mut chat_menu: Signal<bool>,
+    mut open_gen: Signal<u32>,
+    busy: Signal<bool>,
+    project_id: String,
+) {
+    if *busy.peek() {
+        return;
+    }
+    let Some(user) = auth::current_email() else {
+        return;
+    };
+    let ticket = open_gen.peek().wrapping_add(1);
+    open_gen.set(ticket);
+    chat_id.set(Some(id.clone()));
+    chat_menu.set(false);
+    draft.set(String::new());
+    spawn(async move {
+        match api::get_chat(&project_id, &id, &user).await {
+            Ok(detail) => {
+                if *open_gen.peek() != ticket {
+                    return;
+                }
+                chat_id.set(Some(detail.id.clone()));
+                remember_summary(
+                    &mut chats,
+                    api::ChatSummary {
+                        id: detail.id,
+                        title: detail.title,
+                    },
+                );
+                apply_stored(&mut messages, detail.messages);
+            }
+            Err(err) => {
+                if *open_gen.peek() != ticket {
+                    return;
+                }
+                messages.set(vec![ChatMsg::status(format!(
+                    "Could not open that chat — {}",
+                    short_api_error(&err)
+                ))]);
+            }
+        }
+    });
+}
+
 fn send_prompt(
     mut draft: Signal<String>,
     mut messages: Signal<Vec<ChatMsg>>,
@@ -3127,6 +3645,8 @@ fn send_prompt(
     provider_id: Signal<String>,
     model_id: Signal<String>,
     mut busy: Signal<bool>,
+    chat_id: Signal<Option<String>>,
+    chats: Signal<Vec<api::ChatSummary>>,
 ) {
     let text = draft.read().trim().to_string();
     if text.is_empty() || *busy.peek() {
@@ -3138,6 +3658,12 @@ fn send_prompt(
     if let Ok(notes) = tools::run_intent(save, &text, target_track.peek().as_str(), at) {
         if !notes.is_empty() {
             messages.write().push(ChatMsg::bot(notes.join(" · ")));
+            let snap = persistable(&messages.read());
+            let pid = save.project_id.peek().clone();
+            let mut bound = chat_id.peek().clone();
+            spawn(async move {
+                let _ = store_snap(&pid, &mut bound, chat_id, chats, snap).await;
+            });
             return;
         }
     }
@@ -3172,7 +3698,16 @@ fn send_prompt(
             )
         })
         .collect();
+    let opening = persistable(&messages.read());
+    let mut bound = chat_id.peek().clone();
     spawn(async move {
+        if let Ok(id) = store_snap(&pid, &mut bound, chat_id, chats, opening).await {
+            bound = Some(id);
+        }
+        if api::chat_stopped() {
+            busy.set(false);
+            return;
+        }
         for (id, name, ctype, dur, url) in &bin {
             let _ = api::register_media(&pid, id, name, ctype, *dur).await;
             if url.starts_with("blob:") {
@@ -3194,6 +3729,8 @@ fn send_prompt(
         })
         .await;
         if api::chat_stopped() {
+            let snap = persistable(&messages.read());
+            let _ = store_snap(&pid, &mut bound, chat_id, chats, snap).await;
             busy.set(false);
             return;
         }
@@ -3220,6 +3757,15 @@ fn send_prompt(
                 clear_status(messages);
                 messages.write().push(ChatMsg::bot(err));
             }
+        }
+        let snap = persistable(&messages.read());
+        if let Err(err) = store_snap(&pid, &mut bound, chat_id, chats, snap).await {
+            messages
+                .write()
+                .push(ChatMsg::status(format!(
+                    "This chat was not saved — {}",
+                    short_api_error(&err)
+                )));
         }
         busy.set(false);
     });
@@ -3744,5 +4290,155 @@ mod chat_tests {
         assert!(!msgs
             .iter()
             .any(|m| m.role == ChatRole::Thought && m.text.contains("clips")));
+    }
+
+    fn screenshot_schema() -> String {
+        concat!(
+            "place that runs a prompt on a recurring interval, or update an existing one in place.\\n",
+            "Use this tool when a user asks you to loop, repeat, or schedule a prompt or a task.\\n",
+            "Set fire_immediately: true to also fire once on creation.\\n",
+            "fields replace old values, omitted ones are unchanged.\\nUsage notes:\\n- Interval format: \\\"5m\\\" (minutes), \\\"2h\\\" (hours)\\n",
+            "\"name\":\"scheduler_create\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"properties\":{\"fire_immediately\":{\"type\":\"boolean\"}}},",
+            "\"name\":\"scheduler_delete\",\"name\":\"scheduler_list\",",
+            "\"description\":\"Every stdout line is a main-agent wake. Print only DONE/FAILED/CANCELLED.\",",
+            "\"name\":\"monitor\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
+        )
+        .to_string()
+    }
+
+    fn tool_row() -> ChatMsg {
+        ChatMsg {
+            role: ChatRole::Tool,
+            text: "assemble".into(),
+            tool_id: "tool-1".into(),
+            tool_name: "assemble".into(),
+            tool_status: "done".into(),
+            tool_args: String::new(),
+            tool_result: String::new(),
+            open: false,
+        }
+    }
+
+    fn schema_is_hidden(msgs: &[ChatMsg]) {
+        assert!(
+            msgs.iter().any(|m| m.role == ChatRole::Thought && !m.open && m.text.contains("scheduler_create")),
+            "schema should be one collapsed thought"
+        );
+        assert!(
+            !msgs.iter().any(|m| {
+                m.role == ChatRole::Bot
+                    && (m.text.contains("$schema")
+                        || m.text.contains("scheduler_")
+                        || m.text.contains("Usage notes")
+                        || m.text.contains("fire_immediately")
+                        || m.text.contains("fields replace")
+                        || m.text.contains("recurring interval")
+                        || m.text.contains("place that runs"))
+            }),
+            "schema leaked into a reply"
+        );
+    }
+
+    #[test]
+    fn screenshot_dump_is_a_collapsed_thought() {
+        let dump = screenshot_schema();
+        assert!(looks_like_tool_trace(&dump));
+        assert!(escaped_schema_dump(&dump));
+        let mut msgs = vec![
+            ChatMsg::user("Make a vlog from these clips"),
+            ChatMsg::bot(dump.clone()),
+        ];
+        fold_messages(&mut msgs);
+        schema_is_hidden(&msgs);
+        settle_reply(
+            &mut msgs,
+            &format!("{dump}\n\nI'll cut a 40 second vlog from the clips you imported."),
+        );
+        schema_is_hidden(&msgs);
+        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("40 second")));
+        fold_messages(&mut msgs);
+        schema_is_hidden(&msgs);
+        assert_eq!(msgs.iter().filter(|m| m.role == ChatRole::Thought).count(), 1);
+    }
+
+    #[test]
+    fn tool_row_does_not_leave_the_schema_visible() {
+        let dump = screenshot_schema();
+        let mut msgs = vec![ChatMsg::user("Make a vlog from these clips")];
+        let mut rest = dump.as_str();
+        let mut n = 0;
+        while !rest.is_empty() {
+            let take = rest.len().min(28);
+            let (chunk, tail) = rest.split_at(take);
+            append_model_chunk(&mut msgs, chunk, false);
+            rest = tail;
+            n += 1;
+            if n == 3 {
+                msgs.push(tool_row());
+            }
+        }
+        append_model_chunk(
+            &mut msgs,
+            "I'll cut a 40 second vlog from the clips you imported.",
+            false,
+        );
+        schema_is_hidden(&msgs);
+        assert!(msgs.iter().any(|m| m.role == ChatRole::Tool));
+        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("40 second")));
+        assert_eq!(msgs.iter().filter(|m| m.role == ChatRole::Thought).count(), 1);
+    }
+
+    #[test]
+    fn acp_logs_are_dropped_from_the_chat() {
+        let log = "acp: [2m2026-10-01T08:59:20Z[0m [32m INFO[0m sampling.request model=grok-4.7 auth_prefix=hidden sse_chunk encrypted_content api_backend=responses";
+        assert!(is_acp_log(log));
+        assert!(!is_acp_log("Sending to xai · grok-4.7…"));
+        assert!(!is_acp_log("I'll cut a 40 second vlog from the clips you imported."));
+        let mut msgs = vec![
+            ChatMsg::user("edit like a pro editor"),
+            ChatMsg::status(log.to_string()),
+            ChatMsg::bot("I'll cut a 40 second vlog from the clips you imported."),
+        ];
+        fold_messages(&mut msgs);
+        assert!(msgs.iter().all(|m| !m.text.contains("sampling.request") && !m.text.contains("auth_prefix")));
+        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("40 second")));
+        assert!(msgs.iter().any(|m| m.role == ChatRole::User));
+    }
+
+    #[test]
+    fn a_chat_saves_the_reply_and_drops_the_log() {
+        let log = "acp: [2m INFO sampling.request auth_prefix=hidden encrypted_content";
+        let msgs = vec![
+            ChatMsg::user("edit like a pro editor"),
+            ChatMsg::status(log.to_string()),
+            ChatMsg::bot("I'll cut a 40 second vlog from the clips you imported."),
+        ];
+        let saved = persistable(&msgs);
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].role, "user");
+        assert_eq!(saved[1].role, "assistant");
+        assert!(saved.iter().all(|row| !row.text.contains("sampling.request")));
+        let restored: Vec<_> = saved
+            .into_iter()
+            .enumerate()
+            .filter_map(|(n, row)| msg_from_stored(row, n))
+            .collect();
+        assert!(restored.iter().any(|msg| msg.role == ChatRole::User));
+        assert!(restored.iter().any(|msg| msg.role == ChatRole::Bot && msg.text.contains("40 second")));
+    }
+
+    #[test]
+    fn the_open_chat_survives_a_stale_list() {
+        let local = vec![api::ChatSummary {
+            id: "new".into(),
+            title: "New chat".into(),
+        }];
+        let remote = vec![api::ChatSummary {
+            id: "old".into(),
+            title: "Yesterday".into(),
+        }];
+        let merged = merge_remote_chats(remote, &local, Some("new"));
+        assert_eq!(merged[0].id, "new");
+        assert!(merged.iter().any(|row| row.id == "old"));
     }
 }

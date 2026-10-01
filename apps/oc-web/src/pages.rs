@@ -2,6 +2,7 @@ use crate::api::{self, ProjectSummary};
 use crate::auth;
 use crate::Route;
 use dioxus::prelude::*;
+use oc_core::{ExportPreset, Op};
 
 pub fn confirm_delete(name: &str) -> bool {
     let msg = format!(
@@ -210,6 +211,124 @@ pub fn Projects() -> Element {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn Export(id: String) -> Element {
+    let nav = navigator();
+    let project_id = id.clone();
+    let mut name = use_signal(|| "Project".to_string());
+    let mut preset = use_signal(|| ExportPreset::Youtube1080);
+    let mut note = use_signal(String::new);
+    let mut url = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+
+    use_effect(move || {
+        if !auth::is_signed_in() {
+            nav.replace(Route::Login {});
+        }
+    });
+    let load_id = project_id.clone();
+    use_future(move || {
+        let project_id = load_id.clone();
+        async move {
+            let Ok(project) = api::get_project(&project_id).await else {
+                return;
+            };
+            name.set(project.name);
+            let tl = &project.timeline;
+            if tl.height > tl.width {
+                preset.set(ExportPreset::Vertical1080);
+            } else if tl.width == tl.height {
+                preset.set(ExportPreset::Square1080);
+            } else {
+                preset.set(ExportPreset::Youtube1080);
+            }
+        }
+    });
+
+    let choices = [
+        (ExportPreset::Youtube1080, "YouTube", "1920 × 1080"),
+        (ExportPreset::Vertical1080, "Vertical", "1080 × 1920"),
+        (ExportPreset::Square1080, "Square", "1080 × 1080"),
+    ];
+    let selected = *preset.read();
+    let back = id.clone();
+
+    rsx! {
+        document::Title { "OpenCut — Export" }
+        div { class: "shell",
+            header { class: "shell-bar",
+                div { class: "header-left",
+                    Link {
+                        to: Route::Workspace { id: back.clone() },
+                        class: "logo",
+                        title: "Back to the edit",
+                        crate::IconScissors {}
+                    }
+                    strong { "{name}" }
+                }
+            }
+            div { class: "shell-body",
+                div { class: "export-page",
+                    h1 { "Export" }
+                    p { class: "export-lead", "Render the current timeline. The file plays here when the worker finishes." }
+                    div { class: "export-options",
+                        for (kind, label, size) in choices {
+                            button {
+                                class: if selected == kind { "export-opt on" } else { "export-opt" },
+                                onclick: move |_| preset.set(kind),
+                                strong { "{label}" }
+                                span { "{size}" }
+                            }
+                        }
+                    }
+                    button {
+                        class: "btn btn-primary",
+                        disabled: *busy.read(),
+                        onclick: move |_| {
+                            let kind = *preset.peek();
+                            let pid = project_id.clone();
+                            busy.set(true);
+                            note.set("Rendering. This page updates when the file is ready.".into());
+                            url.set(String::new());
+                            spawn(async move {
+                                if let Err(err) = api::apply_ops(&pid, vec![Op::Export { preset: kind }]).await {
+                                    note.set(err);
+                                    busy.set(false);
+                                    return;
+                                }
+                                for _ in 0..60 {
+                                    gloo_timers::future::TimeoutFuture::new(2000).await;
+                                    let file = format!("http://127.0.0.1:8787/v1/projects/{pid}/export");
+                                    if reqwest::Client::new().head(&file).send().await.ok().is_some_and(|r| r.status().is_success()) {
+                                        url.set(file);
+                                        note.set("Ready to play.".into());
+                                        busy.set(false);
+                                        return;
+                                    }
+                                }
+                                note.set("The render did not show up yet. Check the worker.".into());
+                                busy.set(false);
+                            });
+                        },
+                        if *busy.read() { "Rendering…" } else { "Render" }
+                    }
+                    if !note.read().is_empty() {
+                        p { class: "export-note", "{note}" }
+                    }
+                    if !url.read().is_empty() {
+                        video {
+                            class: "export-video",
+                            src: "{url}",
+                            controls: true,
+                            playsinline: true,
                         }
                     }
                 }

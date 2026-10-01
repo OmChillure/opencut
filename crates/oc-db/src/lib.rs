@@ -25,6 +25,8 @@ pub enum DbError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("timeline json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("bad user")]
+    BadUser,
 }
 
 impl DbError {
@@ -110,6 +112,9 @@ pub async fn migrate(pool: &Db) -> Result<(), DbError> {
         .execute(pool)
         .await?;
     sqlx::raw_sql(include_str!("../migrations/0002_media_analysis.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!("../migrations/0003_chats.sql"))
         .execute(pool)
         .await?;
     Ok(())
@@ -592,6 +597,260 @@ pub async fn list_analysis_for_project(
     Ok(rows)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ChatRow {
+    pub id: Uuid,
+    pub title: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ChatMessageInput {
+    pub role: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub tool_id: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_status: String,
+    #[serde(default)]
+    pub tool_args: String,
+    #[serde(default)]
+    pub tool_result: String,
+}
+
+pub fn normalize_user_email(raw: &str) -> Result<String, DbError> {
+    let email = raw.trim().to_ascii_lowercase();
+    if email.len() < 3
+        || email.len() > 200
+        || !email.contains('@')
+        || email.starts_with('@')
+        || email.ends_with('@')
+        || email.contains(char::is_whitespace)
+    {
+        return Err(DbError::BadUser);
+    }
+    Ok(email)
+}
+
+/// Keep a title the person set. Otherwise use the first thing they asked.
+pub fn chat_title(current: &str, first_user_text: Option<&str>) -> String {
+    let current = current.trim();
+    if !current.is_empty() && current != "New chat" {
+        return current.to_string();
+    }
+    let Some(text) = first_user_text.map(str::trim).filter(|text| !text.is_empty()) else {
+        return "New chat".into();
+    };
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for (i, ch) in flat.chars().enumerate() {
+        if i == 48 {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        "New chat".into()
+    } else {
+        out
+    }
+}
+
+/// CLI tracing must not land in the database.
+pub fn is_cli_noise(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("sampling.request")
+        || lower.contains("cli-chat-proxy")
+        || lower.contains("auth_prefix")
+        || lower.contains("encrypted_content")
+        || lower.contains("sse_chunk")
+        || lower.contains("api_backend")
+        || text.contains("[0m")
+        || text.contains("[32m")
+        || text.contains("[2m")
+        || text.contains('\u{1b}')
+}
+
+pub fn prepare_chat_messages(messages: &[ChatMessageInput]) -> Vec<ChatMessageInput> {
+    let mut out = Vec::new();
+    for msg in messages {
+        let Some(role) = canonical_chat_role(&msg.role) else {
+            continue;
+        };
+        if is_cli_noise(&msg.text) || is_cli_noise(&msg.tool_result) {
+            continue;
+        }
+        let text = clip_chars(&msg.text, 100_000);
+        if text.trim().is_empty() && role != "tool" {
+            continue;
+        }
+        out.push(ChatMessageInput {
+            role: role.into(),
+            text,
+            tool_id: clip_chars(&msg.tool_id, 200),
+            tool_name: clip_chars(&msg.tool_name, 200),
+            tool_status: clip_chars(&msg.tool_status, 40),
+            tool_args: clip_chars(&msg.tool_args, 20_000),
+            tool_result: clip_chars(&msg.tool_result, 100_000),
+        });
+    }
+    if out.len() > 400 {
+        out = out.split_off(out.len() - 400);
+    }
+    out
+}
+
+fn canonical_chat_role(role: &str) -> Option<&'static str> {
+    match role {
+        "user" => Some("user"),
+        "assistant" | "bot" => Some("assistant"),
+        "tool" => Some("tool"),
+        "thought" => Some("thought"),
+        _ => None,
+    }
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    text.chars().take(max).collect()
+}
+
+pub async fn list_chats(pool: &Db, project_id: Uuid, user: &str) -> Result<Vec<ChatRow>, DbError> {
+    let user = normalize_user_email(user)?;
+    let rows = query_as::<ChatRow>(
+        "select id, title, updated_at from chats
+         where project_id = $1 and user_email = $2
+         order by updated_at desc
+         limit 100",
+    )
+    .bind(project_id)
+    .bind(user)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn create_chat(
+    pool: &Db,
+    project_id: Uuid,
+    user: &str,
+    title: Option<&str>,
+) -> Result<ChatRow, DbError> {
+    let user = normalize_user_email(user)?;
+    let title = chat_title("", title);
+    let id = Uuid::now_v7();
+    let row = query_as::<ChatRow>(
+        "insert into chats (id, project_id, user_email, title)
+         values ($1, $2, $3, $4)
+         returning id, title, updated_at",
+    )
+    .bind(id)
+    .bind(project_id)
+    .bind(user)
+    .bind(title)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn get_chat(
+    pool: &Db,
+    project_id: Uuid,
+    chat_id: Uuid,
+    user: &str,
+) -> Result<(ChatRow, Vec<ChatMessageInput>), DbError> {
+    let user = normalize_user_email(user)?;
+    let chat = chat_for_user(pool, project_id, chat_id, &user).await?;
+    let messages = query_as::<ChatMessageInput>(
+        "select role, text, tool_id, tool_name, tool_status, tool_args, tool_result
+         from chat_messages
+         where chat_id = $1
+         order by idx",
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await?;
+    Ok((chat, messages))
+}
+
+pub async fn save_chat_messages(
+    pool: &Db,
+    project_id: Uuid,
+    chat_id: Uuid,
+    user: &str,
+    messages: &[ChatMessageInput],
+) -> Result<ChatRow, DbError> {
+    let user = normalize_user_email(user)?;
+    let chat = chat_for_user(pool, project_id, chat_id, &user).await?;
+    let messages = prepare_chat_messages(messages);
+    let title = chat_title(
+        &chat.title,
+        messages
+            .iter()
+            .find(|msg| msg.role == "user")
+            .map(|msg| msg.text.as_str()),
+    );
+    let mut tx = pool.begin().await?;
+    query("delete from chat_messages where chat_id = $1")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    for (idx, msg) in messages.iter().enumerate() {
+        query(
+            "insert into chat_messages
+                (id, chat_id, idx, role, text, tool_id, tool_name, tool_status, tool_args, tool_result)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(chat_id)
+        .bind(idx as i32)
+        .bind(&msg.role)
+        .bind(&msg.text)
+        .bind(&msg.tool_id)
+        .bind(&msg.tool_name)
+        .bind(&msg.tool_status)
+        .bind(&msg.tool_args)
+        .bind(&msg.tool_result)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let row = query_as::<ChatRow>(
+        "update chats set title = $2, updated_at = now()
+         where id = $1
+         returning id, title, updated_at",
+    )
+    .bind(chat_id)
+    .bind(&title)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+async fn chat_for_user(
+    pool: &Db,
+    project_id: Uuid,
+    chat_id: Uuid,
+    user: &str,
+) -> Result<ChatRow, DbError> {
+    query_as::<ChatRow>(
+        "select id, title, updated_at from chats
+         where id = $1 and project_id = $2 and user_email = $3",
+    )
+    .bind(chat_id)
+    .bind(project_id)
+    .bind(user)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(DbError::NotFound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::prefer_session_pooler;
@@ -602,5 +861,79 @@ mod tests {
         let next = prefer_session_pooler(url);
         assert!(next.contains(":5432"), "{next}");
         assert!(!next.contains(":6543"), "{next}");
+    }
+
+    #[test]
+    fn chat_title_uses_the_first_request() {
+        assert_eq!(super::chat_title("", None), "New chat");
+        assert_eq!(super::chat_title("New chat", None), "New chat");
+        assert_eq!(
+            super::chat_title("New chat", Some("edit like a pro editor")),
+            "edit like a pro editor"
+        );
+        assert_eq!(
+            super::chat_title("Rough cut", Some("ignore this")),
+            "Rough cut"
+        );
+        let long = "a".repeat(60);
+        let title = super::chat_title("New chat", Some(&long));
+        assert_eq!(title.chars().count(), 49);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn saved_messages_drop_status_and_cli_logs() {
+        use super::ChatMessageInput;
+        let rows = super::prepare_chat_messages(&[
+            ChatMessageInput {
+                role: "user".into(),
+                text: "edit like a pro editor".into(),
+                tool_id: String::new(),
+                tool_name: String::new(),
+                tool_status: String::new(),
+                tool_args: String::new(),
+                tool_result: String::new(),
+            },
+            ChatMessageInput {
+                role: "status".into(),
+                text: "Sending to xai".into(),
+                tool_id: String::new(),
+                tool_name: String::new(),
+                tool_status: String::new(),
+                tool_args: String::new(),
+                tool_result: String::new(),
+            },
+            ChatMessageInput {
+                role: "assistant".into(),
+                text: "acp: [2m INFO sampling.request auth_prefix=hidden encrypted_content".into(),
+                tool_id: String::new(),
+                tool_name: String::new(),
+                tool_status: String::new(),
+                tool_args: String::new(),
+                tool_result: String::new(),
+            },
+            ChatMessageInput {
+                role: "bot".into(),
+                text: "I'll cut a 40 second vlog from the clips you imported.".into(),
+                tool_id: String::new(),
+                tool_name: String::new(),
+                tool_status: String::new(),
+                tool_args: String::new(),
+                tool_result: String::new(),
+            },
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[1].role, "assistant");
+        assert!(rows[1].text.contains("40 second"));
+    }
+
+    #[test]
+    fn email_is_the_chat_owner() {
+        assert_eq!(
+            super::normalize_user_email("  A@Studio.com ").unwrap(),
+            "a@studio.com"
+        );
+        assert!(super::normalize_user_email("not-an-email").is_err());
     }
 }

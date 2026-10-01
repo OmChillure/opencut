@@ -430,7 +430,7 @@ fn parse_tool_reply(text: String) -> LlmReply {
         }
     }
     if calls.is_empty() {
-        acp::to_reply(text)
+        acp::to_reply(acp::user_visible_text(text))
     } else {
         LlmReply::Tools(calls)
     }

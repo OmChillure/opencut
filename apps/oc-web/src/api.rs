@@ -173,6 +173,101 @@ pub async fn chat_stream(
     Ok(reply)
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatSummary {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredMsg {
+    pub role: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub tool_id: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_status: String,
+    #[serde(default)]
+    pub tool_args: String,
+    #[serde(default)]
+    pub tool_result: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChatDetail {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub messages: Vec<StoredMsg>,
+}
+
+fn user_query(user: &str) -> String {
+    let mut out = String::with_capacity(user.len());
+    for b in user.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+pub async fn list_chats(project_id: &str, user: &str) -> Result<Vec<ChatSummary>, String> {
+    let url = format!(
+        "{API}/v1/projects/{project_id}/chats?user={}",
+        user_query(user)
+    );
+    get_json(&url).await
+}
+
+pub async fn create_chat(project_id: &str, user: &str) -> Result<ChatSummary, String> {
+    reqwest::Client::new()
+        .post(format!("{API}/v1/projects/{project_id}/chats"))
+        .json(&serde_json::json!({ "user": user }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn get_chat(project_id: &str, chat_id: &str, user: &str) -> Result<ChatDetail, String> {
+    let url = format!(
+        "{API}/v1/projects/{project_id}/chats/{chat_id}?user={}",
+        user_query(user)
+    );
+    get_json(&url).await
+}
+
+pub async fn save_chat(
+    project_id: &str,
+    chat_id: &str,
+    user: &str,
+    messages: &[StoredMsg],
+) -> Result<ChatSummary, String> {
+    reqwest::Client::new()
+        .put(format!(
+            "{API}/v1/projects/{project_id}/chats/{chat_id}/messages"
+        ))
+        .json(&serde_json::json!({ "user": user, "messages": messages }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 async fn read_ndjson(
     url: &str,
     json_body: &str,

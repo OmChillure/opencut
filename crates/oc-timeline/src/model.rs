@@ -1015,19 +1015,50 @@ impl Clip {
         time >= self.start && time < self.end()
     }
 
+    /// True when the playback rate changes along the clip.
+    #[must_use]
+    pub fn ramps(&self) -> bool {
+        self.look.speed_keys.len() >= 2
+            || self
+                .look
+                .speed_to
+                .is_some_and(|end| (end - self.speed).abs() > 1e-3)
+    }
+
+    /// Source position at `timeline_time`. The rate is clamped to the 0.25–4 export range.
     #[must_use]
     pub fn source_time_at(&self, timeline_time: Time) -> Option<Time> {
         if !self.contains(timeline_time) {
             return None;
         }
         let elapsed = timeline_time - self.start;
-        let speed = if self.speed.is_finite() && self.speed > 0.0 {
-            self.speed
+        let ticks = if self.ramps() {
+            let seconds = integrated_source_seconds(self, elapsed.as_seconds());
+            (seconds * oc_time::TICKS_PER_SECOND as f64).round() as i64
         } else {
-            1.0
+            let speed = f64::from(clamped_speed(self.speed));
+            (elapsed.as_ticks() as f64 * speed).round() as i64
         };
-        let scaled = Duration::from_ticks((elapsed.as_ticks() as f64 * f64::from(speed)).round() as i64);
-        Some(self.source_in + scaled)
+        Some(self.source_in + Duration::from_ticks(ticks.max(0)))
+    }
+
+    #[must_use]
+    pub fn speed_at(&self, timeline_time: Time) -> f32 {
+        let speed = clamped_speed(self.speed);
+        if !self.contains(timeline_time) {
+            return speed;
+        }
+        let dur = self.duration.as_seconds().max(1e-4);
+        let along = ((timeline_time - self.start).as_seconds() / dur).clamp(0.0, 1.0) as f32;
+        if self.look.speed_keys.len() >= 2 {
+            return speed_on_keys(&self.look.speed_keys, along);
+        }
+        if let Some(end) = self.look.speed_to {
+            let start = f64::from(speed);
+            let end = f64::from(end.clamp(0.25, 4.0));
+            return (start + (end - start) * f64::from(along)) as f32;
+        }
+        speed
     }
 
     #[must_use]
@@ -1039,6 +1070,167 @@ impl Clip {
         };
         Duration::from_ticks((self.duration.as_ticks() as f64 * f64::from(speed)).round() as i64)
     }
+
+    /// Source media consumed by `timeline_seconds` of this clip. Negative extends before the in-point.
+    #[must_use]
+    pub fn source_consumed(&self, timeline_seconds: f64) -> Duration {
+        if !timeline_seconds.is_finite() || timeline_seconds == 0.0 {
+            return Duration::ZERO;
+        }
+        if timeline_seconds < 0.0 {
+            let speed = f64::from(self.speed_at(self.start));
+            return Duration::from_seconds(timeline_seconds * speed);
+        }
+        let seconds = if self.ramps() {
+            integrated_source_seconds(self, timeline_seconds)
+        } else {
+            timeline_seconds * f64::from(clamped_speed(self.speed))
+        };
+        Duration::from_seconds(seconds.max(0.0))
+    }
+
+    /// Move the source in-point by a timeline delta. A positive delta keeps the later part of a ramp.
+    pub fn take_head(&mut self, timeline_seconds: f64) {
+        if !timeline_seconds.is_finite() || timeline_seconds.abs() < 1e-9 {
+            return;
+        }
+        let consumed = self.source_consumed(timeline_seconds);
+        let next = self.source_in + consumed;
+        self.source_in = if next.as_ticks() < 0 {
+            Time::ZERO
+        } else {
+            next
+        };
+        if timeline_seconds > 0.0 && self.ramps() {
+            let dur = self.duration.as_seconds().max(1e-4);
+            let cut = (timeline_seconds / dur).clamp(0.02, 0.98) as f32;
+            let (_, _, look, speed) = ramp_halves(&self.look, self.speed, cut);
+            self.look = look;
+            self.speed = speed;
+        }
+    }
+}
+
+fn ramp_halves(look: &ClipLook, speed: f32, cut: f32) -> (ClipLook, f32, ClipLook, f32) {
+    let cut = cut.clamp(0.02, 0.98);
+    let mut left_look = look.clone();
+    let mut right_look = look.clone();
+    let left_speed = speed;
+    let mut right_speed = speed;
+    if look.speed_keys.len() >= 2 {
+        let keys = ordered_keys(&look.speed_keys);
+        let mid = speed_on_keys(&keys, cut);
+        let mut left = vec![SpeedKey {
+            at: 0.0,
+            speed: speed_on_keys(&keys, 0.0),
+        }];
+        let mut right = vec![SpeedKey { at: 0.0, speed: mid }];
+        for key in &keys {
+            if key.at > 0.02 && key.at < cut - 0.02 {
+                left.push(SpeedKey {
+                    at: key.at / cut,
+                    speed: key.speed,
+                });
+            }
+            if key.at > cut + 0.02 && key.at < 0.98 {
+                right.push(SpeedKey {
+                    at: (key.at - cut) / (1.0 - cut),
+                    speed: key.speed,
+                });
+            }
+        }
+        left.push(SpeedKey { at: 1.0, speed: mid });
+        right.push(SpeedKey {
+            at: 1.0,
+            speed: speed_on_keys(&keys, 1.0),
+        });
+        left_look.speed_keys = left;
+        right_look.speed_keys = right;
+    } else if look.speed_to.is_some() {
+        let end = look.speed_to.unwrap_or(speed);
+        let mid = speed + (end - speed) * cut;
+        left_look.speed_to = Some(mid);
+        right_speed = mid;
+        right_look.speed_to = Some(end);
+    }
+    (left_look, left_speed, right_look, right_speed)
+}
+
+fn clamped_speed(speed: f32) -> f32 {
+    if speed.is_finite() && speed > 0.05 {
+        speed.clamp(0.25, 4.0)
+    } else {
+        1.0
+    }
+}
+
+fn ordered_keys(keys: &[SpeedKey]) -> Vec<SpeedKey> {
+    let mut keys = keys.to_vec();
+    keys.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
+    keys
+}
+
+fn key_speed(key: &SpeedKey) -> f32 {
+    key.speed.clamp(0.25, 4.0)
+}
+
+fn speed_on_keys(keys: &[SpeedKey], along: f32) -> f32 {
+    let keys = ordered_keys(keys);
+    let along = along.clamp(0.0, 1.0);
+    let Some(first) = keys.first() else {
+        return 1.0;
+    };
+    if along <= first.at {
+        return key_speed(first);
+    }
+    for pair in keys.windows(2) {
+        if along <= pair[1].at {
+            let span = (pair[1].at - pair[0].at).max(1e-4);
+            let t = (along - pair[0].at) / span;
+            let s0 = f64::from(key_speed(&pair[0]));
+            let s1 = f64::from(key_speed(&pair[1]));
+            return (s0 + (s1 - s0) * f64::from(t)) as f32;
+        }
+    }
+    keys.last().map(key_speed).unwrap_or(1.0)
+}
+
+/// Seconds of source consumed from the in-point up to `local` seconds into the clip.
+fn integrated_source_seconds(clip: &Clip, local: f64) -> f64 {
+    let dur = clip.duration.as_seconds().max(1e-4);
+    let local = local.clamp(0.0, dur);
+    if clip.look.speed_keys.len() >= 2 {
+        let keys = ordered_keys(&clip.look.speed_keys);
+        let first = f64::from(key_speed(&keys[0]));
+        let first_at = f64::from(keys[0].at).clamp(0.0, 1.0) * dur;
+        if local <= first_at {
+            return local * first;
+        }
+        let mut acc = first_at * first;
+        let mut prev_t = first_at;
+        for pair in keys.windows(2) {
+            let t1 = f64::from(pair[1].at).clamp(0.0, 1.0) * dur;
+            if t1 <= prev_t {
+                continue;
+            }
+            let s0 = f64::from(key_speed(&pair[0]));
+            let s1 = f64::from(key_speed(&pair[1]));
+            let end = local.min(t1);
+            let span = (t1 - prev_t).max(1e-4);
+            let u1 = ((end - prev_t) / span).clamp(0.0, 1.0);
+            let b = s0 + (s1 - s0) * u1;
+            acc += (end - prev_t) * (s0 + b) * 0.5;
+            prev_t = end;
+            if local <= t1 {
+                return acc;
+            }
+        }
+        let tail = f64::from(keys.last().map(key_speed).unwrap_or(1.0));
+        return acc + (local - prev_t).max(0.0) * tail;
+    }
+    let s0 = f64::from(clamped_speed(clip.speed));
+    let s1 = f64::from(clip.look.speed_to.unwrap_or(clip.speed).clamp(0.25, 4.0));
+    s0 * local + (s1 - s0) * local * local / (2.0 * dur)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1289,7 +1481,7 @@ impl Timeline {
         if left.media_id != right.media_id {
             return Err(TimelineError::CannotMerge);
         }
-        let expected_src = left.source_in + left.duration;
+        let expected_src = left.source_in + left.source_consumed(left.duration.as_seconds());
         if (right.source_in - expected_src).as_ticks().abs() > slack.as_ticks() {
             return Err(TimelineError::CannotMerge);
         }
@@ -1313,18 +1505,27 @@ impl Timeline {
                 return Err(TimelineError::SplitOutOfRange);
             }
             let offset = at - clip.start;
+            let cut = (offset.as_seconds() / clip.duration.as_seconds().max(1e-4)).clamp(0.02, 0.98)
+                as f32;
+            let (left_look, left_speed, right_look, right_speed) =
+                ramp_halves(&clip.look, clip.speed, cut);
+            let source_at = clip.source_time_at(at).unwrap_or(clip.source_in);
             let mut right = clip.clone();
             right.id = ClipId::new();
             right.start = at;
             right.duration = clip.duration - offset;
-            right.source_in = clip.source_in + offset;
+            right.source_in = source_at;
+            right.look = right_look;
+            right.speed = right_speed;
             // Inner cut is a hard cut. Outgoing mix / fade-out stay on the right.
             right.look.fade_in = Duration::ZERO;
-            (track.id, offset, right)
+            (track.id, (offset, left_look, left_speed), right)
         };
         let right_id = new_clip.id;
         if let Some(clip) = self.clip_mut(clip_id) {
-            clip.duration = left_end;
+            clip.duration = left_end.0;
+            clip.look = left_end.1;
+            clip.speed = left_end.2;
             clip.look.fade_out = Duration::ZERO;
             clip.look.transition = TransitionKind::Cut;
         }
@@ -1368,7 +1569,9 @@ impl Timeline {
             .clip_mut(clip_id)
             .ok_or(TimelineError::ClipNotFound(clip_id))?;
         let delta = new_start - clip.start;
-        clip.source_in += delta;
+        if delta.as_ticks() != 0 {
+            clip.take_head(delta.as_seconds());
+        }
         clip.start = new_start;
         clip.duration = new_duration;
         Ok(())

@@ -5,8 +5,8 @@ use crate::finish::{self, CoverShot, SpokenLine};
 use crate::ops::{apply, Op};
 use oc_time::{Duration, Time};
 use oc_timeline::{
-    AspectRatio, CaptionStyle, ClipKind, EditPlan, EditSlot, MediaId,
-    Timeline, TrackKind, TransitionKind, UndoStack,
+    AspectRatio, CaptionStyle, Clip, ClipKind, EditPlan, EditSlot, MediaId, Timeline, TrackKind,
+    TransitionKind, UndoStack,
 };
 
 #[derive(Clone, Debug)]
@@ -45,6 +45,7 @@ pub fn build_plan(
     covers: &[CoverShot],
 ) -> Result<Vec<String>, String> {
     check_slots(&plan.slots, windows)?;
+    let (kept_clips, kept_looks) = snapshot_layers(timeline);
     let mut undo = UndoStack::new();
     let mut notes = Vec::new();
     let cleared = apply(timeline, &mut undo, Op::ClearTimeline).map_err(err)?;
@@ -124,8 +125,168 @@ pub fn build_plan(
         }
     }
     notes.extend(finish_picture(timeline, &mut undo, plan, &ids, lines, covers)?);
+    restore_layers(timeline, kept_clips, &kept_looks);
     timeline.edit_plan = Some(plan.clone());
     Ok(notes)
+}
+
+struct KeptClip {
+    track_name: String,
+    clip: Clip,
+}
+
+struct KeptLook {
+    media: MediaId,
+    source_in: f64,
+    mask: Option<oc_timeline::AlphaShape>,
+    curves: oc_timeline::Curves,
+    crop: Option<oc_timeline::Crop>,
+    stabilize: bool,
+}
+
+fn snapshot_layers(timeline: &Timeline) -> (Vec<KeptClip>, Vec<KeptLook>) {
+    let mut clips = Vec::new();
+    let mut looks = Vec::new();
+    for track in &timeline.tracks {
+        let overlay = matches!(track.name.as_str(), "Design" | "Front" | "GFX");
+        for clip in &track.clips {
+            if clip.disabled {
+                continue;
+            }
+            let graphic = matches!(clip.kind, ClipKind::Graphic { .. });
+            if overlay || graphic {
+                let mut kept = clip.clone();
+                kept.id = oc_timeline::ClipId::new();
+                clips.push(KeptClip {
+                    track_name: track.name.clone(),
+                    clip: kept,
+                });
+            }
+            if overlay || !matches!(clip.kind, ClipKind::Video { .. }) {
+                continue;
+            }
+            let Some(media) = clip.media_id else {
+                continue;
+            };
+            let look = &clip.look;
+            if look.mask.is_none()
+                && look.crop.is_none()
+                && !look.stabilize
+                && look.curves.is_identity()
+            {
+                continue;
+            }
+            looks.push(KeptLook {
+                media,
+                source_in: clip.source_in.as_seconds(),
+                mask: look.mask,
+                curves: look.curves.clone(),
+                crop: look.crop,
+                stabilize: look.stabilize,
+            });
+        }
+    }
+    (clips, looks)
+}
+
+fn restore_layers(timeline: &mut Timeline, clips: Vec<KeptClip>, looks: &[KeptLook]) {
+    let end = timeline.duration().as_seconds();
+    if end < 0.2 {
+        return;
+    }
+    let mut pending = Vec::new();
+    for mut kept in clips {
+        let start = kept.clip.start.as_seconds();
+        if start >= end - 0.05 {
+            continue;
+        }
+        if kept.clip.end().as_seconds() > end {
+            let dur = end - start;
+            if dur < 0.2 {
+                continue;
+            }
+            kept.clip.duration = Duration::from_seconds(dur);
+        }
+        if plan_cover_already(&kept, timeline) {
+            continue;
+        }
+        pending.push(kept);
+    }
+    for kept in pending {
+        let kind = kept.clip.kind.track_kind();
+        let track_id = ensure_named(timeline, kind, &kept.track_name);
+        let _ = timeline.add_clip(track_id, kept.clip);
+    }
+    for track in &mut timeline.tracks {
+        if matches!(track.name.as_str(), "Design" | "Front" | "GFX") {
+            continue;
+        }
+        for clip in &mut track.clips {
+            if !matches!(clip.kind, ClipKind::Video { .. }) {
+                continue;
+            }
+            let Some(media) = clip.media_id else {
+                continue;
+            };
+            let src = clip.source_in.as_seconds();
+            let Some(look) = looks
+                .iter()
+                .filter(|look| look.media == media)
+                .min_by(|a, b| {
+                    (a.source_in - src)
+                        .abs()
+                        .partial_cmp(&(b.source_in - src).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            else {
+                continue;
+            };
+            if (look.source_in - src).abs() > 0.35 {
+                continue;
+            }
+            if clip.look.mask.is_none() {
+                clip.look.mask = look.mask;
+            }
+            if clip.look.crop.is_none() {
+                clip.look.crop = look.crop;
+            }
+            if look.stabilize {
+                clip.look.stabilize = true;
+            }
+            if clip.look.curves.is_identity() && !look.curves.is_identity() {
+                clip.look.curves = look.curves.clone();
+            }
+        }
+    }
+}
+
+fn plan_cover_already(kept: &KeptClip, timeline: &Timeline) -> bool {
+    if kept.track_name != "GFX" || !matches!(kept.clip.kind, ClipKind::Video { .. }) {
+        return false;
+    }
+    let Some(media) = kept.clip.media_id else {
+        return false;
+    };
+    let src = kept.clip.source_in.as_seconds();
+    timeline
+        .tracks
+        .iter()
+        .filter(|track| track.name == "GFX")
+        .flat_map(|track| track.clips.iter())
+        .any(|clip| {
+            clip.media_id == Some(media) && (clip.source_in.as_seconds() - src).abs() < 0.3
+        })
+}
+
+fn ensure_named(timeline: &mut Timeline, kind: TrackKind, name: &str) -> oc_timeline::TrackId {
+    if let Some(track) = timeline
+        .tracks
+        .iter()
+        .find(|track| track.kind == kind && track.name == name)
+    {
+        return track.id;
+    }
+    timeline.add_track(kind, name)
 }
 
 fn finish_picture(
@@ -403,7 +564,7 @@ fn err(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oc_timeline::{Grade, Lut};
+    use oc_timeline::{AlphaShape, ClipId, ClipLook, Grade, Lut, MaskShape, Transform};
 
     fn window(media: MediaId, start: f64, end: f64, look: &str, silent: bool) -> SourceWindow {
         SourceWindow {
@@ -512,6 +673,98 @@ mod tests {
             })
         });
         assert!(captioned, "{joined}");
+    }
+
+    #[test]
+    fn a_revision_keeps_design_and_a_mask() {
+        let picture = MediaId::new();
+        let design_media = MediaId::new();
+        let mut timeline = Timeline::default();
+        let v1 = timeline.first_track(TrackKind::Video).unwrap().id;
+        timeline
+            .add_clip(
+                v1,
+                Clip {
+                    id: ClipId::new(),
+                    media_id: Some(picture),
+                    kind: ClipKind::Video {
+                        transform: Transform::default(),
+                    },
+                    start: Time::ZERO,
+                    duration: Duration::from_seconds(4.0),
+                    source_in: Time::from_seconds(2.0),
+                    speed: 1.0,
+                    group_id: None,
+                    link_id: None,
+                    disabled: false,
+                    look: ClipLook {
+                        mask: Some(AlphaShape {
+                            shape: MaskShape::Ellipse,
+                            x: 0.4,
+                            y: 0.4,
+                            w: 0.3,
+                            h: 0.3,
+                            feather: 0.1,
+                            invert: false,
+                        }),
+                        stabilize: true,
+                        ..ClipLook::default()
+                    },
+                },
+            )
+            .unwrap();
+        let design_track = timeline.add_track(TrackKind::Video, "Design");
+        timeline
+            .add_clip(
+                design_track,
+                Clip {
+                    id: ClipId::new(),
+                    media_id: Some(design_media),
+                    kind: ClipKind::Video {
+                        transform: Transform::default(),
+                    },
+                    start: Time::ZERO,
+                    duration: Duration::from_seconds(2.0),
+                    source_in: Time::ZERO,
+                    speed: 1.0,
+                    group_id: None,
+                    link_id: None,
+                    disabled: false,
+                    look: ClipLook::default(),
+                },
+            )
+            .unwrap();
+        let plan = EditPlan {
+            style: "cinematic".into(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            grade: Grade::default(),
+            slots: vec![slot(picture, 2.0)],
+        };
+        let windows = vec![window(picture, 0.0, 10.0, "wide", false)];
+        build_plan(&mut timeline, &plan, &windows, &[], &[], &[]).unwrap();
+        let design = timeline
+            .tracks
+            .iter()
+            .find(|track| track.name == "Design")
+            .expect("design track");
+        assert!(
+            design.clips.iter().any(|clip| clip.media_id == Some(design_media)),
+            "design survives the rebuild"
+        );
+        let program = timeline
+            .tracks
+            .iter()
+            .filter(|track| track.name != "Design" && track.name != "GFX" && track.name != "Front")
+            .flat_map(|track| track.clips.iter())
+            .find(|clip| clip.media_id == Some(picture))
+            .expect("program clip");
+        let mask = program.look.mask.expect("mask copied onto the new clip");
+        assert!((mask.x - 0.4).abs() < 1e-4);
+        assert!(program.look.stabilize);
     }
 
     #[test]

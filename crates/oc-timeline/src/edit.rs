@@ -51,10 +51,10 @@ impl Timeline {
         if at <= left_start || at >= right_end {
             return Err(TimelineError::CannotRoll);
         }
-        let right_delta = at - right_start;
+        let right_delta = (at - right_start).as_seconds();
         self.tracks[ti].clips[ci].duration = at - left_start;
         let right = &mut self.tracks[ti].clips[ci + 1];
-        right.source_in += right_delta;
+        right.take_head(right_delta);
         right.start = at;
         right.duration = right_end - at;
         Ok(())
@@ -95,7 +95,8 @@ impl Timeline {
         self.tracks[ti].clips[ci].start = new_start;
         let right = &mut self.tracks[ti].clips[ci + 1];
         let new_right_start = new_start + mid.duration;
-        right.source_in += new_right_start - right.start;
+        let delta = (new_right_start - right.start).as_seconds();
+        right.take_head(delta);
         right.start = new_right_start;
         right.duration = right_end - new_right_start;
         Ok(())
@@ -672,6 +673,27 @@ mod tests {
             disabled: false,
             look: ClipLook::default(),
         }
+    }
+
+    #[test]
+    fn roll_of_a_fast_clip_moves_source_by_the_rate() {
+        let mut tl = Timeline::default();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let mut left = video(0.0, 2.0);
+        left.speed = 2.0;
+        left.source_in = Time::from_seconds(10.0);
+        let mut right = video(2.0, 2.0);
+        right.speed = 2.0;
+        right.source_in = Time::from_seconds(14.0);
+        let id = tl.add_clip(track, left).unwrap();
+        tl.add_clip(track, right).unwrap();
+        tl.roll(id, Time::from_seconds(1.0)).unwrap();
+        let right = &tl.first_track(TrackKind::Video).unwrap().clips[1];
+        assert!(
+            (right.source_in.as_seconds() - 12.0).abs() < 1e-2,
+            "{}",
+            right.source_in.as_seconds()
+        );
     }
 
     #[test]

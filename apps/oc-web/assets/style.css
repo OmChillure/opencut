@@ -402,6 +402,15 @@ button:disabled { opacity: 0.45; cursor: default; }
 }
 .preview-video-b { z-index: 1; }
 .preview-design, .preview-design-clip { z-index: 2; object-fit: cover; pointer-events: none; }
+.program-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 4;
+  pointer-events: none;
+}
+.program-canvas.off { display: none; }
 .preview-video.off, .preview-video-b.off, .preview-image.off, .preview-design.off, .preview-design-clip.off { visibility: hidden; }
 .preview-grade {
   position: absolute;
@@ -428,7 +437,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   position: absolute;
   inset: 0;
   pointer-events: none;
-  z-index: 3;
+  z-index: 5;
 }
 .preview-vignette.off, .preview-grain.off { display: none; }
 .preview-grain {
@@ -501,7 +510,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 .mask-handles {
   position: absolute;
   inset: 0;
-  z-index: 5;
+  z-index: 6;
   pointer-events: none;
   touch-action: none;
 }
@@ -1276,8 +1285,89 @@ button:disabled { opacity: 0.45; cursor: default; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 0 10px 0 14px;
   border-bottom: 1px solid var(--line);
+  position: relative;
+}
+.ai-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.chat-switch {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+}
+.chat-switch span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-switch:hover { background: var(--hover); }
+.chat-caret { color: var(--muted); flex-shrink: 0; font-size: 10px; }
+.chat-new {
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.chat-new:hover { background: var(--hover); }
+.chat-new:disabled { opacity: 0.4; }
+.chat-menu {
+  position: absolute;
+  top: 3.2rem;
+  left: 8px;
+  right: 8px;
+  z-index: 8;
+  background: #161616;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px;
+  max-height: 280px;
+  overflow: auto;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.chat-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-menu button.on { background: #102033; }
+.chat-menu button:hover { background: var(--hover); }
+.chat-menu button:disabled { opacity: 0.45; }
+.chat-menu-empty {
+  margin: 0;
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 12px;
 }
 .ai-title {
   display: flex;
@@ -1727,6 +1817,55 @@ a.btn, a.btn-primary { display: inline-flex; align-items: center; }
 }
 .create-form input:focus { border-color: var(--primary); }
 .create-form .auth-submit { width: auto; align-self: flex-start; padding: 0 18px; }
+
+.export-page {
+  max-width: 720px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.export-page h1 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 650;
+}
+.export-lead, .export-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.export-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.export-opt {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  padding: 14px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #141414;
+}
+.export-opt strong { font-size: 14px; }
+.export-opt span { color: var(--muted); font-size: 12px; }
+.export-opt.on {
+  border-color: var(--primary);
+  background: #102033;
+}
+.export-page .export-video {
+  width: min(100%, 640px);
+  max-width: none;
+  max-height: 70vh;
+}
+.export-page .btn { align-self: flex-start; padding: 0 18px; }
+@media (max-width: 700px) {
+  .export-options { grid-template-columns: 1fr; }
+  .shell-body { padding: 20px 16px 40px; }
+}
 
 /* Fleet toaster — progress line then auto-close */
 .toaster {

@@ -3089,6 +3089,7 @@ dependencies = [
  "oc-time",
  "oc-timeline",
  "serde",
+ "uuid",
 ]
 
 [[package]]
