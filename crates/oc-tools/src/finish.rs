@@ -224,6 +224,23 @@ fn wants_vertical(request: &str) -> bool {
         || t.contains("9:16")
 }
 
+/// True when a caption track already has words to burn.
+#[must_use]
+pub fn has_burnable_captions(timeline: &Timeline) -> bool {
+    timeline.tracks.iter().any(|track| {
+        track.kind == TrackKind::Caption
+            && !track.muted
+            && !track.hidden
+            && track.clips.iter().any(|clip| {
+                !clip.disabled
+                    && matches!(
+                        &clip.kind,
+                        ClipKind::Caption { cues, .. } if !cues.is_empty()
+                    )
+            })
+    })
+}
+
 pub fn program_clips(timeline: &Timeline) -> Vec<&Clip> {
     let mut clips = Vec::new();
     for track in &timeline.tracks {
@@ -363,6 +380,28 @@ mod tests {
         assert_eq!(cues.len(), 1);
         assert!((cues[0].start.as_seconds() - 1.0).abs() < 1e-6);
         assert!((cues[0].end.as_seconds() - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_empty_caption_track_is_not_burnable() {
+        let mut tl = tl(vec![video(MediaId::new(), 0.0, 4.0, 0.0)]);
+        assert!(!has_burnable_captions(&tl));
+        let mut undo = oc_timeline::UndoStack::new();
+        crate::apply(
+            &mut tl,
+            &mut undo,
+            Op::AddCaptions {
+                style: CaptionStyle::Stacked,
+                cues: vec![CaptionCue {
+                    start: Time::from_seconds(0.2),
+                    end: Time::from_seconds(2.0),
+                    text: "on screen".into(),
+                    speaker: None,
+                }],
+            },
+        )
+        .unwrap();
+        assert!(has_burnable_captions(&tl));
     }
 
     #[test]

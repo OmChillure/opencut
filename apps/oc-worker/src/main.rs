@@ -374,13 +374,52 @@ async fn save_transcript(
     Ok(())
 }
 
+async fn lay_captions(
+    db: &Db,
+    project_id: Uuid,
+    timeline: &mut oc_core::Timeline,
+) -> anyhow::Result<()> {
+    if oc_tools::has_burnable_captions(timeline) {
+        return Ok(());
+    }
+    let rows = oc_db::list_transcripts_for_project(db, project_id).await?;
+    let lines: Vec<oc_tools::SpokenLine> = rows
+        .iter()
+        .map(|row| oc_tools::SpokenLine {
+            media: oc_core::MediaId::from_uuid(row.media_id),
+            start: oc_core::Time::from_ticks(row.start_ticks).as_seconds(),
+            end: oc_core::Time::from_ticks(row.end_ticks).as_seconds(),
+            text: row.text.clone(),
+        })
+        .collect();
+    let clips = oc_tools::program_clips(timeline);
+    let cues = oc_tools::mapped_cues(&clips, &lines);
+    if cues.is_empty() {
+        return Ok(());
+    }
+    let n = cues.len();
+    let mut undo = UndoStack::new();
+    apply(
+        timeline,
+        &mut undo,
+        Op::AddCaptions {
+            style: oc_core::CaptionStyle::Stacked,
+            cues,
+        },
+    )?;
+    oc_db::save_timeline(db, project_id, timeline).await?;
+    tracing::info!(project = %project_id, cues = n, "captions laid on the cut for export");
+    Ok(())
+}
+
 async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
-    let project = oc_db::get_project(db, p.project_id).await?;
+    let mut project = oc_db::get_project(db, p.project_id).await?;
     let rows = oc_db::list_media(db, p.project_id).await?;
     if project.timeline.duration().as_seconds() < 0.04 {
         anyhow::bail!("timeline is empty");
     }
+    lay_captions(db, p.project_id, &mut project.timeline).await?;
     let work = std::env::temp_dir().join(format!("oc-export-{}", p.project_id));
     tokio::fs::create_dir_all(&work).await?;
     let mut media = std::collections::HashMap::new();

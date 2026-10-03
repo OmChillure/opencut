@@ -20,8 +20,8 @@ pub use ops::{
 pub use oc_timeline::PlaceMode;
 pub use registry::{actions, modes, tool, tools, track_actions};
 pub use finish::{
-    CoverShot, SpokenLine, already_finished, finish_reel, mapped_cues, program_clips,
-    wants_picture_finish,
+    CoverShot, SpokenLine, already_finished, finish_reel, has_burnable_captions, mapped_cues,
+    program_clips, wants_picture_finish,
 };
 pub use review::{review_cut, review_with, CutReview, ReviewFacts, ShotNote, SourceSpan, Spoken};
 
