@@ -472,13 +472,20 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
             oc_timeline::MediaId::from_uuid(p.project_id),
             &filename,
         );
-        r2.put_bytes(&key, bytes, "video/mp4").await?;
-        tracing::info!(
-            project = %p.project_id,
-            key,
-            ms = t0.elapsed().as_millis(),
-            "export uploaded"
-        );
+        // The editor plays the local file. A denied upload must not fail that render.
+        match r2.put_bytes(&key, bytes, "video/mp4").await {
+            Ok(()) => tracing::info!(
+                project = %p.project_id,
+                key,
+                ms = t0.elapsed().as_millis(),
+                "export uploaded"
+            ),
+            Err(err) => tracing::error!(
+                project = %p.project_id,
+                path = %rendered.output.display(),
+                "export file is local; R2 upload failed: {err}"
+            ),
+        }
     } else {
         tracing::info!(
             project = %p.project_id,

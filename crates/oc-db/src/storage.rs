@@ -11,13 +11,24 @@ pub enum StorageError {
     MissingEnv(&'static str),
     #[error("presign: {0}")]
     Presign(String),
-    #[error(transparent)]
-    Sdk(Box<aws_sdk_s3::Error>),
+    #[error("{0}")]
+    Sdk(String),
 }
 
 impl From<aws_sdk_s3::Error> for StorageError {
     fn from(value: aws_sdk_s3::Error) -> Self {
-        Self::Sdk(Box::new(value))
+        Self::Sdk(explain_store(&value))
+    }
+}
+
+/// Cloudflare answers a signed request with AccessDenied when the R2 token
+/// cannot write the bucket. The SDK otherwise prints "unhandled error".
+fn explain_store(err: &aws_sdk_s3::Error) -> String {
+    let raw = err.to_string();
+    if raw.contains("AccessDenied") {
+        "R2 refused the upload (Access Denied). The API token needs Object Read & Write on this bucket.".into()
+    } else {
+        format!("object store: {raw}")
     }
 }
 
