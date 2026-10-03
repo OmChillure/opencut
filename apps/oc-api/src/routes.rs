@@ -413,7 +413,8 @@ async fn run_chat(
                 return false;
             }
             let stale = looks.get(&m.id).is_some_and(|l| {
-                l.has_video && crate::edit::shot_looks(l).is_empty()
+                (l.has_video && crate::edit::shot_looks(l).is_empty())
+                    || crate::edit::look_needs_vision(l)
             });
             stale || (!speech.contains_key(&m.id) && !looks.contains_key(&m.id))
         });
@@ -432,7 +433,8 @@ async fn run_chat(
                     continue;
                 }
                 let stale_look = looks.get(&row.id).is_some_and(|l| {
-                    l.has_video && crate::edit::shot_looks(l).is_empty()
+                    (l.has_video && crate::edit::shot_looks(l).is_empty())
+                        || crate::edit::look_needs_vision(l)
                 });
                 if (speech.contains_key(&row.id) || looks.contains_key(&row.id)) && !stale_look
                 {

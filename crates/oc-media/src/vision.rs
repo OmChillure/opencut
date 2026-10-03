@@ -18,13 +18,13 @@ pub struct ShotLook {
     pub subject: String,
     #[serde(default)]
     pub motion: f32,
-    /// Filled by one vision batch at import. Missing when there is no API key.
+    /// Filled when a signed-in Claude, Grok, or Codex CLI labels this range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<ShotCard>,
 }
 
 /// Compact look from one vision batch. Cached on the analysis row.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShotCard {
     #[serde(default)]
     pub scale: String,
@@ -58,6 +58,9 @@ pub struct VisualDigest {
     pub shots: Vec<ShotLook>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music: Option<crate::MusicAnalysis>,
+    /// `labeled` or `failed` after a vision pass. Absent when the pass has not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<String>,
 }
 
 impl Default for VisualDigest {
@@ -72,6 +75,7 @@ impl Default for VisualDigest {
             has_audio: false,
             shots: Vec::new(),
             music: None,
+            vision: None,
         }
     }
 }
@@ -529,7 +533,20 @@ fn fold_frames(frames: Vec<FrameStats>, scene_n: usize, duration: f64, has_audio
         has_audio,
         shots: Vec::new(),
         music: None,
+        vision: None,
     }
+}
+
+impl VisualDigest {
+    /// Picture ranges still have no card, and a previous pass did not finish.
+    #[must_use]
+    pub fn needs_cards(&self) -> bool {
+        self.has_video
+            && !self.shots.is_empty()
+            && self.shots.iter().any(|shot| shot.card.is_none())
+            && !matches!(self.vision.as_deref(), Some("labeled" | "failed"))
+    }
+
 }
 
 fn path_str(path: &Path) -> String {
@@ -572,5 +589,32 @@ mod tests {
         let d: VisualDigest = serde_json::from_str(raw).unwrap();
         assert!(d.shots.is_empty());
         assert_eq!(d.look, "wide");
+        assert!(d.vision.is_none());
+        assert!(!d.needs_cards());
+    }
+
+    #[test]
+    fn a_finished_vision_pass_does_not_ask_again() {
+        let mut d = VisualDigest {
+            has_video: true,
+            shots: vec![ShotLook {
+                start: 0.0,
+                end: 2.0,
+                look: "wide".into(),
+                subject: String::new(),
+                motion: 0.0,
+                card: None,
+            }],
+            ..VisualDigest::default()
+        };
+        assert!(d.needs_cards());
+        d.vision = Some("failed".into());
+        assert!(!d.needs_cards());
+        d.vision = None;
+        d.shots[0].card = Some(ShotCard {
+            scale: "wide".into(),
+            ..ShotCard::default()
+        });
+        assert!(!d.needs_cards());
     }
 }

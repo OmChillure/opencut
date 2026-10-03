@@ -223,6 +223,21 @@ async fn understand_file(
                     look.music = Some(music);
                 }
             }
+            match label_with_subscription(path, &mut look).await {
+                Ok(filled) => {
+                    look.vision = Some("labeled".into());
+                    tracing::info!(filled, shots = look.shots.len(), "shot cards saved");
+                }
+                Err(LabelError::SkipLabels) => {
+                    tracing::info!(
+                        "shot cards skipped — sign in with `claude auth login`, `grok`, or `codex`"
+                    );
+                }
+                Err(LabelError::LabelFailed(err)) => {
+                    look.vision = Some("failed".into());
+                    tracing::warn!("shot cards failed: {err}");
+                }
+            }
             let raw = serde_json::to_value(&look).unwrap_or(serde_json::json!({}));
             if let Err(e) = oc_db::upsert_media_analysis(
                 db,
@@ -255,6 +270,37 @@ async fn understand_file(
     oc_db::set_media_status(db, p.media_id, "ready").await?;
     tracing::info!(media = %p.media_id, ms = t0.elapsed().as_millis(), "understand done");
     Ok(())
+}
+
+enum LabelError {
+    SkipLabels,
+    LabelFailed(String),
+}
+
+async fn label_with_subscription(path: &Path, look: &mut oc_media::VisualDigest) -> Result<usize, LabelError> {
+    let stills = match oc_media::shot_stills(path, &look.shots).await {
+        Ok(stills) => stills,
+        Err(err) => return Err(LabelError::LabelFailed(err)),
+    };
+    if stills.is_empty() {
+        return Ok(look.shots.iter().filter(|shot| shot.card.is_some()).count());
+    }
+    if !oc_providers::subscription_ready() {
+        return Err(LabelError::SkipLabels);
+    }
+    let frames = stills
+        .iter()
+        .map(|still| oc_providers::PromptImage {
+            caption: still.caption.clone(),
+            jpeg: still.jpeg.clone(),
+        })
+        .collect::<Vec<_>>();
+    let text = oc_providers::ask_with_stills(oc_media::shot_label_prompt(), &frames)
+        .await
+        .map_err(|err| LabelError::LabelFailed(err.to_string()))?;
+    oc_media::apply_shot_reply(&mut look.shots, &stills, &text)
+        .map_err(LabelError::LabelFailed)?;
+    Ok(look.shots.iter().filter(|shot| shot.card.is_some()).count())
 }
 
 async fn music_grid(path: &Path) -> Option<oc_media::MusicAnalysis> {

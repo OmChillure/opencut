@@ -503,6 +503,13 @@ pub(crate) fn shot_looks(row: &oc_db::AnalysisRow) -> Vec<oc_media::ShotLook> {
         .unwrap_or_default()
 }
 
+pub(crate) fn look_needs_vision(row: &oc_db::AnalysisRow) -> bool {
+    row.raw
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<oc_media::VisualDigest>(v.clone()).ok())
+        .is_some_and(|digest| digest.needs_cards() && oc_providers::subscription_ready())
+}
+
 /// One JPEG at a source time. The model calls `see` when it wants to look.
 pub(crate) async fn see_frame(
     db: &Db,
@@ -862,17 +869,19 @@ fn compact_shots(picture: &[oc_media::ShotLook], briefs: &[oc_media::ShotBrief])
     for i in 0..rows {
         let start = briefs.get(i).map(|b| b.start).unwrap_or(picture[i].start);
         let end = briefs.get(i).map(|b| b.end).unwrap_or(picture[i].end);
-        let card = picture.iter().find(|s| (s.start - start).abs() < 0.4).and_then(|s| s.card.as_ref());
+        let shot = picture.iter().find(|s| (s.start - start).abs() < 0.4);
+        let card = shot.and_then(|s| s.card.as_ref());
         if let Some(card) = card {
             if card.quality > 0 && card.quality < 5 {
                 hidden += 1;
                 continue;
             }
             let color = card.palette.first().map(String::as_str).unwrap_or("");
+            let subject = shot.map(|s| s.subject.as_str()).unwrap_or("");
             let speech = briefs.get(i).map(|b| b.text.as_str()).unwrap_or("");
             let role = briefs.get(i).map(|b| b.role.as_str()).unwrap_or("silence");
             out.push_str(&format!(
-                "{start:.1}-{end:.1} {} {} {} \"{}\" q{} {color} {role}",
+                "{start:.1}-{end:.1} {} {subject} {} {} \"{}\" q{} {color} {role}",
                 card.scale, card.camera, card.motion_dir, card.action, card.quality
             ));
             if !speech.is_empty() && role != "silence" {

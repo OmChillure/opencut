@@ -12,6 +12,7 @@ oc-core.workspace = true
 oc-db.workspace = true
 oc-voice.workspace = true
 oc-media.workspace = true
+oc-providers.workspace = true
 oc-render.workspace = true
 oc-timeline.workspace = true
 oc-tools.workspace = true

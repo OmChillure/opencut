@@ -120,10 +120,12 @@ pub fn mcp_tools() -> Vec<McpTool> {
         McpTool {
             name: "get_media".into(),
             description:
-                "Shot list for one media id: each range has a look (wide/close/action), \
-                 a subject (person, product, street, screen, interior, landscape), \
-                 and a role (speech, silence, filler) plus the words in that range. \
-                 Call this before cutting a long file. Place excerpts on those times."
+                "Shot list for one media id. Each range has a scale (wide/medium/close/detail), \
+                 a subject (person, product, street, screen, interior, landscape, object), \
+                 camera, motion (l2r/r2l/toward/away/none), q (1-10), \
+                 a role (speech, silence, filler), and the words in that range. \
+                 Shots under q5 are omitted. A row with only wide/close/action has not been \
+                 labeled yet. Call this before cutting a long file. Place excerpts on those times."
                     .into(),
             input_schema: object(&[("media_id", str_prop("Media id from list_bin"), true)]),
         },

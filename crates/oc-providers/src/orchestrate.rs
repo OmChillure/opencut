@@ -12,6 +12,65 @@ pub struct PromptImage {
     pub jpeg: Vec<u8>,
 }
 
+/// True when Claude, Grok, or Codex is signed in on this machine.
+#[must_use]
+pub fn subscription_ready() -> bool {
+    ProviderId::Claude.connected()
+        || ProviderId::Xai.connected()
+        || ProviderId::Openai.connected()
+}
+
+/// One still-labeling turn on a local subscription. Claude, then Grok, then Codex.
+pub async fn ask_with_stills(prompt: &str, frames: &[PromptImage]) -> Result<String, LlmError> {
+    let ready = [
+        ProviderId::Claude,
+        ProviderId::Xai,
+        ProviderId::Openai,
+    ]
+    .into_iter()
+    .filter(|id| id.connected())
+    .collect::<Vec<_>>();
+    if ready.is_empty() {
+        return Err(LlmError::Message(
+            "Sign in with `claude auth login`, `grok`, or `codex`. Shot labels use that subscription."
+                .into(),
+        ));
+    }
+    let mut last = None;
+    for id in ready {
+        match ask_one(id, prompt, frames).await {
+            Ok(text) => {
+                tracing::info!(provider = id.as_str(), chars = text.len(), "shot labels");
+                return Ok(text);
+            }
+            Err(err) => {
+                tracing::warn!(provider = id.as_str(), "shot labels failed: {err}");
+                last = Some(err);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| LlmError::Message("no subscription answered".into())))
+}
+
+async fn ask_one(id: ProviderId, prompt: &str, frames: &[PromptImage]) -> Result<String, LlmError> {
+    match id {
+        ProviderId::Claude => claude_print(prompt, frames).await,
+        ProviderId::Openai => codex_print(prompt, frames).await,
+        ProviderId::Xai => grok_stills(prompt, frames).await,
+    }
+}
+
+async fn grok_stills(prompt: &str, frames: &[PromptImage]) -> Result<String, LlmError> {
+    let model = crate::local_auth::grok_models()
+        .into_iter()
+        .next()
+        .map(|info| info.id)
+        .unwrap_or_default();
+    let bin = env_or("OPENCUT_GROK_ACP", "grok");
+    let args = grok_agent_args(&model);
+    spawn_acp(&bin, &args, &model, prompt, &[], frames, None).await
+}
+
 pub async fn complete(
     provider: &str,
     model: &str,

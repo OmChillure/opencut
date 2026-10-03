@@ -3242,6 +3242,7 @@ dependencies = [
  "oc-core",
  "oc-db",
  "oc-media",
+ "oc-providers",
  "oc-render",
  "oc-timeline",
  "oc-tools",
