@@ -573,6 +573,15 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             format!("flags on {track_id}")
         }
         Op::SetTimeline { timeline: next } => {
+            // The open editor can still be holding the timeline from before a
+            // director cut. Saving that view would wipe the cut.
+            let kept = crate::program_clips(timeline).len();
+            let incoming = crate::program_clips(next).len();
+            if kept > 0 && incoming == 0 {
+                return Err(OpError::Message(
+                    "refusing to replace a cut with an empty timeline".into(),
+                ));
+            }
             *timeline = next.clone();
             "updated timeline".into()
         }
@@ -2638,6 +2647,47 @@ mod tests {
         .unwrap();
         apply(&mut tl, &mut undo, Op::ClearTimeline).unwrap();
         assert!(tl.first_track(TrackKind::Video).unwrap().clips.is_empty());
+    }
+
+    #[test]
+    fn set_timeline_keeps_a_cut_the_client_dropped() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let clip = Clip {
+            id: ClipId::new(),
+            media_id: Some(MediaId::new()),
+            kind: ClipKind::Video {
+                transform: Transform::default(),
+            },
+            start: Time::ZERO,
+            duration: Duration::from_seconds(2.0),
+            source_in: Time::ZERO,
+            speed: 1.0,
+            group_id: None,
+            link_id: None,
+            disabled: false,
+            look: ClipLook::default(),
+        };
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::AddClip {
+                track_id: track,
+                clip,
+            },
+        )
+        .unwrap();
+        let err = apply(
+            &mut tl,
+            &mut undo,
+            Op::SetTimeline {
+                timeline: Timeline::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+        assert_eq!(tl.first_track(TrackKind::Video).unwrap().clips.len(), 1);
     }
 
     #[test]
