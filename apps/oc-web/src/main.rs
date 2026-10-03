@@ -2536,7 +2536,7 @@ fn AiSidebar(
                         button {
                             class: "send pause",
                             title: "Stop the chat",
-                            onclick: move |_| stop_chat(messages),
+                            onclick: move |_| stop_chat(messages, busy),
                             "Pause"
                         }
                     } else {
@@ -3365,10 +3365,23 @@ fn commit_mask(
     );
 }
 
-fn stop_chat(mut messages: Signal<Vec<ChatMsg>>) {
+fn stop_chat(mut messages: Signal<Vec<ChatMsg>>, mut busy: Signal<bool>) {
     api::request_chat_stop();
-    clear_status(messages);
-    messages.write().push(ChatMsg::status("Stopped".to_string()));
+    finish_chat_stop(&mut messages.write());
+    busy.set(false);
+}
+
+/// Pause ended the turn. Pending tools leave the yellow state, and the
+/// composer is idle so the button is send again.
+fn finish_chat_stop(messages: &mut Vec<ChatMsg>) {
+    for msg in messages.iter_mut() {
+        if msg.role == ChatRole::Tool && msg.tool_status == "pending" {
+            msg.tool_status = "stopped".into();
+            msg.open = false;
+        }
+    }
+    messages.retain(|msg| msg.role != ChatRole::Status);
+    messages.push(ChatMsg::status("Stopped".to_string()));
 }
 
 fn clear_status(mut messages: Signal<Vec<ChatMsg>>) {
@@ -3667,7 +3680,7 @@ fn send_prompt(
             return;
         }
     }
-    api::clear_chat_stop();
+    let turn = api::begin_chat();
     busy.set(true);
     messages.write().push(ChatMsg::status(format!(
         "Sending to {} · {}…",
@@ -3704,11 +3717,16 @@ fn send_prompt(
         if let Ok(id) = store_snap(&pid, &mut bound, chat_id, chats, opening).await {
             bound = Some(id);
         }
-        if api::chat_stopped() {
-            busy.set(false);
+        if !api::chat_current(turn) {
+            if api::chat_generation() == turn {
+                busy.set(false);
+            }
             return;
         }
         for (id, name, ctype, dur, url) in &bin {
+            if !api::chat_current(turn) {
+                break;
+            }
             let _ = api::register_media(&pid, id, name, ctype, *dur).await;
             if url.starts_with("blob:") {
                 if let Ok(resp) = reqwest::Client::new().get(url).send().await {
@@ -3718,8 +3736,14 @@ fn send_prompt(
                 }
             }
         }
-        let reply = api::chat_stream(&pid, &provider, &model, &history, |ev| {
-            if api::chat_stopped() {
+        if !api::chat_current(turn) {
+            if api::chat_generation() == turn {
+                busy.set(false);
+            }
+            return;
+        }
+        let reply = api::chat_stream(&pid, &provider, &model, &history, turn, |ev| {
+            if !api::chat_current(turn) {
                 return;
             }
             if let Some(tl) = ev.timeline.clone() {
@@ -3728,10 +3752,17 @@ fn send_prompt(
             apply_chat_event(messages, ev);
         })
         .await;
+        if api::chat_generation() != turn {
+            return;
+        }
         if api::chat_stopped() {
             let snap = persistable(&messages.read());
-            let _ = store_snap(&pid, &mut bound, chat_id, chats, snap).await;
-            busy.set(false);
+            if api::chat_generation() == turn {
+                let _ = store_snap(&pid, &mut bound, chat_id, chats, snap).await;
+            }
+            if api::chat_generation() == turn {
+                busy.set(false);
+            }
             return;
         }
         match reply {
@@ -3767,7 +3798,9 @@ fn send_prompt(
                     short_api_error(&err)
                 )));
         }
-        busy.set(false);
+        if api::chat_generation() == turn {
+            busy.set(false);
+        }
     });
 }
 
@@ -4304,6 +4337,47 @@ mod chat_tests {
             "\"name\":\"monitor\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
         )
         .to_string()
+    }
+
+    #[test]
+    fn pause_returns_the_composer_and_closes_pending_tools() {
+        let mut msgs = vec![
+            ChatMsg::user("edit this video"),
+            ChatMsg::status("Sending to grok · grok-4.7…"),
+            ChatMsg {
+                role: ChatRole::Tool,
+                text: "see".into(),
+                tool_id: "see-1".into(),
+                tool_name: "see".into(),
+                tool_status: "pending".into(),
+                tool_args: String::new(),
+                tool_result: "media @ 0.4s".into(),
+                open: true,
+            },
+            ChatMsg {
+                role: ChatRole::Tool,
+                text: "read".into(),
+                tool_id: "read-1".into(),
+                tool_name: "read".into(),
+                tool_status: "done".into(),
+                tool_args: String::new(),
+                tool_result: String::new(),
+                open: false,
+            },
+        ];
+        finish_chat_stop(&mut msgs);
+        assert_eq!(
+            msgs.iter()
+                .filter(|msg| msg.role == ChatRole::Status)
+                .map(|msg| msg.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Stopped"]
+        );
+        let see = msgs.iter().find(|msg| msg.tool_name == "see").unwrap();
+        assert_eq!(see.tool_status, "stopped");
+        assert!(!see.open);
+        let read = msgs.iter().find(|msg| msg.tool_name == "read").unwrap();
+        assert_eq!(read.tool_status, "done");
     }
 
     fn tool_row() -> ChatMsg {

@@ -1508,6 +1508,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 }
 .tool-status.pending { color: #c9a227; }
 .tool-status.done { color: #3d9a5f; }
+.tool-status.stopped { color: var(--muted); }
 .tool-status.error { color: #c45c5c; }
 .tool-args, .tool-result {
   margin: 6px 0 0;

@@ -114,18 +114,86 @@ pub async fn put_media_bytes(
 
 thread_local! {
     static CHAT_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CHAT_GEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static CHAT_ABORT: std::cell::RefCell<Option<(u32, web_sys::AbortController)>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Starts one chat turn. A later stop only applies to this generation.
+pub fn begin_chat() -> u32 {
+    CHAT_STOP.with(|cell| cell.set(false));
+    CHAT_GEN.with(|cell| {
+        let next = cell.get().wrapping_add(1);
+        cell.set(next);
+        next
+    })
+}
+
+pub fn chat_generation() -> u32 {
+    CHAT_GEN.with(|cell| cell.get())
+}
+
+/// True while `turn` is still the turn on screen and the user has not stopped it.
+pub fn chat_current(turn: u32) -> bool {
+    chat_generation() == turn && !chat_stopped()
 }
 
 pub fn request_chat_stop() {
     CHAT_STOP.with(|cell| cell.set(true));
-}
-
-pub fn clear_chat_stop() {
-    CHAT_STOP.with(|cell| cell.set(false));
+    abort_chat_stream();
 }
 
 pub fn chat_stopped() -> bool {
     CHAT_STOP.with(|cell| cell.get())
+}
+
+fn abort_chat_stream() {
+    #[cfg(target_arch = "wasm32")]
+    CHAT_ABORT.with(|slot| {
+        if let Some((_, ctrl)) = slot.borrow().as_ref() {
+            ctrl.abort();
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bind_chat_abort(turn: u32, ctrl: web_sys::AbortController) {
+    CHAT_ABORT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((_, prev)) = slot.take() {
+            if prev != ctrl {
+                prev.abort();
+            }
+        }
+        *slot = Some((turn, ctrl));
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clear_chat_abort(turn: u32) {
+    CHAT_ABORT.with(|slot| {
+        let same = slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|(bound, _)| *bound == turn);
+        if same {
+            *slot.borrow_mut() = None;
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+struct ChatAbortLease(u32);
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for ChatAbortLease {
+    fn drop(&mut self) {
+        clear_chat_abort(self.0);
+    }
 }
 
 pub async fn chat_stream(
@@ -133,6 +201,7 @@ pub async fn chat_stream(
     provider: &str,
     model: &str,
     messages: &[(bool, String)],
+    turn: u32,
     mut on_event: impl FnMut(ChatStreamEvent),
 ) -> Result<ChatReply, String> {
     let body = serde_json::json!({
@@ -150,7 +219,10 @@ pub async fn chat_stream(
     };
     let mut saw_done = false;
     let url = format!("{API}/v1/projects/{project_id}/chat");
-    read_ndjson(&url, &body.to_string(), |line| {
+    read_ndjson(&url, &body.to_string(), turn, |line| {
+        if !chat_current(turn) {
+            return Err("stopped".into());
+        }
         let ev: ChatStreamEvent = serde_json::from_str(line).map_err(|e| e.to_string())?;
         if ev.kind == "done" {
             reply.text = ev.text.clone();
@@ -271,14 +343,19 @@ pub async fn save_chat(
 async fn read_ndjson(
     url: &str,
     json_body: &str,
-    mut on_line: impl FnMut(&str) -> Result<(), String>,
+    turn: u32,
+    on_line: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
     {
-        wasm_read_ndjson(url, json_body, on_line).await
+        wasm_read_ndjson(url, json_body, turn, on_line).await
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let mut on_line = on_line;
+        if !chat_current(turn) {
+            return Err("stopped".into());
+        }
         let raw = reqwest::Client::new()
             .post(url)
             .header("content-type", "application/json")
@@ -305,25 +382,39 @@ async fn read_ndjson(
 async fn wasm_read_ndjson(
     url: &str,
     json_body: &str,
+    turn: u32,
     mut on_line: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
     use web_sys::{ReadableStreamDefaultReader, Request, RequestInit, RequestMode, Response};
 
+    let ctrl = web_sys::AbortController::new().map_err(js_err)?;
     let opts = RequestInit::new();
     opts.set_method("POST");
     opts.set_mode(RequestMode::Cors);
     opts.set_body(&wasm_bindgen::JsValue::from_str(json_body));
+    opts.set_signal(Some(&ctrl.signal()));
+    bind_chat_abort(turn, ctrl);
+    let _lease = ChatAbortLease(turn);
+    if !chat_current(turn) {
+        return Err("stopped".into());
+    }
     let request = Request::new_with_str_and_init(url, &opts).map_err(js_err)?;
     request
         .headers()
         .set("content-type", "application/json")
         .map_err(js_err)?;
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
-    let resp = JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(js_err)?;
+    let resp = match JsFuture::from(window.fetch_with_request(&request)).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            if !chat_current(turn) {
+                return Err("stopped".into());
+            }
+            return Err(js_err(err));
+        }
+    };
     let resp: Response = resp.dyn_into().map_err(|_| "bad response".to_string())?;
     if !resp.ok() {
         return Err(format!("HTTP {}", resp.status()));
@@ -337,11 +428,19 @@ async fn wasm_read_ndjson(
         .map_err(|_| "stream reader".to_string())?;
     let mut pending = String::new();
     loop {
-        if chat_stopped() {
+        if !chat_current(turn) {
             let _ = reader.cancel();
             return Err("stopped".into());
         }
-        let next = JsFuture::from(reader.read()).await.map_err(js_err)?;
+        let next = match JsFuture::from(reader.read()).await {
+            Ok(next) => next,
+            Err(err) => {
+                if !chat_current(turn) {
+                    return Err("stopped".into());
+                }
+                return Err(js_err(err));
+            }
+        };
         let done = js_sys::Reflect::get(&next, &"done".into())
             .ok()
             .and_then(|v| v.as_bool())
@@ -639,4 +738,23 @@ pub async fn upload_media(
 
 pub fn media_file_url(project_id: &str, media_id: &str) -> String {
     format!("{API}/v1/projects/{project_id}/media/{media_id}/file")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stopped_turn_does_not_keep_the_composer() {
+        let first = begin_chat();
+        assert!(chat_current(first));
+        request_chat_stop();
+        assert!(chat_stopped());
+        assert!(!chat_current(first));
+        let second = begin_chat();
+        assert_ne!(first, second);
+        assert!(chat_current(second));
+        assert!(!chat_current(first));
+        assert!(!chat_stopped());
+    }
 }
