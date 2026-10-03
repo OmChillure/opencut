@@ -126,19 +126,37 @@ async fn run_provider(
 
 fn acp_launch(id: ProviderId, model: &str) -> (String, Vec<String>) {
     match id {
-        ProviderId::Xai => (
-            env_or("OPENCUT_GROK_ACP", "grok"),
-            vec![
-                "agent".into(),
-                "--always-approve".into(),
-                "-m".into(),
-                model.into(),
-                "stdio".into(),
-            ],
-        ),
+        ProviderId::Xai => (env_or("OPENCUT_GROK_ACP", "grok"), grok_agent_args(model)),
         ProviderId::Claude => claude_launch(model),
         ProviderId::Openai => codex_launch(model),
     }
+}
+
+/// A private grok process. `--no-leader` keeps it off the user's running session.
+fn grok_agent_args(model: &str) -> Vec<String> {
+    let mut args = vec![
+        "agent".into(),
+        "--always-approve".into(),
+        "--no-leader".into(),
+    ];
+    if let Some(sock) = private_grok_socket() {
+        args.push("--leader-socket".into());
+        args.push(sock);
+    }
+    if !model.is_empty() {
+        args.push("-m".into());
+        args.push(model.into());
+    }
+    args.push("stdio".into());
+    args
+}
+
+fn private_grok_socket() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    Some(format!(
+        "{home}/.grok/leader-opencut-{}.sock",
+        std::process::id()
+    ))
 }
 
 fn claude_launch(model: &str) -> (String, Vec<String>) {
