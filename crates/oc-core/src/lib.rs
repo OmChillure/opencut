@@ -11,7 +11,7 @@ pub use oc_tools::{
     revises_existing_cut, PiecePick, SourceBeat, review_cut, review_with, finish_reel, already_finished,
     wants_picture_finish, CutReview, Spoken, SpokenLine, CoverShot, mapped_cues, program_clips,
     build_plan, revise_plan,
-    plan_from_value, SourceWindow, ReviewFacts,
+    plan_from_value, SourceWindow, ReviewFacts, ShotNote, SourceSpan,
 };
 pub use oc_time::{Duration, FrameRate, Time};
 pub use oc_timeline::{

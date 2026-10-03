@@ -8,7 +8,7 @@ mod plan;
 mod registry;
 mod review;
 
-pub use intent::{Intent, is_director_request, parse_intent};
+pub use intent::{asks_for_whole_piece, Intent, is_director_request, parse_intent};
 pub use mcp::{inspect_from_mcp, Inspect, McpCall, McpTool, mcp_tools, op_from_mcp};
 pub use plan::{build_plan, plan_from_value, revise_plan, SourceWindow};
 pub use ops::{
@@ -23,7 +23,7 @@ pub use finish::{
     CoverShot, SpokenLine, already_finished, finish_reel, mapped_cues, program_clips,
     wants_picture_finish,
 };
-pub use review::{review_cut, review_with, CutReview, ReviewFacts, Spoken};
+pub use review::{review_cut, review_with, CutReview, ReviewFacts, ShotNote, SourceSpan, Spoken};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

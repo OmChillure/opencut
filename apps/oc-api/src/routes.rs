@@ -320,14 +320,18 @@ async fn fresh_review(state: &AppState, id: Uuid, request: &str) -> oc_core::Cut
     if !director {
         return review_cut(&timeline, &spoken, request);
     }
-    let facts = oc_core::ReviewFacts {
-        has_music: timeline
-            .edit_plan
-            .as_ref()
-            .and_then(|p| p.music_id)
-            .is_some(),
-        ..oc_core::ReviewFacts::default()
-    };
+    let media = oc_db::list_media(&state.db, id).await.unwrap_or_default();
+    let looks = look_by_media(
+        &oc_db::list_analysis_for_project(&state.db, id)
+            .await
+            .unwrap_or_default(),
+    );
+    let has_music = timeline
+        .edit_plan
+        .as_ref()
+        .and_then(|p| p.music_id)
+        .is_some();
+    let facts = edit::review_facts(&timeline, &media, &looks, Vec::new(), has_music);
     oc_core::review_with(&timeline, &spoken, request, &facts)
 }
 

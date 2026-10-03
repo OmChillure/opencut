@@ -5,12 +5,13 @@ Think, then act. Match the tools to **this** request — do not run a stock vlog
 ## 1. Inventory
 
 Call `list_bin` and `list_timeline` first. For a long file, call `get_media`.
-Read the shot list (`start-end`, look, `speech` / `silence` / `filler`, words).
-`list_cues` is the raw transcript if you still need a line the shot list cut off.
+Read the shot list (`start-end`, scale, subject, camera, motion, `q`, `speech` / `silence` / `filler`, words).
+A row without a scale is only the coarse look (`wide`, `close`, `action`). `list_cues` is the raw transcript if you still need a line the shot list cut off.
 
 From those tools (not filenames):
 
 - who is speaking, and which lines are worth keeping (with source times)
+- which ranges are the person, the place, or a screen, and which are wide or close
 - which clips have almost no speech (B-roll / stills)
 - which file is music
 - what is already on the timeline (`source_in` is the in-point in the source)
@@ -20,8 +21,9 @@ From those tools (not filenames):
 Decide the shape from the ask. You choose the in-points. Do not walk the transcript in order and keep each sentence.
 
 - **Several recordings of one moment** — cut between angles on the word. The other file is not the next sentence.
-- **Reel / short / tiktok / 30–60s** — hook, spine, cover, end. Vertical if they said reel or tiktok.
-- **One long source** — several excerpts, not one short bite and not the whole file.
+- **Reel / short / tiktok / highlight / a named duration** — hook, spine, cover, end. A long take may become 30–60s. Vertical if they said reel or tiktok.
+- **Edit this video / the whole import / cover the source** — keep the piece. Excerpts in order. Drop ums, dead air, and retakes. At least half of the real speech stays (on a silent film, at least half of the source). Not a 30–60s reel.
+- **One long source and they asked for a reel or a short** — several excerpts, not one short bite and not the whole file.
 - **Trim / split / delete / recut** — touch only what they named.
 - **Captions / silence / duck / reframe** — just that.
 - **On the plan** — grade, grain, a fade, a push, a cover, music volume, captions, and letterbox only where this footage needs them. Rust applies those fields and leaves every other shot alone.

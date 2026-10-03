@@ -51,6 +51,13 @@ pub fn is_director_request(text: &str) -> bool {
     if PHRASES.iter().any(|p| t.contains(p)) {
         return true;
     }
+    if asks_for_whole_piece(&t)
+        && !t.contains("split")
+        && !t.contains("trim")
+        && !t.contains("delete")
+    {
+        return true;
+    }
     let wants = t.contains("vlog")
         || t.contains("reel")
         || t.contains("tiktok")
@@ -110,6 +117,38 @@ fn looks_like(text: &str, keys: &[&str]) -> bool {
     keys.iter().any(|key| text.contains(key))
 }
 
+/// The user asked to keep the imported piece, not to make a short.
+#[must_use]
+pub fn asks_for_whole_piece(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    const PHRASES: &[&str] = &[
+        "the whole",
+        "whole video",
+        "whole import",
+        "whole thing",
+        "whole clip",
+        "whole footage",
+        "whole source",
+        "entire video",
+        "entire import",
+        "entire clip",
+        "entire footage",
+        "entire source",
+        "entire thing",
+        "full video",
+        "full cut",
+        "full source",
+        "cover the",
+        "all of it",
+        "start to finish",
+        "this video",
+        "this footage",
+        "the footage",
+        "the import",
+    ];
+    PHRASES.iter().any(|p| t.contains(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +161,9 @@ mod tests {
         );
         assert_eq!(parse_intent("make a video from these"), Intent::Direct);
         assert_eq!(parse_intent("split at the playhead"), Intent::Split);
+        assert_eq!(parse_intent("cut the whole import"), Intent::Direct);
+        assert_eq!(parse_intent("edit this footage"), Intent::Direct);
         assert!(!is_director_request("trim the start"));
+        assert!(!is_director_request("split this video"));
     }
 }

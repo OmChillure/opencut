@@ -1,5 +1,6 @@
 //! Read a cut the way a picture editor would, before accepting it.
 
+use crate::asks_for_whole_piece;
 use oc_timeline::{Clip, ClipKind, MediaId, Timeline, TrackKind};
 #[cfg(test)]
 use oc_time::{Duration, Time};
@@ -30,6 +31,69 @@ pub struct ReviewFacts {
     pub scales: Vec<String>,
     pub qualities: Vec<u8>,
     pub motion_dirs: Vec<String>,
+    /// Imported file length. Used when the ask is the whole source and there is little speech.
+    pub sources: Vec<SourceSpan>,
+}
+
+/// One imported file and its length in seconds.
+#[derive(Clone, Debug)]
+pub struct SourceSpan {
+    pub media: MediaId,
+    pub duration: f64,
+}
+
+/// Picture label for one source range, already matched to a media id.
+#[derive(Clone, Debug)]
+pub struct ShotNote {
+    pub media: MediaId,
+    pub start: f64,
+    pub end: f64,
+    pub scale: String,
+    pub quality: u8,
+    pub motion_dir: String,
+}
+
+impl ReviewFacts {
+    /// Scales, quality, and motion in the same order as the picture clips.
+    #[must_use]
+    pub fn from_timeline(
+        timeline: &Timeline,
+        shots: &[ShotNote],
+        sources: Vec<SourceSpan>,
+        beats: Vec<f64>,
+        has_music: bool,
+    ) -> Self {
+        let mut scales = Vec::new();
+        let mut qualities = Vec::new();
+        let mut motion_dirs = Vec::new();
+        for clip in video_clips(timeline) {
+            let speed = if clip.speed.is_finite() && clip.speed > 0.0 {
+                clip.speed
+            } else {
+                1.0
+            };
+            let src_in = clip.source_in.as_seconds();
+            let src_out = src_in + clip.duration.as_seconds() * f64::from(speed);
+            let mid = (src_in + src_out) * 0.5;
+            let note = clip.media_id.and_then(|media| {
+                shots.iter().find(|s| {
+                    s.media == media && mid >= s.start - 0.05 && mid < s.end + 0.05
+                })
+            });
+            scales.push(note.map(|s| s.scale.clone()).unwrap_or_default());
+            qualities.push(note.map(|s| s.quality).unwrap_or(0));
+            motion_dirs.push(note.map(|s| s.motion_dir.clone()).unwrap_or_default());
+        }
+        Self {
+            beats,
+            has_music,
+            target_shot: None,
+            scales,
+            qualities,
+            motion_dirs,
+            sources,
+        }
+    }
 }
 
 /// Facts about the timeline plus problems the director should fix.
@@ -71,6 +135,9 @@ pub fn review_with(
         }
     }
     for note in leftover_speech(&videos, speech, request) {
+        issues.push(note);
+    }
+    for note in uncovered_source(&videos, speech, request, facts) {
         issues.push(note);
     }
     for hole in holes(&videos) {
@@ -335,6 +402,132 @@ fn clip_has_speech(clip: &Clip, speech: &[Spoken], tl0: f64, tl1: f64) -> bool {
     })
 }
 
+fn wants_full_source(request: &str) -> bool {
+    if target_range(request).is_some() {
+        return false;
+    }
+    let t = request.to_ascii_lowercase();
+    if t.contains("reel")
+        || t.contains("tiktok")
+        || t.contains("highlight")
+        || t.contains("trailer")
+        || t.contains("teaser")
+        || (t.contains("short") && !t.contains("shortcut"))
+    {
+        return false;
+    }
+    asks_for_whole_piece(&t)
+}
+
+/// A whole-source ask that kept less than half the real speech, or half a silent file.
+fn uncovered_source(
+    clips: &[&Clip],
+    speech: &[Spoken],
+    request: &str,
+    facts: &ReviewFacts,
+) -> Vec<String> {
+    if !wants_full_source(request) {
+        return Vec::new();
+    }
+    let mut speech_total = 0.0;
+    let mut speech_kept = 0.0;
+    for line in speech {
+        if line_is_filler(&line.text) {
+            continue;
+        }
+        let dur = (line.end - line.start).max(0.0);
+        if dur < 0.25 {
+            continue;
+        }
+        speech_total += dur;
+        if speech_line_kept(clips, line) {
+            speech_kept += dur;
+        }
+    }
+    if speech_total >= 12.0 {
+        let pct = speech_kept / speech_total;
+        if pct < 0.50 {
+            return vec![format!(
+                "only {:.0}% of the source speech is in the cut; keep the piece and drop ums, dead air, and retakes",
+                pct * 100.0
+            )];
+        }
+        return Vec::new();
+    }
+    let mut worst: Option<(f64, f64)> = None;
+    for src in &facts.sources {
+        if src.duration < 20.0 {
+            continue;
+        }
+        let kept = covered_source_seconds(clips, src.media, src.duration);
+        let pct = kept / src.duration;
+        if worst.is_none_or(|(was, _)| pct < was) {
+            worst = Some((pct, src.duration));
+        }
+    }
+    if let Some((pct, duration)) = worst {
+        if pct < 0.50 {
+            return vec![format!(
+                "only {:.0}% of the {duration:.0}s source is in the cut; this ask keeps the piece",
+                pct * 100.0
+            )];
+        }
+    }
+    Vec::new()
+}
+
+fn speech_line_kept(clips: &[&Clip], line: &Spoken) -> bool {
+    let need = ((line.end - line.start) * 0.4).clamp(0.2, 1.2);
+    clips.iter().any(|clip| {
+        let Some(media) = clip.media_id else {
+            return false;
+        };
+        if media != line.media {
+            return false;
+        }
+        let speed = if clip.speed.is_finite() && clip.speed > 0.0 {
+            clip.speed
+        } else {
+            1.0
+        };
+        let src_in = clip.source_in.as_seconds();
+        let src_out = src_in + clip.duration.as_seconds() * f64::from(speed);
+        let overlap = line.end.min(src_out) - line.start.max(src_in);
+        overlap >= need
+    })
+}
+
+fn covered_source_seconds(clips: &[&Clip], media: MediaId, duration: f64) -> f64 {
+    let mut spans: Vec<(f64, f64)> = clips
+        .iter()
+        .filter_map(|clip| {
+            if clip.media_id != Some(media) {
+                return None;
+            }
+            let speed = if clip.speed.is_finite() && clip.speed > 0.0 {
+                clip.speed
+            } else {
+                1.0
+            };
+            let a = clip.source_in.as_seconds().clamp(0.0, duration);
+            let b = (clip.source_in.as_seconds() + clip.duration.as_seconds() * f64::from(speed))
+                .clamp(0.0, duration);
+            if b - a < 0.05 { None } else { Some((a, b)) }
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut total = 0.0;
+    let mut cursor = 0.0;
+    for (a, b) in spans {
+        let start = a.max(cursor);
+        if b > start {
+            total += b - start;
+            cursor = b;
+        }
+    }
+    total
+}
+
 fn wants_hook(request: &str) -> bool {
     let t = request.to_ascii_lowercase();
     t.contains("hook") || t.contains("reel") || t.contains("short") || t.contains("tiktok")
@@ -592,6 +785,7 @@ mod tests {
             scales: vec!["CU".into(), "CU".into(), "CU".into()],
             qualities: vec![3],
             motion_dirs: vec!["l2r".into(), "r2l".into()],
+            sources: Vec::new(),
         };
         let review = review_with(&tl, &[], "make a short", &facts);
         for needle in [
@@ -608,5 +802,101 @@ mod tests {
             assert!(review.text.contains(needle), "{needle} missing in {}", review.text);
         }
         assert!(!review.issues || review.text.contains("fix:"), "{}", review.text);
+    }
+
+    fn long_speech(media: MediaId) -> Vec<Spoken> {
+        (0..8)
+            .map(|i| {
+                let start = i as f64 * 4.0;
+                Spoken {
+                    media,
+                    start,
+                    end: start + 3.0,
+                    text: format!("this is line {i} about the day"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn whole_video_rejects_a_highlight_of_the_speech() {
+        let media = MediaId::new();
+        let tl = tl_with(vec![video_clip(media, 0.0, 3.0, 0.0)]);
+        let review = review_cut(&tl, &long_speech(media), "edit this video");
+        assert!(review.issues, "{}", review.text);
+        assert!(review.text.contains("source speech"), "{}", review.text);
+    }
+
+    #[test]
+    fn reel_can_leave_source_speech_out() {
+        let media = MediaId::new();
+        let tl = tl_with(vec![video_clip(media, 0.0, 3.0, 0.0)]);
+        let review = review_cut(&tl, &long_speech(media), "make a 30s reel");
+        assert!(!review.text.contains("source speech"), "{}", review.text);
+    }
+
+    #[test]
+    fn whole_video_keeps_a_cut_that_holds_the_lines() {
+        let media = MediaId::new();
+        let tl = tl_with(vec![video_clip(media, 0.0, 32.0, 0.0)]);
+        let review = review_cut(&tl, &long_speech(media), "cut the whole import");
+        assert!(!review.text.contains("source speech"), "{}", review.text);
+    }
+
+    #[test]
+    fn silent_whole_video_must_cover_the_source() {
+        let media = MediaId::new();
+        let tl = tl_with(vec![video_clip(media, 0.0, 8.0, 0.0)]);
+        let facts = ReviewFacts {
+            sources: vec![SourceSpan {
+                media,
+                duration: 100.0,
+            }],
+            ..ReviewFacts::default()
+        };
+        let review = review_with(&tl, &[], "edit this footage", &facts);
+        assert!(review.issues, "{}", review.text);
+        assert!(review.text.contains("source is in the cut"), "{}", review.text);
+    }
+
+    #[test]
+    fn named_length_does_not_demand_the_whole_source() {
+        let media = MediaId::new();
+        let tl = tl_with(vec![video_clip(media, 0.0, 8.0, 0.0)]);
+        let facts = ReviewFacts {
+            sources: vec![SourceSpan {
+                media,
+                duration: 100.0,
+            }],
+            ..ReviewFacts::default()
+        };
+        let review = review_with(&tl, &[], "edit this footage in 30s", &facts);
+        assert!(!review.text.contains("source is in the cut"), "{}", review.text);
+    }
+
+    #[test]
+    fn shot_notes_land_on_the_clip_they_describe() {
+        let media = MediaId::new();
+        let tl = tl_with(vec![
+            video_clip(media, 0.0, 2.0, 0.0),
+            video_clip(media, 2.0, 2.0, 4.0),
+            video_clip(media, 4.0, 2.0, 8.0),
+        ]);
+        let shots: Vec<ShotNote> = [(0.0, 3.0), (3.0, 7.0), (7.0, 12.0)]
+            .into_iter()
+            .map(|(start, end)| ShotNote {
+                media,
+                start,
+                end,
+                scale: "close".into(),
+                quality: 8,
+                motion_dir: "none".into(),
+            })
+            .collect();
+        let facts = ReviewFacts::from_timeline(&tl, &shots, Vec::new(), Vec::new(), false);
+        assert_eq!(facts.scales, ["close", "close", "close"]);
+        let review = review_with(&tl, &[], "edit this video", &facts);
+        assert!(review.text.contains("same shot size"), "{}", review.text);
+        assert!(!review.text.contains("source speech"), "{}", review.text);
     }
 }

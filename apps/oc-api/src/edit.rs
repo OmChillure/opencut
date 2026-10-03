@@ -510,6 +510,46 @@ pub(crate) fn look_needs_vision(row: &oc_db::AnalysisRow) -> bool {
         .is_some_and(|digest| digest.needs_cards() && oc_providers::subscription_ready())
 }
 
+pub(crate) fn review_facts(
+    timeline: &Timeline,
+    media: &[oc_db::MediaRow],
+    looks: &HashMap<Uuid, oc_db::AnalysisRow>,
+    beats: Vec<f64>,
+    has_music: bool,
+) -> oc_core::ReviewFacts {
+    let mut shots = Vec::new();
+    for (id, row) in looks {
+        let media_id = MediaId::from_uuid(*id);
+        for shot in shot_looks(row) {
+            let Some(card) = shot.card else {
+                continue;
+            };
+            shots.push(oc_core::ShotNote {
+                media: media_id,
+                start: shot.start,
+                end: shot.end,
+                scale: card.scale,
+                quality: card.quality,
+                motion_dir: card.motion_dir,
+            });
+        }
+    }
+    let sources = media
+        .iter()
+        .filter_map(|row| {
+            let ticks = row.duration_ticks?;
+            if ticks <= 0 {
+                return None;
+            }
+            Some(oc_core::SourceSpan {
+                media: MediaId::from_uuid(row.id),
+                duration: oc_core::Duration::from_ticks(ticks).as_seconds(),
+            })
+        })
+        .collect();
+    oc_core::ReviewFacts::from_timeline(timeline, &shots, sources, beats, has_music)
+}
+
 /// One JPEG at a source time. The model calls `see` when it wants to look.
 pub(crate) async fn see_frame(
     db: &Db,
@@ -1017,11 +1057,13 @@ async fn apply_submitted_plan(
         .await
         .map_err(|e| e.to_string())?;
     let spoken = spoken(speech);
-    let facts = oc_core::ReviewFacts {
+    let facts = review_facts(
+        &project.timeline,
+        media,
+        looks,
         beats,
-        has_music: plan.music_id.is_some(),
-        ..oc_core::ReviewFacts::default()
-    };
+        plan.music_id.is_some(),
+    );
     let review = oc_core::review_with(&project.timeline, &spoken, "", &facts);
     Ok(format!("{}\n{}", notes.join("\n"), review.text))
 }
