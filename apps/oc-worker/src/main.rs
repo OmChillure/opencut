@@ -25,13 +25,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("R2 not configured — understand runs on local files only");
     }
     if oc_voice::groq_stt_configured() {
-        tracing::info!("understand = ffmpeg look + Groq Whisper (free, ~8h audio/day)");
-    } else if oc_voice::grok_stt_configured() {
-        tracing::info!("understand = ffmpeg look + Grok STT ($0.10/hour)");
+        tracing::info!("understand = ffmpeg look + Groq Whisper");
     } else {
-        tracing::info!(
-            "understand = ffmpeg look + local Whisper (set GROQ_API_KEY for free hosted Whisper)"
-        );
+        tracing::info!("understand = ffmpeg look + local Whisper (set GROQ_API_KEY for Groq Whisper)");
     }
 
     tracing::info!("worker polling jobs");

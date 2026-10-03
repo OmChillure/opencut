@@ -1,6 +1,5 @@
-//! Free local STT: ffmpeg extracts audio, Whisper turns it into text.
-//! No API key. ffmpeg is required; Whisper is any of:
-//! `whisper` (openai-whisper), `whisper-cli` / `whisper.cpp`.
+//! ffmpeg extracts audio. Groq Whisper writes the transcript.
+//! Local Whisper is the fallback when GROQ_API_KEY is unset.
 
 use crate::punctuate::restore_punctuation;
 use crate::{Cue, Transcript};
@@ -67,35 +66,26 @@ pub async fn transcribe_path(input: &Path) -> Result<Transcript, LocalSttError> 
     extract_wav(input, &wav).await?;
     tracing::info!(ms = t0.elapsed().as_millis(), "stt wav ready");
     let t1 = Instant::now();
-    let transcript = transcribe_cloud_or_local(&wav, &dir).await?;
+    let transcript = transcribe_groq_or_local(&wav, &dir).await?;
     let transcript = punctuate_transcript(transcript);
     tracing::info!(
         ms = t1.elapsed().as_millis(),
         words = transcript.full_text.split_whitespace().count(),
         cues = transcript.cues.len(),
-        "stt whisper done"
+        "stt done"
     );
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(transcript)
 }
 
-async fn transcribe_cloud_or_local(wav: &Path, dir: &Path) -> Result<Transcript, LocalSttError> {
+async fn transcribe_groq_or_local(wav: &Path, dir: &Path) -> Result<Transcript, LocalSttError> {
     if crate::groq_stt::configured() {
         match crate::groq_stt::transcribe_wav(wav).await {
             Ok(t) => {
-                tracing::info!("stt via groq whisper (free tier)");
+                tracing::info!("stt via groq whisper");
                 return Ok(t);
             }
             Err(e) => tracing::warn!("groq stt failed: {e}"),
-        }
-    }
-    if crate::grok_stt::configured() {
-        match crate::grok_stt::transcribe_wav(wav).await {
-            Ok(t) => {
-                tracing::info!("stt via grok ($0.10/hour)");
-                return Ok(t);
-            }
-            Err(e) => tracing::warn!("grok stt failed: {e}"),
         }
     }
     run_whisper(wav, dir).await

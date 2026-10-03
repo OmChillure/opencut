@@ -3,7 +3,7 @@ name = "oc-voice"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Speech: local Whisper STT, optional cloud TTS"
+description = "Speech: Groq Whisper, local Whisper fallback"
 
 [dependencies]
 oc-time.workspace = true
