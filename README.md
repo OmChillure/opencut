@@ -12,7 +12,7 @@ crates/oc-compositor   frame planner (wgpu later)
 crates/oc-render       ffmpeg bake (xfade, titles, grade, mix, captions)
 crates/oc-media        probe / object-key helpers
 crates/oc-providers    AI providers (SpaceXAI / xAI)
-crates/oc-voice        speech: STT + TTS
+crates/oc-voice        Groq Whisper, local fallback
 crates/oc-core         re-exports the editor crates
 crates/oc-db           Postgres + object storage (R2)
 apps/oc-api            Axum
@@ -24,7 +24,8 @@ apps/oc-web            Dioxus UI
 
 ```bash
 cp .env.example .env
-# fill DATABASE_URL, R2_*, SARVAM_API_KEY
+# fill DATABASE_URL, R2_*, and GROQ_API_KEY. Director chat uses a signed-in `claude`, `grok`, or `codex`.
+# B-roll and motion design use the `grok` sign-in. No xAI API key.
 
 cargo run -p oc-api
 cargo run -p oc-worker
@@ -40,4 +41,4 @@ cargo run -p oc-api          # runs sqlx migrations on boot
 
 ## v0
 
-Import → timeline (split / trim / undo) → Sarvam captions → agent ops → export.
+Import → timeline (split / trim / undo) → Groq transcript → agent ops → export.
