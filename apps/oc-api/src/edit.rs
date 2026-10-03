@@ -119,96 +119,6 @@ pub(crate) async fn call_tool(
     Ok(applied.note)
 }
 
-/// Silent clip from grok-imagine-video. Returns the file bytes and its duration.
-async fn imagine_video(prompt: &str, requested: u32, aspect: &str) -> Result<(Vec<u8>, f64), String> {
-    let key = std::env::var("XAI_API_KEY").map_err(|_| "XAI_API_KEY is not set".to_string())?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(90))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let started = client
-        .post("https://api.x.ai/v1/videos/generations")
-        .bearer_auth(&key)
-        .json(&serde_json::json!({
-            "model": "grok-imagine-video-1.5",
-            "prompt": prompt,
-            "duration": requested,
-            "aspect_ratio": aspect,
-            "resolution": "480p",
-            "generate_audio": false,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("video request failed: {e}"))?;
-    if !started.status().is_success() {
-        let status = started.status();
-        let body = started.text().await.unwrap_or_default();
-        return Err(format!("video request {status}: {body}"));
-    }
-    let started: Value = started.json().await.map_err(|e| e.to_string())?;
-    let request_id = started
-        .get("request_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "video request returned no request_id".to_string())?
-        .to_string();
-    let mut video_url = None;
-    let mut seconds = f64::from(requested);
-    for _ in 0..60 {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let polled = client
-            .get(format!("https://api.x.ai/v1/videos/{request_id}"))
-            .bearer_auth(&key)
-            .send()
-            .await
-            .map_err(|e| format!("video poll failed: {e}"))?;
-        if !polled.status().is_success() {
-            let status = polled.status();
-            let body = polled.text().await.unwrap_or_default();
-            return Err(format!("video poll {status}: {body}"));
-        }
-        let body: Value = polled.json().await.map_err(|e| e.to_string())?;
-        match body.get("status").and_then(Value::as_str).unwrap_or("pending") {
-            "done" => {
-                video_url = body
-                    .pointer("/video/url")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                if let Some(dur) = body.pointer("/video/duration").and_then(Value::as_f64) {
-                    if dur > 0.2 {
-                        seconds = dur;
-                    }
-                }
-                break;
-            }
-            "expired" => return Err("video request expired".into()),
-            "failed" => {
-                let detail = body
-                    .get("error")
-                    .or_else(|| body.get("message"))
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "failed".into());
-                return Err(format!("video generation failed: {detail}"));
-            }
-            _ => {}
-        }
-    }
-    let video_url = video_url.ok_or_else(|| "video generation timed out".to_string())?;
-    let bytes = client
-        .get(&video_url)
-        .send()
-        .await
-        .map_err(|e| format!("video download failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("video download failed: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("video download failed: {e}"))?;
-    if bytes.len() < 32 {
-        return Err("video download was empty".into());
-    }
-    Ok((bytes.to_vec(), seconds))
-}
-
 /// Silent cutaway from grok-imagine-video, saved into the bin, then covered over `at`.
 async fn generate_broll(
     db: &Db,
@@ -237,15 +147,7 @@ async fn generate_broll(
         timeline,
         arguments.get("aspect").and_then(Value::as_str),
     );
-    let (bytes, seconds) = imagine_video(prompt, requested, &aspect)
-        .await
-        .map_err(|err| {
-            if err == "XAI_API_KEY is not set" {
-                "XAI_API_KEY is not set. Add it to .env to generate B-roll.".to_string()
-            } else {
-                err
-            }
-        })?;
+    let (bytes, seconds) = oc_providers::imagine_clip(prompt, requested, &aspect).await?;
     let media_id = Uuid::now_v7();
     let filename = format!("broll-{media_id}.mp4");
     let local_key = oc_db::local_media_key(project_id, media_id, &filename);
@@ -336,15 +238,8 @@ async fn add_design(
         .to_string();
     let layout = design_layout(arguments.get("layout").and_then(Value::as_str));
     let aspect = broll_aspect(timeline, arguments.get("aspect").and_then(Value::as_str));
-    let (bytes, seconds) = imagine_video(&design_prompt(prompt), requested, &aspect)
-        .await
-        .map_err(|err| {
-            if err == "XAI_API_KEY is not set" {
-                "XAI_API_KEY is not set. Add it to .env to draw motion design.".to_string()
-            } else {
-                err
-            }
-        })?;
+    let (bytes, seconds) =
+        oc_providers::imagine_clip(&design_prompt(prompt), requested, &aspect).await?;
     let media_id = Uuid::now_v7();
     let filename = format!("design-{media_id}.mp4");
     let local_key = oc_db::local_media_key(project_id, media_id, &filename);
