@@ -1,4 +1,4 @@
-use crate::captions::{captions_for_cut, to_srt, BurnedCue};
+use crate::captions::{captions_for_cut, to_ass, BurnedCue};
 use crate::{MediaSource, RenderError};
 use oc_timeline::{
     Clip, ClipKind, GraphicKind, MediaId, Timeline, TrackKind, TransitionKind,
@@ -121,16 +121,12 @@ pub fn compile(
     let srt = if captions.is_empty() {
         None
     } else {
-        let path = work.join("cut.srt");
-        std::fs::write(&path, to_srt(&captions)).map_err(RenderError::Io)?;
+        let path = work.join("cut.ass");
+        std::fs::write(&path, to_ass(&captions, width, height, timeline.letterbox))
+            .map_err(RenderError::Io)?;
         let lab = next_label();
-        let margin_v = if timeline.letterbox {
-            ((height as f32) * 0.12).round() as u32 + 28
-        } else {
-            36
-        };
         fc.push_str(&format!(
-            "[{vcur}]subtitles={}:force_style='Fontsize=13,Outline=1,Shadow=0,Alignment=2,MarginL=48,MarginR=48,MarginV={margin_v},WrapStyle=0'[{lab}];",
+            "[{vcur}]subtitles={}[{lab}];",
             escape_path(&path)
         ));
         vcur = lab;

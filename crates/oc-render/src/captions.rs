@@ -140,6 +140,61 @@ pub fn to_srt(cues: &[BurnedCue]) -> String {
     out
 }
 
+/// ASS with PlayRes equal to the frame, so Fontsize is in real pixels.
+/// An SRT burned through libass uses a 288-line script and blows the type up.
+#[must_use]
+pub fn to_ass(cues: &[BurnedCue], width: u32, height: u32, letterbox: bool) -> String {
+    let short = width.min(height).max(1);
+    let font = (short / 20).clamp(42, 64);
+    let margin_v = if letterbox {
+        ((height as f32) * 0.12).round() as u32 + font
+    } else {
+        (height / 9).max(font * 2)
+    };
+    let mut out = format!(
+        "[Script Info]\n\
+         ScriptType: v4.00+\n\
+         PlayResX: {width}\n\
+         PlayResY: {height}\n\
+         WrapStyle: 0\n\
+         ScaledBorderAndShadow: yes\n\
+         \n\
+         [V4+ Styles]\n\
+         Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+         Style: Default,DejaVu Sans,{font},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,3,0,2,72,72,{margin_v},1\n\
+         \n\
+         [Events]\n\
+         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    );
+    for cue in cues {
+        let _ = writeln!(
+            out,
+            "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+            ass_time(cue.start),
+            ass_time(cue.end),
+            ass_text(&cue.text)
+        );
+    }
+    out
+}
+
+fn ass_time(secs: f64) -> String {
+    let cs = (secs.max(0.0) * 100.0).round() as u64;
+    let h = cs / 360_000;
+    let m = (cs / 6_000) % 60;
+    let s = (cs / 100) % 60;
+    let c = cs % 100;
+    format!("{h}:{m:02}:{s:02}.{c:02}")
+}
+
+fn ass_text(text: &str) -> String {
+    text.trim()
+        .replace('\\', "\\\\")
+        .replace('{', "\\{")
+        .replace('}', "\\}")
+        .replace('\n', "\\N")
+}
+
 fn srt_time(secs: f64) -> String {
     let ms_total = (secs.max(0.0) * 1000.0).round() as u64;
     let h = ms_total / 3_600_000;
@@ -152,6 +207,23 @@ fn srt_time(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ass_type_is_sized_to_the_frame() {
+        let ass = to_ass(
+            &[BurnedCue {
+                start: 0.0,
+                end: 1.5,
+                text: "something that matters.".into(),
+            }],
+            1080,
+            1920,
+            false,
+        );
+        assert!(ass.contains("PlayResX: 1080\nPlayResY: 1920"), "{ass}");
+        assert!(ass.contains("DejaVu Sans,54,"), "{ass}");
+        assert!(ass.contains("Dialogue: 0,0:00:00.00,0:00:01.50,Default,,0,0,0,,something that matters."));
+    }
     use oc_time::{Duration, Time};
     use oc_timeline::{CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook, TrackKind};
 
