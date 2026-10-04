@@ -61,7 +61,11 @@ pub fn ruler_marks_nle(span: f64, pps: f64) -> Vec<RulerMark> {
         .copied()
         .find(|step| *step * pps >= 72.0)
         .unwrap_or(300.0);
-    let minor = if major >= 1.0 { major / 5.0 } else { major / 2.0 };
+    let minor = if major >= 1.0 {
+        major / 5.0
+    } else {
+        major / 2.0
+    };
     let mut marks = Vec::new();
     let mut i = 0i32;
     loop {
@@ -293,7 +297,10 @@ pub fn capture_pointer(evt: &Event<PointerData>) {
 
 /// Shrink lanes so every track fits in the timeline, like Kdenlive "Fit tracks to view".
 pub fn fit_scale(tracks: &[EditorTrack], viewport: f64) -> f64 {
-    let want: f64 = tracks.iter().map(|track| base_lane_height(track.kind)).sum();
+    let want: f64 = tracks
+        .iter()
+        .map(|track| base_lane_height(track.kind))
+        .sum();
     let avail = (viewport - 24.0).max(48.0);
     if want <= avail || want <= 0.0 {
         1.0
@@ -552,7 +559,9 @@ pub fn commit_drag(
                 ToolId::Spacer => space_from(tracks, session.at - origin, origin),
                 ToolId::Roll => roll_clip(tracks, clip_id, session.at + session.grab),
                 ToolId::Slide => slide_clip(tracks, clip_id, session.at),
-                ToolId::RateStretch => rate_stretch_clip(tracks, clip_id, session.at + session.grab),
+                ToolId::RateStretch => {
+                    rate_stretch_clip(tracks, clip_id, session.at + session.grab)
+                }
                 _ => relocate_clip(tracks, clip_id, &session.track_id, session.at, true),
             }
             true
@@ -643,7 +652,10 @@ pub fn relocate_clip(
     let Some((src, clip_i)) = locate_clip(tracks, clip_id) else {
         return;
     };
-    let dest = tracks.iter().position(|track| track.id == dest_id).unwrap_or(src);
+    let dest = tracks
+        .iter()
+        .position(|track| track.id == dest_id)
+        .unwrap_or(src);
     if tracks[src].kind != tracks[dest].kind {
         let dur = tracks[src].clips[clip_i].duration;
         let start = if snap {
@@ -706,9 +718,11 @@ fn snap_start(track: &EditorTrack, start: f64, duration: f64, except: Option<&st
 }
 
 fn sort_clips(track: &mut EditorTrack) {
-    track
-        .clips
-        .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    track.clips.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 fn apply_edit(
@@ -724,9 +738,11 @@ fn apply_edit(
         EditMode::Insert => place_insert(track, media_id, start, duration),
         EditMode::Overwrite => place_overwrite(track, media_id, start, duration),
     }
-    track
-        .clips
-        .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    track.clips.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 fn place_normal(track: &mut EditorTrack, media_id: String, playhead: f64, duration: f64) {
@@ -767,9 +783,7 @@ fn roll_clip(tracks: &mut [EditorTrack], clip_id: &str, at: f64) {
         && (tracks[ti].clips[ci + 1].start - tracks[ti].clips[ci].end()).abs() < 0.05
     {
         ci
-    } else if ci > 0
-        && (tracks[ti].clips[ci].start - tracks[ti].clips[ci - 1].end()).abs() < 0.05
-    {
+    } else if ci > 0 && (tracks[ti].clips[ci].start - tracks[ti].clips[ci - 1].end()).abs() < 0.05 {
         ci - 1
     } else {
         return;
@@ -974,7 +988,12 @@ pub fn display_tracks(tracks: &[EditorTrack]) -> Vec<EditorTrack> {
     caps.into_iter().chain(rest).collect()
 }
 
-pub fn set_media_duration(library: &mut [MediaItem], tracks: &mut [EditorTrack], url: &str, duration: f64) -> bool {
+pub fn set_media_duration(
+    library: &mut [MediaItem],
+    tracks: &mut [EditorTrack],
+    url: &str,
+    duration: f64,
+) -> bool {
     if !(duration.is_finite() && duration > 0.05) {
         return false;
     }
@@ -986,11 +1005,8 @@ pub fn set_media_duration(library: &mut [MediaItem], tracks: &mut [EditorTrack],
     item.duration = duration;
     let id = item.id.clone();
     for track in tracks.iter_mut() {
-        let mut bounds: Vec<(f64, f64)> = track
-            .clips
-            .iter()
-            .map(|c| (c.start, c.duration))
-            .collect();
+        let mut bounds: Vec<(f64, f64)> =
+            track.clips.iter().map(|c| (c.start, c.duration)).collect();
         bounds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let only = track.clips.iter().filter(|c| c.media_id == id).count() == 1;
         for clip in track.clips.iter_mut() {
@@ -1326,7 +1342,8 @@ fn seek_video(video: &HtmlVideoElement, time: f64, force: bool) {
 }
 
 pub fn css_filter(grade: oc_core::Grade, fx: oc_core::Fx) -> String {
-    let brightness = (1.0 + grade.exposure + grade.gain * 0.35 + grade.lift * 0.15).clamp(0.15, 2.8);
+    let brightness =
+        (1.0 + grade.exposure + grade.gain * 0.35 + grade.lift * 0.15).clamp(0.15, 2.8);
     let contrast = (1.0 + grade.contrast + grade.gamma * 0.45).clamp(0.2, 2.8);
     let saturation = (1.0 + grade.saturation).clamp(0.0, 2.6);
     let hue = grade.temperature * 18.0;
@@ -1337,9 +1354,9 @@ pub fn css_filter(grade: oc_core::Grade, fx: oc_core::Fx) -> String {
     if grade.cube.is_none() {
         let named = match grade.lut {
             oc_core::Lut::None => "",
-            oc_core::Lut::Film => " sepia(0.35) contrast(1.05) saturate(0.9)",
+            oc_core::Lut::Film => " contrast(1.06) saturate(1.16)",
             oc_core::Lut::Cool => " hue-rotate(14deg) saturate(1.08)",
-            oc_core::Lut::Warm => " sepia(0.28) saturate(1.12)",
+            oc_core::Lut::Warm => " sepia(0.10) saturate(1.28)",
             oc_core::Lut::TealOrange => " hue-rotate(-10deg) saturate(1.28) contrast(1.06)",
             oc_core::Lut::Mono => " grayscale(1)",
         };
@@ -1360,7 +1377,11 @@ fn mix_preview_css(
     if let Some((dx, dy)) = kind.slide_delta() {
         return (
             opacity,
-            format!("translate({:.1}%, {:.1}%)", dx * mix * 100.0, dy * mix * 100.0),
+            format!(
+                "translate({:.1}%, {:.1}%)",
+                dx * mix * 100.0,
+                dy * mix * 100.0
+            ),
             "none".into(),
             filter.into(),
         );
@@ -1372,11 +1393,21 @@ fn mix_preview_css(
         oc_core::TransitionKind::FadeBlack => {
             let dip = 1.0 - (2.0 * mix - 1.0).abs();
             let f = format!("{filter} brightness({:.3})", (1.0 - dip).max(0.05));
-            ((opacity * (1.0 - mix)).clamp(0.0, 1.0), "none".into(), "none".into(), f)
+            (
+                (opacity * (1.0 - mix)).clamp(0.0, 1.0),
+                "none".into(),
+                "none".into(),
+                f,
+            )
         }
         oc_core::TransitionKind::FadeWhite => {
             let f = format!("{filter} brightness({:.3})", 1.0 + mix);
-            ((opacity * (1.0 - mix)).clamp(0.0, 1.0), "none".into(), "none".into(), f)
+            (
+                (opacity * (1.0 - mix)).clamp(0.0, 1.0),
+                "none".into(),
+                "none".into(),
+                f,
+            )
         }
         oc_core::TransitionKind::CircleOpen => {
             let r = mix * 80.0;
@@ -1406,8 +1437,17 @@ fn mix_preview_css(
             )
         }
         oc_core::TransitionKind::Pixelize => {
-            let f = format!("{filter} contrast({:.2}) saturate({:.2})", 1.0 + mix, 1.0 - mix * 0.4);
-            ((opacity * (1.0 - mix * 0.5)).clamp(0.0, 1.0), "none".into(), "none".into(), f)
+            let f = format!(
+                "{filter} contrast({:.2}) saturate({:.2})",
+                1.0 + mix,
+                1.0 - mix * 0.4
+            );
+            (
+                (opacity * (1.0 - mix * 0.5)).clamp(0.0, 1.0),
+                "none".into(),
+                "none".into(),
+                f,
+            )
         }
         _ => (
             (opacity * (1.0 - mix)).clamp(0.0, 1.0),
@@ -1438,18 +1478,22 @@ fn incoming_preview_css(kind: oc_core::TransitionKind, mix: f64) -> (f64, String
     }
 }
 
-fn caption_line(text: &str, into: f64, span: f64) -> String {
+fn caption_visible(text: &str, into: f64, span: f64) -> (String, f64, f64) {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.len() <= 7 {
-        return words.join(" ");
+        return (words.join(" "), into, span);
     }
     let groups = words.len().div_ceil(6).max(1);
     let idx = ((into / span.max(0.01)) * groups as f64).floor() as usize;
-    words
+    let idx = idx.min(groups - 1);
+    let step = span / groups as f64;
+    let local = (into - step * idx as f64).clamp(0.0, step);
+    let line = words
         .chunks(6)
-        .nth(idx.min(groups - 1))
+        .nth(idx)
         .map(|group| group.join(" "))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (line, local, step.max(0.2))
 }
 
 pub fn apply_monitor_look(
@@ -1472,7 +1516,7 @@ pub fn apply_monitor_look(
     let mut pan_x = 0.0_f32;
     let mut pan_y = 0.0_f32;
     let mut volume = 1.0_f64;
-    let mut graphics: Vec<(String, String, Option<f32>, Option<f32>)> = Vec::new();
+    let mut graphics: Vec<(String, String, Option<f32>, Option<f32>, String)> = Vec::new();
     let mut next_url = String::new();
     let mut next_src = 0.0_f64;
     let mut mask: Option<oc_core::AlphaShape> = None;
@@ -1502,16 +1546,20 @@ pub fn apply_monitor_look(
                     vignette = clip.look.fx.vignette;
                     grain = clip.look.fx.grain;
                     kind = clip.look.transition;
-                    let next = engine.tracks.iter().flat_map(|t| t.clips.iter()).find(|other| {
-                        other.id != clip.id
-                            && matches!(other.kind, oc_core::ClipKind::Video { .. })
-                            && !other.disabled
-                            && is_join_ui(
-                                clip.start.as_seconds(),
-                                clip.end().as_seconds(),
-                                other.start.as_seconds(),
-                            )
-                    });
+                    let next = engine
+                        .tracks
+                        .iter()
+                        .flat_map(|t| t.clips.iter())
+                        .find(|other| {
+                            other.id != clip.id
+                                && matches!(other.kind, oc_core::ClipKind::Video { .. })
+                                && !other.disabled
+                                && is_join_ui(
+                                    clip.start.as_seconds(),
+                                    clip.end().as_seconds(),
+                                    other.start.as_seconds(),
+                                )
+                        });
                     let dur = next
                         .map(|n| {
                             clip.look
@@ -1550,18 +1598,33 @@ pub fn apply_monitor_look(
                         oc_core::GraphicKind::Shape => "shape",
                         oc_core::GraphicKind::Sticker => "sticker",
                     };
-                    graphics.push((cls.into(), graphic.text.clone(), graphic.x, graphic.y));
+                    graphics.push((
+                        cls.into(),
+                        graphic.text.clone(),
+                        graphic.x,
+                        graphic.y,
+                        String::new(),
+                    ));
                 }
                 oc_core::ClipKind::Caption { style: _, cues } => {
                     let local_t = oc_core::Time::from_ticks((t - clip.start).as_ticks());
                     if let Some(cue) = cues.iter().find(|c| local_t >= c.start && local_t < c.end) {
                         let span = (cue.end - cue.start).as_seconds().max(0.3);
                         let into = (local_t - cue.start).as_seconds().clamp(0.0, span);
+                        let (line, local, local_span) = caption_visible(&cue.text, into, span);
+                        let shown = oc_core::caption_reveal(&line, cue.effect, local, local_span);
+                        let motion = oc_core::caption_motion(cue.effect, local, local_span);
                         graphics.push((
-                            "caption".into(),
-                            caption_line(&cue.text, into, span),
+                            format!(
+                                "caption place-{} font-{} effect-{}",
+                                cue.place.as_str(),
+                                cue.font.as_str(),
+                                cue.effect.as_str()
+                            ),
+                            shown,
                             None,
                             None,
+                            motion,
                         ));
                     }
                 }
@@ -1665,7 +1728,7 @@ pub fn apply_monitor_look(
         };
         let _ = layer.set_attribute("class", gfx_class);
         layer.set_inner_html("");
-        for (cls, text, x, y) in graphics {
+        for (cls, text, x, y, motion) in graphics {
             if let Some(node) = doc.create_element("div").ok() {
                 let _ = node.set_attribute("class", &format!("gfx {cls}"));
                 if let (Some(x), Some(y)) = (x, y) {
@@ -1673,12 +1736,14 @@ pub fn apply_monitor_look(
                     let _ = node.set_attribute(
                         "style",
                         &format!(
-                            "position:absolute;left:{:.2}%;top:{:.2}%;transform:translate(-50%,-50%);margin:0;width:max-content;max-width:{:.0}%;font-size:clamp(15px,3.2cqw,28px);line-height:1.15;text-align:center;",
+                            "position:absolute;left:{:.2}%;top:{:.2}%;transform:translate(-50%,-50%);margin:0;width:max-content;max-width:{:.0}%;font-size:clamp(15px,3.2cqw,28px);line-height:1.15;text-align:center;{motion}",
                             x * 100.0,
                             y * 100.0,
                             max_w
                         ),
                     );
+                } else if !motion.is_empty() {
+                    let _ = node.set_attribute("style", &motion);
                 }
                 node.set_text_content(Some(&text));
                 let _ = layer.append_child(&node);
@@ -1714,7 +1779,11 @@ fn label_clear_of_card(x: f32, card: Option<oc_core::FrameCard>) -> (f32, f32) {
     (x, ((1.0 - right - 0.04) * 100.0).clamp(24.0, 80.0))
 }
 
-fn frame_card(engine: &oc_core::Timeline, now: f64, track_name: &str) -> Option<oc_core::FrameCard> {
+fn frame_card(
+    engine: &oc_core::Timeline,
+    now: f64,
+    track_name: &str,
+) -> Option<oc_core::FrameCard> {
     let t = oc_core::Time::from_seconds(now);
     engine.tracks.iter().find_map(|track| {
         if track.name != track_name {
@@ -2235,7 +2304,10 @@ mod tests {
         label.graphic = "Bullish flag".into();
         assert_eq!(clip_name(&label, None), "Bullish flag");
         let named = clip("p", "m", 0.0, 4.0);
-        assert_eq!(clip_name(&named, Some("design-flag.jpg")), "design-flag.jpg");
+        assert_eq!(
+            clip_name(&named, Some("design-flag.jpg")),
+            "design-flag.jpg"
+        );
         let bare = clip("q", "", 0.0, 4.0);
         assert_eq!(clip_name(&bare, None), "Clip");
     }
@@ -2477,7 +2549,8 @@ fn selected_video(engine: &oc_core::Timeline, at: oc_core::Time) -> Option<&oc_c
     let raw = SELECTED.with(|slot| slot.borrow().clone())?;
     let id = Uuid::parse_str(&raw).ok()?;
     let (_, clip) = engine.find_clip(oc_core::ClipId::from_uuid(id))?;
-    if clip.disabled || !clip.contains(at) || !matches!(clip.kind, oc_core::ClipKind::Video { .. }) {
+    if clip.disabled || !clip.contains(at) || !matches!(clip.kind, oc_core::ClipKind::Video { .. })
+    {
         None
     } else {
         Some(clip)
@@ -2503,7 +2576,8 @@ fn remember_look(
         };
         look.clip_id = clip_id.to_string();
         if look.cube_id != cube_id {
-            look.cube = cube_id.and_then(|id| engine.cubes.iter().find(|cube| cube.id == id).cloned());
+            look.cube =
+                cube_id.and_then(|id| engine.cubes.iter().find(|cube| cube.id == id).cloned());
             look.cube_id = cube_id;
         }
     });
@@ -2512,7 +2586,11 @@ fn remember_look(
 fn paint_monitor_matte(doc: &web_sys::Document, letterbox: bool) {
     let (mask, background, dragging) = LIVE.with(|slot| {
         let look = slot.borrow();
-        (look.mask, look.background.clone(), GESTURE.with(|g| g.borrow().is_some()))
+        (
+            look.mask,
+            look.background.clone(),
+            GESTURE.with(|g| g.borrow().is_some()),
+        )
     });
     if let Some(host) = doc.query_selector(".preview-mask-host").ok().flatten() {
         if let Some(mask) = mask {
@@ -2819,7 +2897,10 @@ fn paint_program(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
     set_class_off(".preview-vignette", true);
 }
 
-fn sources_ready(plan: &oc_core::compositor::FramePlan, sources: &[oc_core::compositor::FrameSource]) -> bool {
+fn sources_ready(
+    plan: &oc_core::compositor::FramePlan,
+    sources: &[oc_core::compositor::FrameSource],
+) -> bool {
     plan.layers.iter().all(|layer| match layer {
         oc_core::compositor::Layer::Video {
             media_id,
@@ -2851,9 +2932,10 @@ fn capture_sources(
             continue;
         }
         let t = source_time.as_seconds();
-        if out.iter().any(|source| {
-            source.media_id == *media_id && (source.source_time - t).abs() < 0.08
-        }) {
+        if out
+            .iter()
+            .any(|source| source.media_id == *media_id && (source.source_time - t).abs() < 0.08)
+        {
             continue;
         }
         let id = media_id.to_string();
@@ -2880,12 +2962,16 @@ fn grab_item(item: &MediaItem, w: u32, h: u32, source_time: f64) -> Option<Vec<u
         ctx.fill_rect(0.0, 0.0, w as f64, h as f64);
         if item.kind == MediaKind::Image {
             let image = image_for(item)?;
-            ctx.draw_image_with_html_image_element_and_dw_and_dh(&image, 0.0, 0.0, w as f64, h as f64)
-                .ok()?;
+            ctx.draw_image_with_html_image_element_and_dw_and_dh(
+                &image, 0.0, 0.0, w as f64, h as f64,
+            )
+            .ok()?;
         } else if item.kind == MediaKind::Video {
             let video = video_for_time(&item.id, &item.url, source_time)?;
-            ctx.draw_image_with_html_video_element_and_dw_and_dh(&video, 0.0, 0.0, w as f64, h as f64)
-                .ok()?;
+            ctx.draw_image_with_html_video_element_and_dw_and_dh(
+                &video, 0.0, 0.0, w as f64, h as f64,
+            )
+            .ok()?;
         } else {
             return None;
         }
@@ -2906,7 +2992,10 @@ fn video_for_time(id: &str, url: &str, source_time: f64) -> Option<HtmlVideoElem
 }
 
 fn video_near(id: &str, source_time: f64, slack: f64) -> Option<HtmlVideoElement> {
-    let list = web_sys::window()?.document()?.query_selector_all("video").ok()?;
+    let list = web_sys::window()?
+        .document()?
+        .query_selector_all("video")
+        .ok()?;
     let mut best: Option<HtmlVideoElement> = None;
     let mut best_distance = slack;
     for i in 0..list.length() {
@@ -2969,7 +3058,10 @@ fn extra_decoder() -> Option<HtmlVideoElement> {
 }
 
 fn video_for_media(id: &str) -> Option<HtmlVideoElement> {
-    let list = web_sys::window()?.document()?.query_selector_all("video").ok()?;
+    let list = web_sys::window()?
+        .document()?
+        .query_selector_all("video")
+        .ok()?;
     for i in 0..list.length() {
         let Ok(video) = list.item(i)?.dyn_into::<HtmlVideoElement>() else {
             continue;
@@ -2991,7 +3083,10 @@ fn image_for(item: &MediaItem) -> Option<web_sys::HtmlImageElement> {
             continue;
         };
         let src = image.current_src();
-        if src == item.url || image.src() == item.url || image.get_attribute("src").as_deref() == Some(item.url.as_str()) {
+        if src == item.url
+            || image.src() == item.url
+            || image.get_attribute("src").as_deref() == Some(item.url.as_str())
+        {
             if image.complete() {
                 return Some(image);
             }
@@ -3073,7 +3168,10 @@ fn reset_stabilize() {
 }
 
 /// High-pass the measured shake and shift the painted frame. A steady pan settles to no shift.
-fn stabilize_surface(surface: oc_core::compositor::Surface, now: f64) -> oc_core::compositor::Surface {
+fn stabilize_surface(
+    surface: oc_core::compositor::Surface,
+    now: f64,
+) -> oc_core::compositor::Surface {
     let correction = STAB.with(|slot| {
         let mut state = slot.borrow_mut();
         stab_correction(&mut state, &surface, now)
@@ -3084,7 +3182,11 @@ fn stabilize_surface(surface: oc_core::compositor::Surface, now: f64) -> oc_core
     shift_surface(&surface, correction.0, correction.1)
 }
 
-fn stab_correction(state: &mut StabMem, surface: &oc_core::compositor::Surface, now: f64) -> (i32, i32) {
+fn stab_correction(
+    state: &mut StabMem,
+    surface: &oc_core::compositor::Surface,
+    now: f64,
+) -> (i32, i32) {
     let thumb = luma_thumb(&surface.rgba, surface.width, surface.height);
     let jump = !state.ready || !now.is_finite() || (now - state.last).abs() > 0.45;
     state.last = now;
@@ -3175,7 +3277,11 @@ fn best_shift(prev: &[f32], curr: &[f32]) -> (i32, i32) {
 }
 
 /// `output[x, y] = input[x - dx, y - dy]` after scaling a thumb-pixel correction up to the frame.
-fn shift_surface(surface: &oc_core::compositor::Surface, thumb_dx: i32, thumb_dy: i32) -> oc_core::compositor::Surface {
+fn shift_surface(
+    surface: &oc_core::compositor::Surface,
+    thumb_dx: i32,
+    thumb_dy: i32,
+) -> oc_core::compositor::Surface {
     let w = surface.width as i32;
     let h = surface.height as i32;
     let dx = ((thumb_dx as f32) * (surface.width as f32 / STAB_W as f32)).round() as i32;
@@ -3211,7 +3317,10 @@ fn shift_surface(surface: &oc_core::compositor::Surface, thumb_dx: i32, thumb_dy
     }
 }
 
-fn blit_surface(canvas: &web_sys::HtmlCanvasElement, surface: &oc_core::compositor::Surface) -> bool {
+fn blit_surface(
+    canvas: &web_sys::HtmlCanvasElement,
+    surface: &oc_core::compositor::Surface,
+) -> bool {
     canvas.set_width(surface.width);
     canvas.set_height(surface.height);
     let Ok(Some(ctx)) = canvas.get_context("2d") else {
@@ -3221,8 +3330,11 @@ fn blit_surface(canvas: &web_sys::HtmlCanvasElement, surface: &oc_core::composit
         return false;
     };
     let array = js_sys::Uint8ClampedArray::from(surface.rgba.as_slice());
-    let Ok(image) = web_sys::ImageData::new_with_js_u8_clamped_array_and_sh(&array, surface.width, surface.height)
-    else {
+    let Ok(image) = web_sys::ImageData::new_with_js_u8_clamped_array_and_sh(
+        &array,
+        surface.width,
+        surface.height,
+    ) else {
         return false;
     };
     ctx.put_image_data(&image, 0.0, 0.0).is_ok()
@@ -3303,11 +3415,9 @@ fn paint_grade_canvas() -> Option<Vec<u8>> {
     set_class_off("#grade-canvas", !show_cube);
     if show_cube {
         let array = js_sys::Uint8ClampedArray::from(pixels.as_slice());
-        if let Ok(painted) = web_sys::ImageData::new_with_js_u8_clamped_array_and_sh(
-            &array,
-            GRADE_W,
-            GRADE_H,
-        ) {
+        if let Ok(painted) =
+            web_sys::ImageData::new_with_js_u8_clamped_array_and_sh(&array, GRADE_W, GRADE_H)
+        {
             let _ = ctx.put_image_data(&painted, 0.0, 0.0);
         }
     }
@@ -3473,7 +3583,10 @@ fn wire_preview(ctx: &web_sys::AudioContext, video: &HtmlVideoElement) {
             return false;
         };
         source.connect_with_audio_node(&chain.filter).is_ok()
-            && chain.filter.connect_with_audio_node(&chain.compressor).is_ok()
+            && chain
+                .filter
+                .connect_with_audio_node(&chain.compressor)
+                .is_ok()
             && chain.compressor.connect_with_audio_node(analyser).is_ok()
     });
     let _ = video.set_attribute("data-meter", "on");
@@ -3507,7 +3620,11 @@ fn set_denoise(on: bool) {
     });
 }
 
-fn apply_denoise(filter: &web_sys::BiquadFilterNode, comp: &web_sys::DynamicsCompressorNode, on: bool) {
+fn apply_denoise(
+    filter: &web_sys::BiquadFilterNode,
+    comp: &web_sys::DynamicsCompressorNode,
+    on: bool,
+) {
     if on {
         filter.set_type(web_sys::BiquadFilterType::Highpass);
         filter.frequency().set_value(80.0);

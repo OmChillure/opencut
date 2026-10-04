@@ -8,26 +8,22 @@ mod toast;
 mod tools;
 
 use dioxus::prelude::*;
-use wasm_bindgen::JsCast;
 use media::{
     Clock, DragSession, DragSource, EditMode, EditTool, EditorTrack, MediaItem, MediaKind,
-    TimelineClip, TrackKindUi, advance_playhead, clip_duration, clip_name, commit_drag,
-    display_tracks, film_tiles, fit_scale, format_clock, format_tc_short,
-    item_from_bytes_id, lane_height, next_track_name, paint_clock, paint_playhead, place_clip,
-    playhead_now, preview_video, reset_tick_clock, ruler_marks_nle, scroll_left,
-    apply_monitor_look,
-    seek_by, max_timeline_h, program_end, set_media_duration, set_playhead, sync_monitor, timeline_end,
-    uses_wall_clock,
-    timeline_viewport_h, timeline_viewport_w, update_drag,
-    capture_pointer, clamp_pps, video_duration_from_src,
-};
-use oc_core::{
-    Fx, Grade, Graphic, Op, Timeline as EngineTimeline, TrackKind, TransitionKind,
+    TimelineClip, TrackKindUi, advance_playhead, apply_monitor_look, capture_pointer, clamp_pps,
+    clip_duration, clip_name, commit_drag, display_tracks, film_tiles, fit_scale, format_clock,
+    format_tc_short, item_from_bytes_id, lane_height, max_timeline_h, next_track_name, paint_clock,
+    paint_playhead, place_clip, playhead_now, preview_video, program_end, reset_tick_clock,
+    ruler_marks_nle, scroll_left, seek_by, set_media_duration, set_playhead, sync_monitor,
+    timeline_end, timeline_viewport_h, timeline_viewport_w, update_drag, uses_wall_clock,
+    video_duration_from_src,
 };
 use oc_core::TimelineEditMode;
+use oc_core::{Fx, Grade, Graphic, Op, Timeline as EngineTimeline, TrackKind, TransitionKind};
 use oc_tools::{ToolId, actions as cut_actions, modes as edit_tools, track_actions};
 use pages::{Export, Login, NewProject, Projects};
 use toast::{ToastProvider, show_toast};
+use wasm_bindgen::JsCast;
 
 const CSS: &str = include_str!("../assets/style.css");
 
@@ -173,7 +169,8 @@ fn persist(save: WorkspaceSave) {
         return;
     }
     let (width, height) = save.aspect.peek().pixels();
-    let timeline = bind::timeline_from_tracks(&save.tracks.peek(), &save.engine.peek(), width, height);
+    let timeline =
+        bind::timeline_from_tracks(&save.tracks.peek(), &save.engine.peek(), width, height);
     let mut engine = save.engine;
     spawn(async move {
         if let Ok(next) = api::save_timeline(&pid, timeline).await {
@@ -335,15 +332,18 @@ fn Workspace(id: String) -> Element {
         let Some(win) = web_sys::window() else {
             return;
         };
-        let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::BeforeUnloadEvent| {
-            if held.peek().is_empty() {
-                return;
-            }
-            event.prevent_default();
-            event.set_return_value(
-                "Imported files are only in this browser tab and will be removed.",
-            );
-        }) as Box<dyn FnMut(web_sys::BeforeUnloadEvent)>);
+        let closure = wasm_bindgen::closure::Closure::wrap(Box::new(
+            move |event: web_sys::BeforeUnloadEvent| {
+                if held.peek().is_empty() {
+                    return;
+                }
+                event.prevent_default();
+                event.set_return_value(
+                    "Imported files are only in this browser tab and will be removed.",
+                );
+            },
+        )
+            as Box<dyn FnMut(web_sys::BeforeUnloadEvent)>);
         let handler: &js_sys::Function = closure.as_ref().unchecked_ref();
         win.set_onbeforeunload(Some(handler));
         closure.forget();
@@ -414,7 +414,13 @@ fn Workspace(id: String) -> Element {
                 current.set(end);
                 continue;
             }
-            sync_monitor(&engine.peek(), &library.peek(), &tracks.peek(), before, true);
+            sync_monitor(
+                &engine.peek(),
+                &library.peek(),
+                &tracks.peek(),
+                before,
+                true,
+            );
             apply_monitor_look(
                 &engine.peek(),
                 &library.peek(),
@@ -434,7 +440,13 @@ fn Workspace(id: String) -> Element {
                     playing.set(false);
                     let parked = playhead_now().min(end);
                     set_playhead(parked);
-                    sync_monitor(&engine.peek(), &library.peek(), &tracks.peek(), parked, false);
+                    sync_monitor(
+                        &engine.peek(),
+                        &library.peek(),
+                        &tracks.peek(),
+                        parked,
+                        false,
+                    );
                     paint_playhead(parked);
                     let mut current = clock.current;
                     current.set(parked);
@@ -1034,7 +1046,7 @@ fn AssetView(tab: AssetTab) -> Element {
                     }
                 }
             }
-        },
+        }
     }
 }
 
@@ -1243,11 +1255,31 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
     let now = playhead_now().max(*clock.current.read());
     let chrome = media::monitor_chrome(&save.engine.read(), now, selected_clip.read().as_deref());
     let monitor_bg = oc_core::canonical_color(&save.engine.read().background);
-    let grade_class = if chrome.cube { "preview-grade" } else { "preview-grade off" };
-    let mask_class = if chrome.mask { "preview-mask-host" } else { "preview-mask-host off" };
-    let letter_class = if chrome.letterbox { "preview-letterbox" } else { "preview-letterbox off" };
-    let handle_class = if chrome.mask { "mask-handles" } else { "mask-handles off" };
-    let gfx_class = if chrome.letterbox { "preview-gfx letterboxed" } else { "preview-gfx" };
+    let grade_class = if chrome.cube {
+        "preview-grade"
+    } else {
+        "preview-grade off"
+    };
+    let mask_class = if chrome.mask {
+        "preview-mask-host"
+    } else {
+        "preview-mask-host off"
+    };
+    let letter_class = if chrome.letterbox {
+        "preview-letterbox"
+    } else {
+        "preview-letterbox off"
+    };
+    let handle_class = if chrome.mask {
+        "mask-handles"
+    } else {
+        "mask-handles off"
+    };
+    let gfx_class = if chrome.letterbox {
+        "preview-gfx letterboxed"
+    } else {
+        "preview-gfx"
+    };
 
     use_effect(move || {
         media::set_selected_clip(selected_clip.read().clone());
@@ -1256,7 +1288,13 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
             return;
         }
         let now = *clock.current.read();
-        sync_monitor(&save.engine.read(), &library.read(), &tracks.read(), now, false);
+        sync_monitor(
+            &save.engine.read(),
+            &library.read(),
+            &tracks.read(),
+            now,
+            false,
+        );
         apply_monitor_look(&save.engine.read(), &library.read(), now, false);
     });
 
@@ -2218,8 +2256,6 @@ fn AiSidebar(
     ai_width: Signal<f64>,
     mut ai_drag: Signal<Option<(f64, f64)>>,
 ) -> Element {
-
-
     let save = use_context::<WorkspaceSave>();
     let clock = use_context::<Clock>();
     let target_track = use_context::<CtxTargetTrack>().0;
@@ -2288,12 +2324,27 @@ fn AiSidebar(
         ("Split at playhead", "split"),
         ("Merge clips", "merge"),
         ("Delete clip", "delete"),
-        ("Remove filler words", "Remove all filler words like um, uh, like from the transcript"),
+        (
+            "Remove filler words",
+            "Remove all filler words like um, uh, like from the transcript",
+        ),
         ("Add subtitles", "Generate subtitles for the current video"),
-        ("Remove silences", "Detect and remove long silences from the timeline"),
-        ("Improve audio", "Apply noise reduction and normalize audio levels"),
-        ("Generate thumbnail", "Create a thumbnail image for this video"),
-        ("Auto color grade", "Apply automatic color grading to the video clips"),
+        (
+            "Remove silences",
+            "Detect and remove long silences from the timeline",
+        ),
+        (
+            "Improve audio",
+            "Apply noise reduction and normalize audio levels",
+        ),
+        (
+            "Generate thumbnail",
+            "Create a thumbnail image for this video",
+        ),
+        (
+            "Auto color grade",
+            "Apply automatic color grading to the video clips",
+        ),
     ];
 
     let open = *ai_open.read();
@@ -2609,7 +2660,9 @@ fn apply_chat_event(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent
                 return;
             }
             clear_status(messages);
-            messages.write().push(ChatMsg::bot(format!("Error: {}", ev.text)));
+            messages
+                .write()
+                .push(ChatMsg::bot(format!("Error: {}", ev.text)));
         }
         "thought" => {
             if is_acp_log(&ev.text) {
@@ -2637,15 +2690,10 @@ fn upsert_tool(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent) {
         ev.id.clone()
     };
     let mut list = messages.write();
-    if let Some(existing) = list
-        .iter_mut()
-        .rev()
-        .find(|m| {
-            m.role == ChatRole::Tool
-                && (m.tool_id == id
-                    || (id.is_empty() && m.tool_name == short_tool_name(&ev.name)))
-        })
-    {
+    if let Some(existing) = list.iter_mut().rev().find(|m| {
+        m.role == ChatRole::Tool
+            && (m.tool_id == id || (id.is_empty() && m.tool_name == short_tool_name(&ev.name)))
+    }) {
         existing.tool_status = ev.status;
         if !ev.name.is_empty() {
             existing.tool_name = short_tool_name(&ev.name);
@@ -2657,20 +2705,20 @@ fn upsert_tool(mut messages: Signal<Vec<ChatMsg>>, ev: api::ChatStreamEvent) {
             existing.tool_result = result;
         }
     } else {
-    list.push(ChatMsg {
-        role: ChatRole::Tool,
-        text: ev.name.clone(),
-        tool_id: id,
-        tool_name: short_tool_name(&ev.name),
-        tool_status: if ev.status.is_empty() {
-            "pending".into()
-        } else {
-            ev.status
-        },
-        tool_args: args,
-        tool_result: result,
-        open: false,
-    });
+        list.push(ChatMsg {
+            role: ChatRole::Tool,
+            text: ev.name.clone(),
+            tool_id: id,
+            tool_name: short_tool_name(&ev.name),
+            tool_status: if ev.status.is_empty() {
+                "pending".into()
+            } else {
+                ev.status
+            },
+            tool_args: args,
+            tool_result: result,
+            open: false,
+        });
     }
     for msg in list.iter_mut() {
         if msg.role == ChatRole::Thought {
@@ -2707,9 +2755,8 @@ fn render_chat_msg(messages: Signal<Vec<ChatMsg>>, msg: ChatMsg) -> Element {
         ChatRole::User => rsx! { div { class: "bubble user", "{msg.text}" } },
         ChatRole::Bot => {
             let (trace, visible) = detach_trace(&msg.text);
-            let hide = !trace.is_empty()
-                || looks_like_tool_trace(&msg.text)
-                || leak_marker(&msg.text);
+            let hide =
+                !trace.is_empty() || looks_like_tool_trace(&msg.text) || leak_marker(&msg.text);
             let visible = if looks_like_tool_trace(&visible) || leak_marker(&visible) {
                 String::new()
             } else {
@@ -2809,11 +2856,7 @@ fn toggle_tool_group(mut messages: Signal<Vec<ChatMsg>>, id: &str) {
 }
 
 fn toggle_msg(mut messages: Signal<Vec<ChatMsg>>, id: &str) {
-    if let Some(msg) = messages
-        .write()
-        .iter_mut()
-        .find(|m| m.tool_id == id)
-    {
+    if let Some(msg) = messages.write().iter_mut().find(|m| m.tool_id == id) {
         msg.open = !msg.open;
     }
 }
@@ -3005,7 +3048,9 @@ fn append_model_chunk(list: &mut Vec<ChatMsg>, chunk: &str, as_thought: bool) {
         Some(last) if last.role == ChatRole::Thought => {
             as_thought || chunk_stays_in_trace(&last.text, &chunk)
         }
-        Some(last) if last.role == ChatRole::Bot => !as_thought || bot_joins_trace(&last.text, &chunk),
+        Some(last) if last.role == ChatRole::Bot => {
+            !as_thought || bot_joins_trace(&last.text, &chunk)
+        }
         _ => false,
     };
     if append {
@@ -3021,7 +3066,9 @@ fn append_model_chunk(list: &mut Vec<ChatMsg>, chunk: &str, as_thought: bool) {
 
 /// Every schema bubble becomes a collapsed Thinking row, not only the last one.
 fn fold_messages(list: &mut Vec<ChatMsg>) {
-    list.retain(|msg| msg.role == ChatRole::User || msg.role == ChatRole::Tool || !is_acp_log(&msg.text));
+    list.retain(|msg| {
+        msg.role == ChatRole::User || msg.role == ChatRole::Tool || !is_acp_log(&msg.text)
+    });
     let mut i = 0;
     while i < list.len() {
         if list[i].role != ChatRole::Bot {
@@ -3193,32 +3240,36 @@ fn install_studio_shortcut(mut ai_open: Signal<bool>) {
         INSTALLED.with(|flag| flag.set(false));
         return;
     };
-    let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
-        let key = event.key();
-        if !(event.ctrl_key() || event.meta_key()) || event.alt_key() || !key.eq_ignore_ascii_case("k") {
-            return;
-        }
-        event.prevent_default();
-        ai_open.set(true);
-        let focus = wasm_bindgen::closure::Closure::once(|| {
-            let Some(el) = web_sys::window()
-                .and_then(|window| window.document())
-                .and_then(|doc| doc.get_element_by_id("ai-prompt"))
-            else {
+    let closure =
+        wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
+            let key = event.key();
+            if !(event.ctrl_key() || event.meta_key())
+                || event.alt_key()
+                || !key.eq_ignore_ascii_case("k")
+            {
                 return;
-            };
-            if let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() {
-                let _ = el.focus();
             }
-        });
-        if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                focus.as_ref().unchecked_ref(),
-                40,
-            );
-        }
-        focus.forget();
-    }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
+            event.prevent_default();
+            ai_open.set(true);
+            let focus = wasm_bindgen::closure::Closure::once(|| {
+                let Some(el) = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|doc| doc.get_element_by_id("ai-prompt"))
+                else {
+                    return;
+                };
+                if let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() {
+                    let _ = el.focus();
+                }
+            });
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    focus.as_ref().unchecked_ref(),
+                    40,
+                );
+            }
+            focus.forget();
+        }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
     if win
         .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
         .is_err()
@@ -3254,7 +3305,8 @@ fn merge_library(
     let mut merged = library.peek().clone();
     for item in remote {
         if let Some(existing) = merged.iter_mut().find(|m| m.id == item.id) {
-            if !item.url.is_empty() && (existing.url.is_empty() || existing.url.starts_with("blob:"))
+            if !item.url.is_empty()
+                && (existing.url.is_empty() || existing.url.starts_with("blob:"))
             {
                 existing.url = item.url;
             }
@@ -3294,11 +3346,7 @@ fn next_background(color: &str) -> &'static str {
     }
 }
 
-fn commit_mask(
-    save: WorkspaceSave,
-    library: &[MediaItem],
-    evt: &Event<dioxus::html::PointerData>,
-) {
+fn commit_mask(save: WorkspaceSave, library: &[MediaItem], evt: &Event<dioxus::html::PointerData>) {
     let Some((clip_id, shape)) = media::mask_up(evt) else {
         return;
     };
@@ -3329,9 +3377,7 @@ fn finish_chat_stop(messages: &mut Vec<ChatMsg>) {
 }
 
 fn clear_status(mut messages: Signal<Vec<ChatMsg>>) {
-    messages
-        .write()
-        .retain(|m| m.role != ChatRole::Status);
+    messages.write().retain(|m| m.role != ChatRole::Status);
 }
 
 fn finish_bot_text(mut messages: Signal<Vec<ChatMsg>>, text: String) {
@@ -3344,9 +3390,11 @@ fn settle_reply(list: &mut Vec<ChatMsg>, text: &str) {
     fold_messages(list);
     let (trace, visible) = detach_trace(text);
     if !trace.is_empty() {
-        if let Some(thought) = list.iter_mut().rev().find(|msg| {
-            msg.role == ChatRole::Thought && traces_overlap(&msg.text, &trace)
-        }) {
+        if let Some(thought) = list
+            .iter_mut()
+            .rev()
+            .find(|msg| msg.role == ChatRole::Thought && traces_overlap(&msg.text, &trace))
+        {
             if trace.len() > thought.text.len() {
                 thought.text = trace;
             }
@@ -3360,7 +3408,10 @@ fn settle_reply(list: &mut Vec<ChatMsg>, text: &str) {
     if visible.is_empty() || looks_like_tool_trace(visible) || leak_marker(visible) {
         return;
     }
-    if list.iter().any(|msg| msg.role == ChatRole::Bot && msg.text.contains(visible)) {
+    if list
+        .iter()
+        .any(|msg| msg.role == ChatRole::Bot && msg.text.contains(visible))
+    {
         return;
     }
     list.push(ChatMsg::bot(visible.to_string()));
@@ -3386,7 +3437,11 @@ fn short_api_error(err: &str) -> String {
     if err.contains("404") {
         return "the API needs a restart before chats can be saved".into();
     }
-    err.split(" for url").next().unwrap_or(err).trim().to_string()
+    err.split(" for url")
+        .next()
+        .unwrap_or(err)
+        .trim()
+        .to_string()
 }
 
 fn persistable(list: &[ChatMsg]) -> Vec<api::StoredMsg> {
@@ -3521,7 +3576,9 @@ fn start_new_chat(
     }
     chat_menu.set(false);
     let Some(user) = auth::current_email() else {
-        messages.write().push(ChatMsg::status("Sign in to keep chats."));
+        messages
+            .write()
+            .push(ChatMsg::status("Sign in to keep chats."));
         return;
     };
     spawn(async move {
@@ -3735,12 +3792,10 @@ fn send_prompt(
         }
         let snap = persistable(&messages.read());
         if let Err(err) = store_snap(&pid, &mut bound, chat_id, chats, snap).await {
-            messages
-                .write()
-                .push(ChatMsg::status(format!(
-                    "This chat was not saved — {}",
-                    short_api_error(&err)
-                )));
+            messages.write().push(ChatMsg::status(format!(
+                "This chat was not saved — {}",
+                short_api_error(&err)
+            )));
         }
         if api::chat_generation() == turn {
             busy.set(false);
@@ -4183,7 +4238,9 @@ mod chat_tests {
             "through the drive, the newsroom, and home. I'm building that into one short."
         ));
         assert!(!looks_like_tool_trace("Cut a 40s reel from the interview."));
-        let mixed = format!("{schema}\n\nthrough the drive, the newsroom, and home. I'm building that into one short.");
+        let mixed = format!(
+            "{schema}\n\nthrough the drive, the newsroom, and home. I'm building that into one short."
+        );
         let (thought, visible) = detach_trace(&mixed);
         assert!(thought.contains("scheduler_create"));
         assert!(visible.contains("newsroom"));
@@ -4216,7 +4273,11 @@ mod chat_tests {
         assert!(msgs.iter().any(|m| {
             m.role == ChatRole::Thought && !m.open && m.text.contains("scheduler_create")
         }));
-        assert!(!msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("$schema")));
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == ChatRole::Bot && m.text.contains("$schema"))
+        );
         assert_eq!(msgs[0].text, "Make a vlog from these clips");
         assert_eq!(msgs.last().unwrap().text, "and keep going");
         assert!(matches!(msgs.last().unwrap().role, ChatRole::User));
@@ -4234,24 +4295,37 @@ mod chat_tests {
             rest = tail;
         }
         assert!(msgs.iter().any(|m| m.role == ChatRole::Thought && !m.open));
-        assert!(!msgs
-            .iter()
-            .any(|m| m.role == ChatRole::Bot && looks_like_tool_trace(&m.text)));
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == ChatRole::Bot && looks_like_tool_trace(&m.text))
+        );
         append_model_chunk(
             &mut msgs,
             "I'll cut a 40 second vlog from the clips you imported.",
             false,
         );
-        assert!(msgs.iter().any(|m| {
-            m.role == ChatRole::Bot && m.text.contains("40 second")
-        }));
-        settle_reply(&mut msgs, &format!("{dump}\n\nI'll cut a 40 second vlog from the clips you imported."));
+        assert!(
+            msgs.iter()
+                .any(|m| { m.role == ChatRole::Bot && m.text.contains("40 second") })
+        );
+        settle_reply(
+            &mut msgs,
+            &format!("{dump}\n\nI'll cut a 40 second vlog from the clips you imported."),
+        );
         assert_eq!(
             msgs.iter().filter(|m| m.role == ChatRole::Thought).count(),
             1
         );
-        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("40 second")));
-        assert!(!msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("$schema")));
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == ChatRole::Bot && m.text.contains("40 second"))
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == ChatRole::Bot && m.text.contains("$schema"))
+        );
     }
 
     #[test]
@@ -4263,10 +4337,15 @@ mod chat_tests {
         ] {
             append_model_chunk(&mut msgs, word, false);
         }
-        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("clips")));
-        assert!(!msgs
-            .iter()
-            .any(|m| m.role == ChatRole::Thought && m.text.contains("clips")));
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == ChatRole::Bot && m.text.contains("clips"))
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == ChatRole::Thought && m.text.contains("clips"))
+        );
     }
 
     fn screenshot_schema() -> String {
@@ -4339,7 +4418,9 @@ mod chat_tests {
 
     fn schema_is_hidden(msgs: &[ChatMsg]) {
         assert!(
-            msgs.iter().any(|m| m.role == ChatRole::Thought && !m.open && m.text.contains("scheduler_create")),
+            msgs.iter().any(|m| m.role == ChatRole::Thought
+                && !m.open
+                && m.text.contains("scheduler_create")),
             "schema should be one collapsed thought"
         );
         assert!(
@@ -4373,10 +4454,16 @@ mod chat_tests {
             &format!("{dump}\n\nI'll cut a 40 second vlog from the clips you imported."),
         );
         schema_is_hidden(&msgs);
-        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("40 second")));
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == ChatRole::Bot && m.text.contains("40 second"))
+        );
         fold_messages(&mut msgs);
         schema_is_hidden(&msgs);
-        assert_eq!(msgs.iter().filter(|m| m.role == ChatRole::Thought).count(), 1);
+        assert_eq!(
+            msgs.iter().filter(|m| m.role == ChatRole::Thought).count(),
+            1
+        );
     }
 
     #[test]
@@ -4402,8 +4489,14 @@ mod chat_tests {
         );
         schema_is_hidden(&msgs);
         assert!(msgs.iter().any(|m| m.role == ChatRole::Tool));
-        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("40 second")));
-        assert_eq!(msgs.iter().filter(|m| m.role == ChatRole::Thought).count(), 1);
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == ChatRole::Bot && m.text.contains("40 second"))
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| m.role == ChatRole::Thought).count(),
+            1
+        );
     }
 
     #[test]
@@ -4411,15 +4504,23 @@ mod chat_tests {
         let log = "acp: [2m2026-10-01T08:59:20Z[0m [32m INFO[0m sampling.request model=grok-4.7 auth_prefix=hidden sse_chunk encrypted_content api_backend=responses";
         assert!(is_acp_log(log));
         assert!(!is_acp_log("Sending to xai · grok-4.7…"));
-        assert!(!is_acp_log("I'll cut a 40 second vlog from the clips you imported."));
+        assert!(!is_acp_log(
+            "I'll cut a 40 second vlog from the clips you imported."
+        ));
         let mut msgs = vec![
             ChatMsg::user("edit like a pro editor"),
             ChatMsg::status(log.to_string()),
             ChatMsg::bot("I'll cut a 40 second vlog from the clips you imported."),
         ];
         fold_messages(&mut msgs);
-        assert!(msgs.iter().all(|m| !m.text.contains("sampling.request") && !m.text.contains("auth_prefix")));
-        assert!(msgs.iter().any(|m| m.role == ChatRole::Bot && m.text.contains("40 second")));
+        assert!(
+            msgs.iter()
+                .all(|m| !m.text.contains("sampling.request") && !m.text.contains("auth_prefix"))
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == ChatRole::Bot && m.text.contains("40 second"))
+        );
         assert!(msgs.iter().any(|m| m.role == ChatRole::User));
     }
 
@@ -4435,14 +4536,22 @@ mod chat_tests {
         assert_eq!(saved.len(), 2);
         assert_eq!(saved[0].role, "user");
         assert_eq!(saved[1].role, "assistant");
-        assert!(saved.iter().all(|row| !row.text.contains("sampling.request")));
+        assert!(
+            saved
+                .iter()
+                .all(|row| !row.text.contains("sampling.request"))
+        );
         let restored: Vec<_> = saved
             .into_iter()
             .enumerate()
             .filter_map(|(n, row)| msg_from_stored(row, n))
             .collect();
         assert!(restored.iter().any(|msg| msg.role == ChatRole::User));
-        assert!(restored.iter().any(|msg| msg.role == ChatRole::Bot && msg.text.contains("40 second")));
+        assert!(
+            restored
+                .iter()
+                .any(|msg| msg.role == ChatRole::Bot && msg.text.contains("40 second"))
+        );
     }
 
     #[test]
