@@ -34,6 +34,9 @@ impl Cue {
             end: self.end,
             text: self.text,
             speaker: self.speaker,
+            place: oc_timeline::CaptionPlace::Bottom,
+            font: oc_timeline::CaptionFont::Sans,
+            effect: oc_timeline::CaptionEffect::None,
         }
     }
 }

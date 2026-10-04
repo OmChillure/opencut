@@ -1,7 +1,8 @@
 //! Graph compile + ffmpeg bake (skipped if ffmpeg is missing).
 
 use oc_core::{
-    Duration, Graphic, MediaId, Op, Time, Timeline, TrackKind, TransitionKind, UndoStack, apply,
+    CaptionCue, CaptionStyle, Duration, Graphic, MediaId, Op, Time, Timeline, TrackKind,
+    TransitionKind, UndoStack, apply,
 };
 use oc_render::{MediaSource, RenderRequest, captions_for_cut, compile, ffmpeg_available, render};
 use oc_tests::video_on;
@@ -215,10 +216,7 @@ fn bakes_explanation_drawing_with_ffmpeg() {
     if !ffmpeg_available() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!(
-        "oc-render-design-bake-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("oc-render-design-bake-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let talk = dir.join("talk.mp4");
     let still = dir.join("pattern.jpg");
@@ -295,7 +293,10 @@ fn bakes_explanation_drawing_with_ffmpeg() {
         .trim()
         .parse()
         .unwrap_or(0.0);
-    assert!(dur > 1.6 && dur < 2.4, "expected the speaker's 2s, got {dur}");
+    assert!(
+        dur > 1.6 && dur < 2.4,
+        "expected the speaker's 2s, got {dur}"
+    );
 }
 
 #[test]
@@ -323,11 +324,7 @@ fn letterbox_and_cube_follow_the_timeline() {
         "{}",
         compiled.filter
     );
-    assert!(
-        compiled.filter.contains("0x1a1a1a"),
-        "{}",
-        compiled.filter
-    );
+    assert!(compiled.filter.contains("0x1a1a1a"), "{}", compiled.filter);
     assert!(dir.join("lut-1.cube").is_file());
 }
 

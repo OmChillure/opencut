@@ -1,9 +1,9 @@
 //! Read a cut the way a picture editor would, before accepting it.
 
 use crate::asks_for_whole_piece;
-use oc_timeline::{Clip, ClipKind, MediaId, Timeline, TrackKind};
 #[cfg(test)]
 use oc_time::{Duration, Time};
+use oc_timeline::{Clip, ClipKind, MediaId, Timeline, TrackKind};
 
 #[derive(Clone, Debug)]
 pub struct Spoken {
@@ -76,9 +76,9 @@ impl ReviewFacts {
             let src_out = src_in + clip.duration.as_seconds() * f64::from(speed);
             let mid = (src_in + src_out) * 0.5;
             let note = clip.media_id.and_then(|media| {
-                shots.iter().find(|s| {
-                    s.media == media && mid >= s.start - 0.05 && mid < s.end + 0.05
-                })
+                shots
+                    .iter()
+                    .find(|s| s.media == media && mid >= s.start - 0.05 && mid < s.end + 0.05)
             });
             scales.push(note.map(|s| s.scale.clone()).unwrap_or_default());
             qualities.push(note.map(|s| s.quality).unwrap_or(0));
@@ -123,7 +123,11 @@ pub fn review_with(
             ));
         }
     }
-    if let Some(first) = videos.iter().map(|c| c.start.as_seconds()).min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)) {
+    if let Some(first) = videos
+        .iter()
+        .map(|c| c.start.as_seconds())
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    {
         if first > 0.35 {
             issues.push(format!("picture starts at {first:.1}s, not at 0"));
         }
@@ -184,7 +188,10 @@ fn taste_notes(timeline: &Timeline, videos: &[&Clip], facts: &ReviewFacts) -> Ve
             if !pair[0].is_empty() && pair[0] == pair[1] {
                 run += 1;
                 if run >= 3 {
-                    notes.push(format!("same shot size {} times in a row ({})", run, pair[0]));
+                    notes.push(format!(
+                        "same shot size {} times in a row ({})",
+                        run, pair[0]
+                    ));
                     break;
                 }
             } else {
@@ -214,15 +221,13 @@ fn taste_notes(timeline: &Timeline, videos: &[&Clip], facts: &ReviewFacts) -> Ve
         }
         let pct = on as f64 / (videos.len() - 1) as f64;
         if pct < 0.70 {
-            notes.push(format!(
-                "only {:.0}% of cuts land on a beat",
-                pct * 100.0
-            ));
+            notes.push(format!("only {:.0}% of cuts land on a beat", pct * 100.0));
         }
     }
     if let Some(target) = facts.target_shot {
         if !videos.is_empty() {
-            let avg = videos.iter().map(|c| c.duration.as_seconds()).sum::<f64>() / videos.len() as f64;
+            let avg =
+                videos.iter().map(|c| c.duration.as_seconds()).sum::<f64>() / videos.len() as f64;
             if (avg - target).abs() > target * 0.4 {
                 notes.push(format!(
                     "average shot {avg:.1}s vs the style target {target:.1}s"
@@ -300,7 +305,11 @@ fn first_speech_time(clips: &[&Clip], speech: &[Spoken]) -> Option<f64> {
     let mut best: Option<f64> = None;
     for clip in clips {
         let Some(media) = clip.media_id else { continue };
-        let speed = if clip.speed.is_finite() && clip.speed > 0.0 { clip.speed } else { 1.0 };
+        let speed = if clip.speed.is_finite() && clip.speed > 0.0 {
+            clip.speed
+        } else {
+            1.0
+        };
         for cue in speech.iter().filter(|s| s.media == media) {
             let src_in = clip.source_in.as_seconds();
             let src_out = src_in + clip.duration.as_seconds() * f64::from(speed);
@@ -383,9 +392,7 @@ fn stacked_talk(clips: &[&Clip], speech: &[Spoken]) -> Vec<String> {
                 continue;
             }
             if clip_has_speech(a, speech, start, end) && clip_has_speech(b, speech, start, end) {
-                notes.push(format!(
-                    "two talking shots stacked {start:.1}–{end:.1}s"
-                ));
+                notes.push(format!("two talking shots stacked {start:.1}–{end:.1}s"));
             }
         }
     }
@@ -393,13 +400,21 @@ fn stacked_talk(clips: &[&Clip], speech: &[Spoken]) -> Vec<String> {
 }
 
 fn clip_has_speech(clip: &Clip, speech: &[Spoken], tl0: f64, tl1: f64) -> bool {
-    let Some(media) = clip.media_id else { return false };
-    let speed = if clip.speed.is_finite() && clip.speed > 0.0 { clip.speed } else { 1.0 };
-    let local0 = clip.source_in.as_seconds() + (tl0 - clip.start.as_seconds()).max(0.0) * f64::from(speed);
-    let local1 = clip.source_in.as_seconds() + (tl1 - clip.start.as_seconds()).max(0.0) * f64::from(speed);
-    speech.iter().any(|s| {
-        s.media == media && s.end > local0 + 0.05 && s.start < local1 - 0.05
-    })
+    let Some(media) = clip.media_id else {
+        return false;
+    };
+    let speed = if clip.speed.is_finite() && clip.speed > 0.0 {
+        clip.speed
+    } else {
+        1.0
+    };
+    let local0 =
+        clip.source_in.as_seconds() + (tl0 - clip.start.as_seconds()).max(0.0) * f64::from(speed);
+    let local1 =
+        clip.source_in.as_seconds() + (tl1 - clip.start.as_seconds()).max(0.0) * f64::from(speed);
+    speech
+        .iter()
+        .any(|s| s.media == media && s.end > local0 + 0.05 && s.start < local1 - 0.05)
 }
 
 fn wants_full_source(request: &str) -> bool {
@@ -621,7 +636,11 @@ fn target_range(request: &str) -> Option<(f64, f64)> {
         }
         let n: f64 = lower[start..i].parse().ok()?;
         let rest = lower[i..].trim_start();
-        if let Some(after) = rest.strip_prefix('-').or_else(|| rest.strip_prefix('–')).or_else(|| rest.strip_prefix("to ")) {
+        if let Some(after) = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('–'))
+            .or_else(|| rest.strip_prefix("to "))
+        {
             let after = after.trim_start();
             let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(hi) = digits.parse::<f64>() {
@@ -640,7 +659,8 @@ fn target_range(request: &str) -> Option<(f64, f64)> {
 }
 
 fn scale_pair(after_sep: &str, a: f64, b: f64) -> (f64, f64) {
-    let trimmed = after_sep.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c.is_whitespace());
+    let trimmed =
+        after_sep.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c.is_whitespace());
     if trimmed.starts_with("min") {
         (a * 60.0, b * 60.0)
     } else {
@@ -712,8 +732,18 @@ mod tests {
         tl.tracks.push(v1);
         tl.tracks.push(v2);
         let speech = vec![
-            Spoken { media: a, start: 0.0, end: 6.0, text: "hello there friend".into() },
-            Spoken { media: b, start: 0.0, end: 4.0, text: "other person talks".into() },
+            Spoken {
+                media: a,
+                start: 0.0,
+                end: 6.0,
+                text: "hello there friend".into(),
+            },
+            Spoken {
+                media: b,
+                start: 0.0,
+                end: 4.0,
+                text: "other person talks".into(),
+            },
         ];
         let review = review_cut(&tl, &speech, "cut this");
         assert!(review.text.contains("stacked"), "{}", review.text);
@@ -799,9 +829,17 @@ mod tests {
             "not ducked",
         ] {
             assert!(review.notes, "{}", review.text);
-            assert!(review.text.contains(needle), "{needle} missing in {}", review.text);
+            assert!(
+                review.text.contains(needle),
+                "{needle} missing in {}",
+                review.text
+            );
         }
-        assert!(!review.issues || review.text.contains("fix:"), "{}", review.text);
+        assert!(
+            !review.issues || review.text.contains("fix:"),
+            "{}",
+            review.text
+        );
     }
 
     fn long_speech(media: MediaId) -> Vec<Spoken> {
@@ -856,7 +894,11 @@ mod tests {
         };
         let review = review_with(&tl, &[], "edit this footage", &facts);
         assert!(review.issues, "{}", review.text);
-        assert!(review.text.contains("source is in the cut"), "{}", review.text);
+        assert!(
+            review.text.contains("source is in the cut"),
+            "{}",
+            review.text
+        );
     }
 
     #[test]
@@ -871,7 +913,11 @@ mod tests {
             ..ReviewFacts::default()
         };
         let review = review_with(&tl, &[], "edit this footage in 30s", &facts);
-        assert!(!review.text.contains("source is in the cut"), "{}", review.text);
+        assert!(
+            !review.text.contains("source is in the cut"),
+            "{}",
+            review.text
+        );
     }
 
     #[test]

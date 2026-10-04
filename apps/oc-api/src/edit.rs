@@ -1,10 +1,10 @@
 //! Shared inspect + apply so chat and the MCP child hit the same tools.
 
-use oc_core::{
-    inspect_from_mcp, apply, op_from_mcp, pick_reel_excerpts, AssembleItem, ExportPreset, Inspect,
-    MediaId, McpCall, Op, Time, Timeline, TrackKind, UndoStack,
-};
 use oc_core::time::TICKS_PER_SECOND;
+use oc_core::{
+    AssembleItem, ExportPreset, Inspect, McpCall, MediaId, Op, Time, Timeline, TrackKind,
+    UndoStack, apply, inspect_from_mcp, op_from_mcp, pick_reel_excerpts,
+};
 use oc_db::Db;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -55,7 +55,16 @@ pub(crate) async fn call_tool(
         return Ok(out);
     }
     if name == "submit_edit" || name == "revise_edit" {
-        return apply_submitted_plan(db, project_id, name, &call.arguments, &media, &speech, &looks).await;
+        return apply_submitted_plan(
+            db,
+            project_id,
+            name,
+            &call.arguments,
+            &media,
+            &speech,
+            &looks,
+        )
+        .await;
     }
     if name == "generate_broll" {
         return generate_broll(db, project_id, &mut project.timeline, &call.arguments).await;
@@ -143,10 +152,7 @@ async fn generate_broll(
         .unwrap_or(4.0)
         .clamp(1.0, 8.0)
         .round() as u32;
-    let aspect = broll_aspect(
-        timeline,
-        arguments.get("aspect").and_then(Value::as_str),
-    );
+    let aspect = broll_aspect(timeline, arguments.get("aspect").and_then(Value::as_str));
     let (bytes, seconds) = oc_providers::imagine_clip(prompt, requested, &aspect).await?;
     let media_id = Uuid::now_v7();
     let filename = format!("broll-{media_id}.mp4");
@@ -161,10 +167,7 @@ async fn generate_broll(
         .await
         .map_err(|e| e.to_string())?;
     let stored_key = match oc_db::R2::from_env().await {
-        Ok(r2) => match r2
-            .put_bytes(&object_key, bytes.to_vec(), "video/mp4")
-            .await
-        {
+        Ok(r2) => match r2.put_bytes(&object_key, bytes.to_vec(), "video/mp4").await {
             Ok(()) => object_key,
             Err(err) => {
                 tracing::warn!("b-roll R2 put failed, keeping a local file: {err}");
@@ -253,10 +256,7 @@ async fn add_design(
         .await
         .map_err(|e| e.to_string())?;
     let stored_key = match oc_db::R2::from_env().await {
-        Ok(r2) => match r2
-            .put_bytes(&object_key, bytes.to_vec(), "video/mp4")
-            .await
-        {
+        Ok(r2) => match r2.put_bytes(&object_key, bytes.to_vec(), "video/mp4").await {
             Ok(()) => object_key,
             Err(err) => {
                 tracing::warn!("design R2 put failed, keeping a local file: {err}");
@@ -332,8 +332,7 @@ fn broll_aspect(timeline: &Timeline, requested: Option<&str>) -> String {
     let ratio = timeline.width.max(1) as f64 / timeline.height.max(1) as f64;
     if (ratio - 1.0).abs() < 0.08 {
         "1:1".into()
-    } else if ratio > 1.0 && (ratio - 4.0 / 3.0).abs() < (ratio - 16.0 / 9.0).abs() && ratio < 1.5
-    {
+    } else if ratio > 1.0 && (ratio - 4.0 / 3.0).abs() < (ratio - 16.0 / 9.0).abs() && ratio < 1.5 {
         "4:3".into()
     } else if ratio < 1.0 {
         "9:16".into()
@@ -457,13 +456,29 @@ pub(crate) async fn place_captions(
             format!("no words yet — queued {queued} transcript(s). Try again when they finish."),
         ));
     }
-    let cues = oc_core::mapped_cues(&oc_core::program_clips(&project.timeline), &lines);
+    let clips = oc_core::program_clips(&project.timeline);
+    let mut cues = oc_core::mapped_cues(&clips, &lines);
     if cues.is_empty() {
         return Ok((
             project.timeline,
             "speech does not overlap the picture on the timeline".into(),
         ));
     }
+    let media = oc_db::list_media(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let analysis = oc_db::list_analysis_for_project(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let looks = look_by_media(&analysis);
+    let windows = source_windows(&media, &speech, &looks);
+    let recipe = if project.timeline.height > project.timeline.width {
+        oc_core::CaptionMood::Kinetic.recipe()
+    } else {
+        oc_core::CaptionMood::Clean.recipe()
+    };
+    let faces = oc_core::cue_faces(&clips, &windows, &cues);
+    oc_core::dress_cues(&mut cues, &recipe, &faces);
     let mut undo = UndoStack::new();
     let applied = apply(
         &mut project.timeline,
@@ -587,9 +602,9 @@ pub(crate) async fn see_frame(
     for dir in temps {
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
-    let jpeg = jpeg.filter(|b| b.len() >= 32).ok_or_else(|| {
-        format!("no frame at {at:.1}s in {media_id}")
-    })?;
+    let jpeg = jpeg
+        .filter(|b| b.len() >= 32)
+        .ok_or_else(|| format!("no frame at {at:.1}s in {media_id}"))?;
     Ok(oc_providers::PromptImage {
         caption: format!("media {media_id} @ {at:.1}s"),
         jpeg,
@@ -721,7 +736,15 @@ pub(crate) fn run_inspect(
             min_quality,
             subject,
             limit,
-        } => find_shots(looks, scale, camera, motion_dir, min_quality, subject, limit),
+        } => find_shots(
+            looks,
+            scale,
+            camera,
+            motion_dir,
+            min_quality,
+            subject,
+            limit,
+        ),
         Inspect::ListCues { media_id } => {
             let id = media_id.as_uuid();
             let Some(s) = speech.get(&id) else {
@@ -756,12 +779,12 @@ pub(crate) fn hydrate_op(
         } => {
             if let Some(row) = media.iter().find(|r| r.id == media_id.as_uuid()) {
                 let (row_kind, row_dur) = spec_from_row(row);
-                let remain = if source_in.as_ticks() > 0 && row_dur.as_ticks() > source_in.as_ticks()
-                {
-                    oc_core::Duration::from_ticks(row_dur.as_ticks() - source_in.as_ticks())
-                } else {
-                    row_dur
-                };
+                let remain =
+                    if source_in.as_ticks() > 0 && row_dur.as_ticks() > source_in.as_ticks() {
+                        oc_core::Duration::from_ticks(row_dur.as_ticks() - source_in.as_ticks())
+                    } else {
+                        row_dur
+                    };
                 Op::PlaceMedia {
                     media_id,
                     track_id,
@@ -801,9 +824,7 @@ pub(crate) fn hydrate_op(
                 media
                     .iter()
                     .rev()
-                    .map(|row| {
-                        item_from_row(row, speech.get(&row.id), looks.get(&row.id), target)
-                    })
+                    .map(|row| item_from_row(row, speech.get(&row.id), looks.get(&row.id), target))
                     .collect()
             } else {
                 items
@@ -851,7 +872,11 @@ fn kind_from_media(content_type: &str, filename: &str) -> TrackKind {
     if content_type.starts_with("audio/") {
         return TrackKind::Audio;
     }
-    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "mp3" | "wav" | "aac" | "m4a" | "ogg" | "flac" => TrackKind::Audio,
         _ => TrackKind::Video,
@@ -935,7 +960,11 @@ fn compact_shots(picture: &[oc_media::ShotLook], briefs: &[oc_media::ShotBrief])
             let text = brief.text.chars().take(48).collect::<String>();
             out.push_str(&format!(
                 "{:.1}-{:.1} {} {} {}\n",
-                brief.start, brief.end, brief.look, brief.role.as_str(), text
+                brief.start,
+                brief.end,
+                brief.look,
+                brief.role.as_str(),
+                text
             ));
         }
     }
@@ -1052,7 +1081,14 @@ async fn apply_submitted_plan(
             end: w.end,
         })
         .collect();
-    let notes = oc_core::build_plan(&mut project.timeline, &plan, &windows, &beats, &lines, &covers)?;
+    let notes = oc_core::build_plan(
+        &mut project.timeline,
+        &plan,
+        &windows,
+        &beats,
+        &lines,
+        &covers,
+    )?;
     oc_db::save_timeline(db, project_id, &project.timeline)
         .await
         .map_err(|e| e.to_string())?;
@@ -1087,6 +1123,7 @@ fn source_windows(
                         end: cue.end.as_seconds(),
                         duration: dur.as_seconds(),
                         look: String::new(),
+                        subject: String::new(),
                         silent: false,
                     });
                 }
@@ -1097,17 +1134,26 @@ fn source_windows(
                 end: 0.0,
                 duration: dur.as_seconds().max(0.1),
                 look: String::new(),
+                subject: String::new(),
                 silent: false,
             });
         } else {
             for shot in shots {
                 let silent = !range_has_speech(speech, row.id, shot.start, shot.end);
+                let look = shot
+                    .card
+                    .as_ref()
+                    .map(|card| card.scale.trim())
+                    .filter(|scale| !scale.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| shot.look.clone());
                 windows.push(oc_core::SourceWindow {
                     media: id,
                     start: shot.start,
                     end: shot.end,
                     duration: dur.as_seconds().max(shot.end),
-                    look: shot.look.clone(),
+                    look,
+                    subject: shot.subject.clone(),
                     silent,
                 });
             }
@@ -1118,9 +1164,9 @@ fn source_windows(
 
 fn range_has_speech(speech: &HashMap<Uuid, Speech>, id: Uuid, start: f64, end: f64) -> bool {
     speech.get(&id).is_some_and(|s| {
-        s.cues.iter().any(|c| {
-            c.end.as_seconds() > start + 0.2 && c.start.as_seconds() < end - 0.2
-        })
+        s.cues
+            .iter()
+            .any(|c| c.end.as_seconds() > start + 0.2 && c.start.as_seconds() < end - 0.2)
     })
 }
 

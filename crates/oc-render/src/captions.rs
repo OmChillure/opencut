@@ -1,4 +1,4 @@
-use oc_timeline::{ClipKind, Timeline};
+use oc_timeline::{CaptionEffect, CaptionFont, CaptionPlace, ClipKind, Timeline};
 use std::fmt::Write;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6,6 +6,9 @@ pub struct BurnedCue {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    pub place: CaptionPlace,
+    pub font: CaptionFont,
+    pub effect: CaptionEffect,
 }
 
 /// Map transcript-style cues (source seconds) onto the *cut*.
@@ -28,11 +31,14 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
                 continue;
             };
             for cue in raw {
-                cues.push((
-                    clip.start.as_seconds() + cue.start.as_seconds(),
-                    clip.start.as_seconds() + cue.end.as_seconds(),
-                    cue.text.clone(),
-                ));
+                cues.push(BurnedCue {
+                    start: clip.start.as_seconds() + cue.start.as_seconds(),
+                    end: clip.start.as_seconds() + cue.end.as_seconds(),
+                    text: cue.text.clone(),
+                    place: cue.place,
+                    font: cue.font,
+                    effect: cue.effect,
+                });
             }
         }
     }
@@ -58,19 +64,22 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
     for clip in &program {
         let tl0 = clip.start.as_seconds();
         let tl1 = clip.end().as_seconds();
-        for (i, (c0, c1, text)) in cues.iter().enumerate() {
-            if *c1 <= tl0 + 0.05 || *c0 >= tl1 - 0.05 {
+        for (i, cue) in cues.iter().enumerate() {
+            if cue.end <= tl0 + 0.05 || cue.start >= tl1 - 0.05 {
                 continue;
             }
-            let a = c0.max(tl0);
-            let b = c1.min(tl1);
+            let a = cue.start.max(tl0);
+            let b = cue.end.min(tl1);
             if b - a < 0.05 {
                 continue;
             }
             out.push(BurnedCue {
                 start: a,
                 end: b,
-                text: text.clone(),
+                text: cue.text.clone(),
+                place: cue.place,
+                font: cue.font,
+                effect: cue.effect,
             });
             placed[i] = true;
         }
@@ -79,23 +88,30 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
     for clip in &program {
         let src0 = clip.source_in.as_seconds();
         let src1 = src0 + clip.duration.as_seconds() * f64::from(clip.speed.max(0.01));
-        for (i, (c0, c1, text)) in cues.iter().enumerate() {
+        for (i, cue) in cues.iter().enumerate() {
             if placed[i] {
                 continue;
             }
-            let a = c0.max(src0);
-            let b = c1.min(src1);
+            let a = cue.start.max(src0);
+            let b = cue.end.min(src1);
             if b - a < 0.05 {
                 continue;
             }
             out.push(BurnedCue {
                 start: clip.start.as_seconds() + (a - src0),
                 end: clip.start.as_seconds() + (b - src0),
-                text: text.clone(),
+                text: cue.text.clone(),
+                place: cue.place,
+                font: cue.font,
+                effect: cue.effect,
             });
         }
     }
-    out.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.dedup_by(|a, b| (a.start - b.start).abs() < 0.05 && a.text == b.text);
     shorten_cues(out)
 }
@@ -118,6 +134,9 @@ fn shorten_cues(cues: Vec<BurnedCue>) -> Vec<BurnedCue> {
                 start: cue.start + step * i,
                 end: cue.start + step * (i + 1.0),
                 text: group.join(" "),
+                place: cue.place,
+                font: cue.font,
+                effect: cue.effect,
             });
         }
     }
@@ -142,10 +161,11 @@ pub fn to_srt(cues: &[BurnedCue]) -> String {
 
 /// ASS with PlayRes equal to the frame, so Fontsize is in real pixels.
 /// An SRT burned through libass uses a 288-line script and blows the type up.
+/// Each line carries its own anchor, face, and effect.
 #[must_use]
 pub fn to_ass(cues: &[BurnedCue], width: u32, height: u32, letterbox: bool) -> String {
     let short = width.min(height).max(1);
-    let font = (short / 20).clamp(42, 64);
+    let font = (short / 22).clamp(36, 58);
     let margin_v = if letterbox {
         ((height as f32) * 0.12).round() as u32 + font
     } else {
@@ -161,21 +181,118 @@ pub fn to_ass(cues: &[BurnedCue], width: u32, height: u32, letterbox: bool) -> S
          \n\
          [V4+ Styles]\n\
          Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
-         Style: Default,DejaVu Sans,{font},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,3,0,2,72,72,{margin_v},1\n\
+         Style: Default,DejaVu Sans,{font},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,3,0,2,72,72,{margin_v},1\n\
          \n\
          [Events]\n\
          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     );
     for cue in cues {
+        let (x, y, an) = anchor(cue.place, width, height, letterbox);
+        let effect = effect_prefix(cue.effect);
         let _ = writeln!(
             out,
-            "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+            "Dialogue: 0,{},{},Default,,0,0,0,,{{\\an{an}\\pos({x},{y}){}{effect}}}{}",
             ass_time(cue.start),
             ass_time(cue.end),
-            ass_text(&cue.text)
+            font_override(cue.font, short),
+            dialogue_text(cue)
         );
     }
     out
+}
+
+fn anchor(place: CaptionPlace, width: u32, height: u32, letterbox: bool) -> (u32, u32, u8) {
+    let h = u64::from(height.max(1));
+    let y_num = match place {
+        CaptionPlace::Top => 14,
+        CaptionPlace::Middle => 46,
+        CaptionPlace::Lower => 64,
+        CaptionPlace::Bottom => {
+            if letterbox {
+                76
+            } else {
+                84
+            }
+        }
+    };
+    let y = (h * y_num / 100).clamp(48, h.saturating_sub(48)) as u32;
+    let an = match place {
+        CaptionPlace::Top => 8,
+        CaptionPlace::Middle | CaptionPlace::Lower => 5,
+        CaptionPlace::Bottom => 2,
+    };
+    (width / 2, y, an)
+}
+
+fn font_override(font: CaptionFont, short: u32) -> String {
+    match font {
+        CaptionFont::Sans => {
+            let size = (short / 22).clamp(36, 58);
+            format!("\\fnDejaVu Sans\\fs{size}\\b1")
+        }
+        CaptionFont::Display => {
+            let size = (short / 12).clamp(64, 120);
+            format!("\\fnDejaVu Sans\\fs{size}\\b1\\c&H006AE5FF&")
+        }
+        CaptionFont::Serif => {
+            let size = (short / 22).clamp(36, 58);
+            format!("\\fnDejaVu Serif\\fs{size}\\i1")
+        }
+        CaptionFont::Mono => {
+            let size = (short / 24).clamp(32, 52);
+            format!("\\fnDejaVu Sans Mono\\fs{size}")
+        }
+    }
+}
+
+fn effect_prefix(effect: CaptionEffect) -> &'static str {
+    match effect {
+        CaptionEffect::Pop => "\\fscx62\\fscy62\\t(0,160,\\fscx100\\fscy100)\\fad(30,0)",
+        CaptionEffect::Fade => "\\fad(90,340)",
+        CaptionEffect::Typewriter | CaptionEffect::None => "",
+    }
+}
+
+fn dialogue_text(cue: &BurnedCue) -> String {
+    let body = if cue.font == CaptionFont::Display {
+        cue.text.trim().to_uppercase()
+    } else {
+        cue.text.trim().to_string()
+    };
+    if cue.effect == CaptionEffect::Typewriter {
+        type_on(&body, (cue.end - cue.start).max(0.2))
+    } else {
+        ass_escape(&body)
+    }
+}
+
+fn type_on(text: &str, duration: f64) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len().max(1) as f64;
+    let window = (duration * 0.7).clamp(0.2, duration.max(0.2));
+    let step = (window / n).clamp(0.03, 0.12);
+    let mut out = String::new();
+    for (i, ch) in chars.iter().enumerate() {
+        let t0 = (i as f64 * step * 1000.0).round() as u32;
+        let t1 = t0 + 40;
+        out.push_str(&format!("{{\\alpha&HFF&\\t({t0},{t1},\\alpha&H00&)}}"));
+        out.push_str(&escape_char(*ch));
+    }
+    out
+}
+
+fn ass_escape(text: &str) -> String {
+    text.chars().map(escape_char).collect()
+}
+
+fn escape_char(c: char) -> String {
+    match c {
+        '\\' => "\\\\".into(),
+        '{' => "\\{".into(),
+        '}' => "\\}".into(),
+        '\n' => "\\N".into(),
+        _ => c.to_string(),
+    }
 }
 
 fn ass_time(secs: f64) -> String {
@@ -185,14 +302,6 @@ fn ass_time(secs: f64) -> String {
     let s = (cs / 100) % 60;
     let c = cs % 100;
     format!("{h}:{m:02}:{s:02}.{c:02}")
-}
-
-fn ass_text(text: &str) -> String {
-    text.trim()
-        .replace('\\', "\\\\")
-        .replace('{', "\\{")
-        .replace('}', "\\}")
-        .replace('\n', "\\N")
 }
 
 fn srt_time(secs: f64) -> String {
@@ -215,14 +324,69 @@ mod tests {
                 start: 0.0,
                 end: 1.5,
                 text: "something that matters.".into(),
+                place: CaptionPlace::Bottom,
+                font: CaptionFont::Sans,
+                effect: CaptionEffect::None,
             }],
             1080,
             1920,
             false,
         );
         assert!(ass.contains("PlayResX: 1080\nPlayResY: 1920"), "{ass}");
-        assert!(ass.contains("DejaVu Sans,54,"), "{ass}");
-        assert!(ass.contains("Dialogue: 0,0:00:00.00,0:00:01.50,Default,,0,0,0,,something that matters."));
+        assert!(
+            ass.contains("{\\an2\\pos(540,1612)\\fnDejaVu Sans\\fs49\\b1}something that matters."),
+            "{ass}"
+        );
+    }
+
+    #[test]
+    fn a_middle_punch_pops_and_a_line_can_type_on_or_vanish() {
+        let pop = to_ass(
+            &[BurnedCue {
+                start: 0.0,
+                end: 1.2,
+                text: "go".into(),
+                place: CaptionPlace::Middle,
+                font: CaptionFont::Display,
+                effect: CaptionEffect::Pop,
+            }],
+            1080,
+            1920,
+            false,
+        );
+        assert!(pop.contains("\\an5\\pos(540,883)"), "{pop}");
+        assert!(pop.contains("\\fs90"), "{pop}");
+        assert!(pop.contains("\\fscx62\\fscy62"), "{pop}");
+        assert!(pop.contains("GO"), "{pop}");
+        let typed = to_ass(
+            &[BurnedCue {
+                start: 0.0,
+                end: 1.0,
+                text: "3 steps".into(),
+                place: CaptionPlace::Lower,
+                font: CaptionFont::Mono,
+                effect: CaptionEffect::Typewriter,
+            }],
+            1080,
+            1920,
+            false,
+        );
+        assert!(typed.contains("\\alpha&HFF&"), "{typed}");
+        assert!(typed.contains("DejaVu Sans Mono"), "{typed}");
+        let vanish = to_ass(
+            &[BurnedCue {
+                start: 0.0,
+                end: 2.0,
+                text: "the long way".into(),
+                place: CaptionPlace::Bottom,
+                font: CaptionFont::Sans,
+                effect: CaptionEffect::Fade,
+            }],
+            1080,
+            1920,
+            false,
+        );
+        assert!(vanish.contains("\\fad(90,340)"), "{vanish}");
     }
     use oc_time::{Duration, Time};
     use oc_timeline::{CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook, TrackKind};
@@ -262,12 +426,18 @@ mod tests {
                             end: Time::from_seconds(43.0),
                             text: "we left".into(),
                             speaker: None,
+                            place: Default::default(),
+                            font: Default::default(),
+                            effect: Default::default(),
                         },
                         CaptionCue {
                             start: Time::from_seconds(80.0),
                             end: Time::from_seconds(82.0),
                             text: "too late".into(),
                             speaker: None,
+                            place: Default::default(),
+                            font: Default::default(),
+                            effect: Default::default(),
                         },
                     ],
                 },
@@ -325,6 +495,9 @@ mod tests {
                         end: Time::from_seconds(3.0),
                         text: "on the cut".into(),
                         speaker: None,
+                        place: Default::default(),
+                        font: Default::default(),
+                        effect: Default::default(),
                     }],
                 },
                 start: Time::ZERO,
@@ -401,6 +574,9 @@ mod tests {
                         end: Time::from_seconds(2.0),
                         text: "learn the patterns".into(),
                         speaker: None,
+                        place: Default::default(),
+                        font: Default::default(),
+                        effect: Default::default(),
                     }],
                 },
                 start: Time::ZERO,
@@ -480,12 +656,18 @@ mod tests {
                             end: Time::from_seconds(7.2),
                             text: "be a bullish flag".into(),
                             speaker: None,
+                            place: Default::default(),
+                            font: Default::default(),
+                            effect: Default::default(),
                         },
                         CaptionCue {
                             start: Time::from_seconds(52.2),
                             end: Time::from_seconds(58.2),
                             text: "is the important level though as".into(),
                             speaker: None,
+                            place: Default::default(),
+                            font: Default::default(),
+                            effect: Default::default(),
                         },
                     ],
                 },

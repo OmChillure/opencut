@@ -176,14 +176,12 @@ impl TransitionKind {
             | Self::SmoothRight
             | Self::SmoothUp
             | Self::SmoothDown => "Edge wipe across the frame",
-            Self::CoverLeft
-            | Self::CoverRight
-            | Self::CoverUp
-            | Self::CoverDown => "Next shot covers this one",
-            Self::RevealLeft
-            | Self::RevealRight
-            | Self::RevealUp
-            | Self::RevealDown => "This shot slides off, revealing the next",
+            Self::CoverLeft | Self::CoverRight | Self::CoverUp | Self::CoverDown => {
+                "Next shot covers this one"
+            }
+            Self::RevealLeft | Self::RevealRight | Self::RevealUp | Self::RevealDown => {
+                "This shot slides off, revealing the next"
+            }
             Self::CircleOpen | Self::CircleClose | Self::Radial => "Iris / clock wipe",
             Self::Pixelize => "Pixelate into the next shot",
             Self::HorzOpen | Self::VertOpen => "Split open to the next shot",
@@ -323,7 +321,9 @@ impl TransitionKind {
     #[must_use]
     pub fn slide_delta(self) -> Option<(f64, f64)> {
         match self {
-            Self::Slide | Self::SlideRight | Self::CoverRight | Self::RevealLeft => Some((-1.0, 0.0)),
+            Self::Slide | Self::SlideRight | Self::CoverRight | Self::RevealLeft => {
+                Some((-1.0, 0.0))
+            }
             Self::SlideLeft | Self::CoverLeft | Self::RevealRight => Some((1.0, 0.0)),
             Self::SlideUp | Self::CoverUp | Self::RevealDown => Some((0.0, 1.0)),
             Self::SlideDown | Self::CoverDown | Self::RevealUp => Some((0.0, -1.0)),
@@ -335,9 +335,7 @@ impl TransitionKind {
     pub fn wipe_inset(self, p: f64) -> Option<String> {
         let p = (p * 100.0).clamp(0.0, 100.0);
         match self {
-            Self::Wipe | Self::WipeLeft | Self::SmoothLeft => {
-                Some(format!("inset(0 {p:.1}% 0 0)"))
-            }
+            Self::Wipe | Self::WipeLeft | Self::SmoothLeft => Some(format!("inset(0 {p:.1}% 0 0)")),
             Self::WipeRight | Self::SmoothRight => Some(format!("inset(0 0 0 {p:.1}%)")),
             Self::WipeUp | Self::SmoothUp => Some(format!("inset(0 0 {p:.1}% 0)")),
             Self::WipeDown | Self::SmoothDown => Some(format!("inset({p:.1}% 0 0 0)")),
@@ -881,6 +879,12 @@ pub struct EditPlan {
     /// Write transcript captions onto the new timeline.
     #[serde(default)]
     pub captions: bool,
+    /// Shortcut when the plan does not compose its own mix. Prefer `caption_look`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_mood: Option<CaptionMood>,
+    /// This video's caption mix. Any place, font, and effect per kind of line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_look: Option<CaptionRecipe>,
     /// Applied to every slot that does not set its own grade.
     #[serde(default)]
     pub grade: Grade,
@@ -917,6 +921,388 @@ pub enum CaptionStyle {
     SpeakerColor,
 }
 
+/// Where a line sits. A close face stays low so the words do not cover the mouth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionPlace {
+    #[default]
+    Bottom,
+    /// Just under a face, or the lower middle of an open frame.
+    Lower,
+    Middle,
+    Top,
+}
+
+impl CaptionPlace {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bottom => "bottom",
+            Self::Lower => "lower",
+            Self::Middle => "middle",
+            Self::Top => "top",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "middle" | "center" | "centre" => Self::Middle,
+            "top" => Self::Top,
+            "lower" | "lower_third" | "low" => Self::Lower,
+            _ => Self::Bottom,
+        }
+    }
+}
+
+/// Typeface family. Export maps these onto DejaVu faces ffmpeg can find.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionFont {
+    #[default]
+    Sans,
+    /// Heavy, large, the punch line.
+    Display,
+    Serif,
+    Mono,
+}
+
+impl CaptionFont {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sans => "sans",
+            Self::Display => "display",
+            Self::Serif => "serif",
+            Self::Mono => "mono",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "display" | "impact" | "heavy" | "bold" => Self::Display,
+            "serif" | "italic" => Self::Serif,
+            "mono" | "type" | "typewriter" => Self::Mono,
+            _ => Self::Sans,
+        }
+    }
+}
+
+/// How the line enters and leaves. `fade` is the vanish.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionEffect {
+    #[default]
+    None,
+    Pop,
+    Typewriter,
+    Fade,
+}
+
+impl CaptionEffect {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pop => "pop",
+            Self::Typewriter => "typewriter",
+            Self::Fade => "fade",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pop" | "slam" | "bounce" => Self::Pop,
+            "typewriter" | "type_on" | "type" | "karaoke" => Self::Typewriter,
+            "fade" | "vanish" | "fade_out" => Self::Fade,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Shortcut filler when a plan does not compose `caption_look`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionMood {
+    /// Interview, vlog, explanation. Words stay low. A punch pops. A long line fades.
+    #[default]
+    Clean,
+    /// Reel or promo. Lines move between the top, the lower third, and the bottom.
+    /// A close face does not take the middle.
+    Kinetic,
+    /// Ad. Big type, center when the frame is open.
+    Bold,
+}
+
+impl CaptionMood {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Kinetic => "kinetic",
+            Self::Bold => "bold",
+        }
+    }
+
+    /// Loose words from the plan. Unknown stays clean.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "kinetic" | "reel" | "tiktok" | "hype" | "funky" | "dynamic" => Self::Kinetic,
+            "bold" | "hormozi" | "ad" | "promo" => Self::Bold,
+            _ => Self::Clean,
+        }
+    }
+
+    /// Filler for roles the plan left empty.
+    /// Clean holds a face at the bottom. Kinetic and bold leave the top free.
+    #[must_use]
+    pub fn recipe(self) -> CaptionRecipe {
+        CaptionRecipe {
+            on_face: match self {
+                Self::Clean => Some(CaptionPlace::Bottom),
+                Self::Kinetic | Self::Bold => None,
+            },
+            base: Some(self),
+            ..CaptionRecipe::default()
+        }
+    }
+}
+
+/// One role in a caption mix. A phrase such as `top serif fade` sets only the words it names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineLook {
+    pub place: Option<CaptionPlace>,
+    pub font: Option<CaptionFont>,
+    pub effect: Option<CaptionEffect>,
+}
+
+impl LineLook {
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        let mut look = Self::default();
+        for token in raw.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            let word = token.trim().to_ascii_lowercase();
+            if word.is_empty() {
+                continue;
+            }
+            if let Some(place) = known_place(&word) {
+                look.place = Some(place);
+            } else if let Some(font) = known_font(&word) {
+                look.font = Some(font);
+            } else if let Some(effect) = known_effect(&word) {
+                look.effect = Some(effect);
+            }
+        }
+        look
+    }
+
+    #[must_use]
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        if let Some(text) = value.as_str() {
+            return Self::parse(text);
+        }
+        let Some(obj) = value.as_object() else {
+            return Self::default();
+        };
+        let mut look = Self::default();
+        if let Some(text) = obj.get("place").and_then(|v| v.as_str()) {
+            if let Some(place) = known_place(&text.to_ascii_lowercase()) {
+                look.place = Some(place);
+            }
+        }
+        if let Some(text) = obj.get("font").and_then(|v| v.as_str()) {
+            if let Some(font) = known_font(&text.to_ascii_lowercase()) {
+                look.font = Some(font);
+            }
+        }
+        if let Some(text) = obj.get("effect").and_then(|v| v.as_str()) {
+            if let Some(effect) = known_effect(&text.to_ascii_lowercase()) {
+                look.effect = Some(effect);
+            }
+        }
+        look
+    }
+}
+
+fn known_place(word: &str) -> Option<CaptionPlace> {
+    match word {
+        "bottom" => Some(CaptionPlace::Bottom),
+        "lower" | "low" | "lower_third" => Some(CaptionPlace::Lower),
+        "middle" | "center" | "centre" => Some(CaptionPlace::Middle),
+        "top" => Some(CaptionPlace::Top),
+        _ => None,
+    }
+}
+
+fn known_font(word: &str) -> Option<CaptionFont> {
+    match word {
+        "sans" => Some(CaptionFont::Sans),
+        "display" | "impact" | "heavy" | "bold" => Some(CaptionFont::Display),
+        "serif" | "italic" => Some(CaptionFont::Serif),
+        "mono" => Some(CaptionFont::Mono),
+        _ => None,
+    }
+}
+
+fn known_effect(word: &str) -> Option<CaptionEffect> {
+    match word {
+        "pop" | "slam" | "bounce" => Some(CaptionEffect::Pop),
+        "typewriter" | "type_on" | "type" | "karaoke" => Some(CaptionEffect::Typewriter),
+        "fade" | "vanish" | "fade_out" => Some(CaptionEffect::Fade),
+        "none" | "static" | "still" => Some(CaptionEffect::None),
+        _ => None,
+    }
+}
+
+impl Serialize for LineLook {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let count = usize::from(self.place.is_some())
+            + usize::from(self.font.is_some())
+            + usize::from(self.effect.is_some());
+        let mut map = serializer.serialize_map(Some(count))?;
+        if let Some(place) = self.place {
+            map.serialize_entry("place", place.as_str())?;
+        }
+        if let Some(font) = self.font {
+            map.serialize_entry("font", font.as_str())?;
+        }
+        if let Some(effect) = self.effect {
+            map.serialize_entry("effect", effect.as_str())?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for LineLook {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self::from_json(&value))
+    }
+}
+
+/// The mix for this video. Each key is optional. A missing key is filled from the line.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptionRecipe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<LineLook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub punch: Option<LineLook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<LineLook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<LineLook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<LineLook>,
+    /// Place used on a close face when that line would sit in the middle or the model set a place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_face: Option<CaptionPlace>,
+    /// Fills roles this recipe left empty. Not a menu the model has to pick from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<CaptionMood>,
+}
+
+impl CaptionRecipe {
+    /// True when the model named nothing.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.hook.is_none()
+            && self.punch.is_none()
+            && self.explain.is_none()
+            && self.question.is_none()
+            && self.number.is_none()
+            && self.on_face.is_none()
+            && self.base.is_none()
+    }
+
+    /// A JSON object, or a short note such as `hook top display typewriter`.
+    /// Unknown words are ignored. A note that names nothing returns `None`.
+    #[must_use]
+    pub fn from_loose(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if value.is_object() {
+                let recipe: Self = serde_json::from_value(value).ok()?;
+                return (!recipe.is_blank()).then_some(recipe);
+            }
+        }
+        let mut recipe = Self::default();
+        let mut any = false;
+        for clause in trimmed.split([',', ';']) {
+            let clause = clause.trim();
+            if clause.is_empty() {
+                continue;
+            }
+            if recipe.apply_clause(clause) {
+                any = true;
+            }
+        }
+        any.then_some(recipe)
+    }
+
+    /// One clause. A named role overrides only that role. No role overrides every role.
+    fn apply_clause(&mut self, raw: &str) -> bool {
+        let look = LineLook::parse(raw);
+        let mut roles = Vec::new();
+        let mut face = false;
+        for token in raw.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            match token.trim().to_ascii_lowercase().as_str() {
+                "hook" => roles.push("hook"),
+                "punch" | "punches" => roles.push("punch"),
+                "explain" | "explanation" => roles.push("explain"),
+                "question" | "questions" => roles.push("question"),
+                "number" | "numbers" => roles.push("number"),
+                "on_face" | "face" => face = true,
+                _ => {}
+            }
+        }
+        if look.place.is_none() && look.font.is_none() && look.effect.is_none() {
+            return false;
+        }
+        if face {
+            if let Some(place) = look.place {
+                self.on_face = Some(place);
+            }
+        }
+        if roles.is_empty() && !face {
+            self.hook = Some(look.clone());
+            self.punch = Some(look.clone());
+            self.explain = Some(look.clone());
+            self.question = Some(look.clone());
+            self.number = Some(look.clone());
+            if look.place.is_some() && self.on_face.is_none() {
+                self.on_face = Some(CaptionPlace::Lower);
+            }
+            return true;
+        }
+        for role in roles {
+            let slot = match role {
+                "hook" => &mut self.hook,
+                "punch" => &mut self.punch,
+                "explain" => &mut self.explain,
+                "question" => &mut self.question,
+                _ => &mut self.number,
+            };
+            *slot = Some(look.clone());
+        }
+        if look.place.is_some() && self.on_face.is_none() {
+            self.on_face = Some(CaptionPlace::Lower);
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CaptionCue {
     pub start: Time,
@@ -924,6 +1310,24 @@ pub struct CaptionCue {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>,
+    #[serde(default, skip_serializing_if = "is_bottom")]
+    pub place: CaptionPlace,
+    #[serde(default, skip_serializing_if = "is_sans")]
+    pub font: CaptionFont,
+    #[serde(default, skip_serializing_if = "is_still")]
+    pub effect: CaptionEffect,
+}
+
+fn is_bottom(place: &CaptionPlace) -> bool {
+    *place == CaptionPlace::Bottom
+}
+
+fn is_sans(font: &CaptionFont) -> bool {
+    *font == CaptionFont::Sans
+}
+
+fn is_still(effect: &CaptionEffect) -> bool {
+    *effect == CaptionEffect::None
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1124,7 +1528,10 @@ fn ramp_halves(look: &ClipLook, speed: f32, cut: f32) -> (ClipLook, f32, ClipLoo
             at: 0.0,
             speed: speed_on_keys(&keys, 0.0),
         }];
-        let mut right = vec![SpeedKey { at: 0.0, speed: mid }];
+        let mut right = vec![SpeedKey {
+            at: 0.0,
+            speed: mid,
+        }];
         for key in &keys {
             if key.at > 0.02 && key.at < cut - 0.02 {
                 left.push(SpeedKey {
@@ -1139,7 +1546,10 @@ fn ramp_halves(look: &ClipLook, speed: f32, cut: f32) -> (ClipLook, f32, ClipLoo
                 });
             }
         }
-        left.push(SpeedKey { at: 1.0, speed: mid });
+        left.push(SpeedKey {
+            at: 1.0,
+            speed: mid,
+        });
         right.push(SpeedKey {
             at: 1.0,
             speed: speed_on_keys(&keys, 1.0),
@@ -1456,7 +1866,9 @@ impl Timeline {
     }
 
     pub fn clip_at_any(&self, at: Time) -> Option<ClipId> {
-        self.tracks.iter().find_map(|track| self.clip_at(track.id, at))
+        self.tracks
+            .iter()
+            .find_map(|track| self.clip_at(track.id, at))
     }
 
     /// Join `clip_id` with the next clip on the same track if they touch and
@@ -1530,15 +1942,15 @@ impl Timeline {
             clip.look.transition = TransitionKind::Cut;
         }
         self.add_clip(track_id, new_clip)?;
-        let link = self
-            .find_clip(clip_id)
-            .and_then(|(_, c)| c.link_id);
+        let link = self.find_clip(clip_id).and_then(|(_, c)| c.link_id);
         if let Some(link) = link {
             let partners: Vec<ClipId> = self
                 .tracks
                 .iter()
                 .flat_map(|t| t.clips.iter())
-                .filter(|c| c.link_id == Some(link) && c.id != clip_id && c.id != right_id && c.contains(at))
+                .filter(|c| {
+                    c.link_id == Some(link) && c.id != clip_id && c.id != right_id && c.contains(at)
+                })
                 .map(|c| c.id)
                 .collect();
             for id in partners {

@@ -8,22 +8,21 @@ mod plan;
 mod registry;
 mod review;
 
-pub use intent::{asks_for_whole_piece, Intent, is_director_request, parse_intent};
-pub use mcp::{inspect_from_mcp, Inspect, McpCall, McpTool, mcp_tools, op_from_mcp};
-pub use plan::{build_plan, plan_from_value, revise_plan, SourceWindow};
-pub use ops::{
-    AppliedOp, AssembleItem, AssembleStyle, DesignLayout, Excerpt, ExportPreset, Op, OpError,
-    TimeRange,
-    TimelineEditMode, apply, asks_for_judgment, choose_piece, excerpts_for_request,
-    pick_reel_excerpts, revises_existing_cut, PiecePick, SourceBeat,
-};
-pub use oc_timeline::PlaceMode;
-pub use registry::{actions, modes, tool, tools, track_actions};
 pub use finish::{
     CoverShot, SpokenLine, already_finished, finish_reel, has_burnable_captions, mapped_cues,
-    program_clips, wants_picture_finish,
+    program_clips, redress_unset_captions, wants_picture_finish,
 };
-pub use review::{review_cut, review_with, CutReview, ReviewFacts, ShotNote, SourceSpan, Spoken};
+pub use intent::{Intent, asks_for_whole_piece, is_director_request, parse_intent};
+pub use mcp::{Inspect, McpCall, McpTool, inspect_from_mcp, mcp_tools, op_from_mcp};
+pub use oc_timeline::PlaceMode;
+pub use ops::{
+    AppliedOp, AssembleItem, AssembleStyle, DesignLayout, Excerpt, ExportPreset, Op, OpError,
+    PiecePick, SourceBeat, TimeRange, TimelineEditMode, apply, asks_for_judgment, choose_piece,
+    excerpts_for_request, pick_reel_excerpts, revises_existing_cut,
+};
+pub use plan::{SourceWindow, build_plan, cue_faces, plan_from_value, revise_plan};
+pub use registry::{actions, modes, tool, tools, track_actions};
+pub use review::{CutReview, ReviewFacts, ShotNote, SourceSpan, Spoken, review_cut, review_with};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

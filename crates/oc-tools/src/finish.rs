@@ -6,8 +6,8 @@
 use crate::ops::Op;
 use oc_time::{Duration, Time};
 use oc_timeline::{
-    AspectRatio, CaptionCue, CaptionStyle, Clip, ClipKind, Grade, MediaId, Timeline, TrackKind,
-    TransitionKind,
+    AspectRatio, CaptionCue, CaptionEffect, CaptionFont, CaptionMood, CaptionPlace, CaptionRecipe,
+    CaptionStyle, Clip, ClipKind, EditPlan, Grade, MediaId, Timeline, TrackKind, TransitionKind,
 };
 
 /// One spoken line in source time, used to lay captions on the cut.
@@ -44,14 +44,17 @@ pub fn wants_picture_finish(request: &str) -> bool {
     {
         return true;
     }
-    let shaping = t.contains("make") || t.contains("cut") || t.contains("edit") || t.contains("turn");
+    let shaping =
+        t.contains("make") || t.contains("cut") || t.contains("edit") || t.contains("turn");
     shaping && (t.contains("min") || t.contains(" sec") || t.contains("second"))
 }
 
 /// Grade already applied means the finish pass ran.
 #[must_use]
 pub fn already_finished(timeline: &Timeline) -> bool {
-    program_clips(timeline).iter().any(|c| !c.look.grade.is_identity())
+    program_clips(timeline)
+        .iter()
+        .any(|c| !c.look.grade.is_identity())
 }
 
 /// Ops that make a structural cut look finished. Empty when there is no picture.
@@ -143,8 +146,11 @@ pub fn finish_reel(
             duration: Duration::from_seconds(dur),
         });
     }
-    let cues = mapped_cues(&clips, lines);
+    let mut cues = mapped_cues(&clips, lines);
     if !cues.is_empty() {
+        let recipe = caption_mood_for(request).recipe();
+        let faces = vec![true; cues.len()];
+        oc_timeline::dress_cues(&mut cues, &recipe, &faces);
         ops.push(Op::AddCaptions {
             style: CaptionStyle::Stacked,
             cues,
@@ -160,6 +166,22 @@ struct Look {
     punch_scale: f32,
     moves: bool,
     vertical: bool,
+}
+
+fn caption_mood_for(request: &str) -> CaptionMood {
+    let text = request.to_ascii_lowercase();
+    if text.contains("interview") || text.contains("podcast") || text.contains("documentary") {
+        return CaptionMood::Clean;
+    }
+    if text.contains("hype")
+        || text.contains("tiktok")
+        || text.contains("reel")
+        || text.contains("ad")
+        || wants_vertical(request)
+    {
+        return CaptionMood::Kinetic;
+    }
+    CaptionMood::Clean
 }
 
 fn finish_look(request: &str) -> Look {
@@ -178,7 +200,10 @@ fn finish_look(request: &str) -> Look {
     if t.contains("ad") || t.contains("product") || t.contains("commercial") {
         return Look {
             grade: Grade::ad(),
-            fx: oc_timeline::Fx { vignette: 0.15, ..oc_timeline::Fx::default() },
+            fx: oc_timeline::Fx {
+                vignette: 0.15,
+                ..oc_timeline::Fx::default()
+            },
             punch: true,
             punch_scale: 1.08,
             moves: true,
@@ -198,7 +223,11 @@ fn finish_look(request: &str) -> Look {
     if t.contains("vlog") {
         return Look {
             grade: Grade::vlog(),
-            fx: oc_timeline::Fx { grain: 0.08, vignette: 0.2, blur: 0.0 },
+            fx: oc_timeline::Fx {
+                grain: 0.08,
+                vignette: 0.2,
+                blur: 0.0,
+            },
             punch: true,
             punch_scale: 1.1,
             moves: true,
@@ -222,6 +251,72 @@ fn wants_vertical(request: &str) -> bool {
         || t.contains("tiktok")
         || t.contains("vertical")
         || t.contains("9:16")
+}
+
+/// Captions saved before a look was chosen are still the default bottom bar.
+/// Dress those. A line that already has a place, a font, or an effect stays.
+#[must_use]
+pub fn redress_unset_captions(timeline: &mut Timeline) -> bool {
+    let recipe = recipe_for_timeline(timeline);
+    let mut changed = false;
+    for track in &mut timeline.tracks {
+        if track.kind != TrackKind::Caption || track.muted || track.hidden {
+            continue;
+        }
+        for clip in &mut track.clips {
+            if clip.disabled {
+                continue;
+            }
+            let ClipKind::Caption { cues, .. } = &mut clip.kind else {
+                continue;
+            };
+            if cues.is_empty() || !cues.iter().all(cue_is_unset) {
+                continue;
+            }
+            let faces = vec![true; cues.len()];
+            oc_timeline::dress_cues(cues, &recipe, &faces);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn cue_is_unset(cue: &CaptionCue) -> bool {
+    cue.place == CaptionPlace::Bottom
+        && cue.font == CaptionFont::Sans
+        && cue.effect == CaptionEffect::None
+}
+
+fn recipe_for_timeline(timeline: &Timeline) -> CaptionRecipe {
+    if let Some(plan) = &timeline.edit_plan {
+        if let Some(look) = &plan.caption_look {
+            let mut recipe = look.clone();
+            if recipe.base.is_none() {
+                recipe.base = Some(mood_for_plan(plan, timeline));
+            }
+            return recipe;
+        }
+        if let Some(mood) = plan.caption_mood {
+            return mood.recipe();
+        }
+        return mood_for_plan(plan, timeline).recipe();
+    }
+    if timeline.height > timeline.width {
+        CaptionMood::Kinetic.recipe()
+    } else {
+        CaptionMood::Clean.recipe()
+    }
+}
+
+fn mood_for_plan(plan: &EditPlan, timeline: &Timeline) -> CaptionMood {
+    if let Some(mood) = plan.caption_mood {
+        return mood;
+    }
+    match plan.aspect.to_ascii_lowercase().as_str() {
+        "vertical" | "9:16" | "reel" | "portrait" => CaptionMood::Kinetic,
+        "" if timeline.height > timeline.width => CaptionMood::Kinetic,
+        _ => CaptionMood::Clean,
+    }
 }
 
 /// True when a caption track already has words to burn.
@@ -283,7 +378,8 @@ pub(crate) fn pick_cover<'a>(covers: &'a [CoverShot], a: &Clip, b: &Clip) -> Opt
 }
 
 fn overlaps_any(start: f64, end: f64, used: &[(f64, f64)]) -> bool {
-    used.iter().any(|(a, b)| start < *b - 0.05 && end > *a + 0.05)
+    used.iter()
+        .any(|(a, b)| start < *b - 0.05 && end > *a + 0.05)
 }
 
 pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
@@ -298,7 +394,7 @@ pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
         let src_in = clip.source_in.as_seconds();
         let src_out = src_in + clip.duration.as_seconds() * speed;
         for line in lines.iter().filter(|l| l.media == media) {
-            if filler(&line.text) {
+            if is_filler(&line.text) {
                 continue;
             }
             let overlap_start = line.start.max(src_in);
@@ -313,6 +409,9 @@ pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
                 end: Time::from_seconds(tl1.max(tl0 + 0.3)),
                 text: line.text.clone(),
                 speaker: None,
+                place: Default::default(),
+                font: Default::default(),
+                effect: Default::default(),
             });
         }
     }
@@ -320,7 +419,7 @@ pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
     cues
 }
 
-fn filler(text: &str) -> bool {
+pub(crate) fn is_filler(text: &str) -> bool {
     let t = text.trim().to_ascii_lowercase();
     if t.is_empty() {
         return true;
@@ -397,11 +496,79 @@ mod tests {
                     end: Time::from_seconds(2.0),
                     text: "on screen".into(),
                     speaker: None,
+                    place: Default::default(),
+                    font: Default::default(),
+                    effect: Default::default(),
                 }],
             },
         )
         .unwrap();
         assert!(has_burnable_captions(&tl));
+    }
+
+    #[test]
+    fn unset_vertical_captions_take_different_places() {
+        let mut timeline = Timeline::new(oc_timeline::FrameRate::FPS_30, 1080, 1920);
+        let track = timeline
+            .first_track(TrackKind::Caption)
+            .expect("captions")
+            .id;
+        timeline
+            .add_clip(
+                track,
+                Clip {
+                    id: ClipId::new(),
+                    media_id: None,
+                    kind: ClipKind::Caption {
+                        style: CaptionStyle::Stacked,
+                        cues: vec![
+                            plain_cue(0.0, "the city opens up from here"),
+                            plain_cue(4.0, "food and refreshments are on the house"),
+                        ],
+                    },
+                    start: Time::ZERO,
+                    duration: Duration::from_seconds(8.0),
+                    source_in: Time::ZERO,
+                    speed: 1.0,
+                    group_id: None,
+                    link_id: None,
+                    disabled: false,
+                    look: ClipLook::default(),
+                },
+            )
+            .unwrap();
+        assert!(redress_unset_captions(&mut timeline));
+        let cues = caption_cues(&timeline);
+        assert_eq!(cues.len(), 2);
+        assert_ne!(cues[0].place, cues[1].place);
+        assert_ne!(cues[0].font, cues[1].font);
+        assert_ne!(cues[0].effect, CaptionEffect::None);
+        assert_ne!(cues[1].effect, CaptionEffect::None);
+        assert!(!redress_unset_captions(&mut timeline));
+    }
+
+    fn plain_cue(start: f64, text: &str) -> CaptionCue {
+        CaptionCue {
+            start: Time::from_seconds(start),
+            end: Time::from_seconds(start + 3.0),
+            text: text.into(),
+            speaker: None,
+            place: CaptionPlace::Bottom,
+            font: CaptionFont::Sans,
+            effect: CaptionEffect::None,
+        }
+    }
+
+    fn caption_cues(timeline: &Timeline) -> Vec<CaptionCue> {
+        timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find_map(|clip| match &clip.kind {
+                ClipKind::Caption { cues, .. } => Some(cues.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     #[test]
@@ -418,24 +585,40 @@ mod tests {
             text: "Here is the hook".into(),
         }];
         let ops = finish_reel(&timeline, &lines, &[], "Make a 1 min reel from this");
-        assert!(ops.iter().any(|op| matches!(op, Op::Reframe { aspect: AspectRatio::Vertical })));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            Op::Reframe {
+                aspect: AspectRatio::Vertical
+            }
+        )));
         assert!(ops.iter().any(|op| matches!(op, Op::SetGrade { .. })));
         assert!(ops.iter().any(|op| matches!(
             op,
             Op::SetTransform { scale, .. } if (*scale - 1.18).abs() < 0.01
         )));
         assert!(ops.iter().any(|op| matches!(op, Op::AddCaptions { .. })));
-        assert!(ops.iter().any(|op| matches!(op, Op::SetTransition { kind: TransitionKind::Dissolve, .. })));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            Op::SetTransition {
+                kind: TransitionKind::Dissolve,
+                ..
+            }
+        )));
     }
 
     #[test]
     fn interview_stays_flat_and_landscape() {
         let media = MediaId::new();
-        let timeline = tl(vec![video(media, 0.0, 6.0, 1.0), video(media, 6.0, 6.0, 20.0)]);
+        let timeline = tl(vec![
+            video(media, 0.0, 6.0, 1.0),
+            video(media, 6.0, 6.0, 20.0),
+        ]);
         let ops = finish_reel(&timeline, &[], &[], "cut an interview from this");
         assert!(ops.iter().all(|op| !matches!(op, Op::Reframe { .. })));
         assert!(ops.iter().all(|op| !matches!(op, Op::SetMove { .. })));
-        assert!(ops.iter().any(|op| matches!(op, Op::SetGrade { grade, .. } if grade.lut == oc_timeline::Lut::None)));
+        assert!(ops.iter().any(
+            |op| matches!(op, Op::SetGrade { grade, .. } if grade.lut == oc_timeline::Lut::None)
+        ));
     }
 
     #[test]
@@ -458,6 +641,9 @@ mod tests {
             end: 3.0,
         }];
         let ops = finish_reel(&timeline, &[], &covers, "cut a short");
-        assert!(ops.iter().any(|op| matches!(op, Op::Cover { media_id, .. } if *media_id == other)));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::Cover { media_id, .. } if *media_id == other))
+        );
     }
 }

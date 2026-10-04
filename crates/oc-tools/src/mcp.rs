@@ -1,13 +1,13 @@
 //! MCP tool list so any LLM provider can call the same edits as the UI.
 
+use crate::ToolGroup;
 use crate::ops::{AssembleItem, AssembleStyle, ExportPreset, Op, TimeRange, TimelineEditMode};
+use crate::registry::tools;
+use oc_time::{Duration, Time};
 use oc_timeline::{
     AlphaShape, AudioFx, CurvePoint, Curves, Fx, Generator, Grade, Graphic, GraphicKind, Lut,
     MaskShape, Mix, SpeedKey, TransitionKind,
 };
-use crate::registry::tools;
-use crate::ToolGroup;
-use oc_time::{Duration, Time};
 use oc_timeline::{ClipId, MediaId, TrackId, TrackKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,9 +32,15 @@ pub struct McpCall {
 pub enum Inspect {
     ListBin,
     ListTimeline,
-    GetMedia { media_id: MediaId },
-    ListCues { media_id: MediaId },
-    GetMusic { media_id: MediaId },
+    GetMedia {
+        media_id: MediaId,
+    },
+    ListCues {
+        media_id: MediaId,
+    },
+    GetMusic {
+        media_id: MediaId,
+    },
     FindShots {
         scale: Option<String>,
         camera: Option<String>,
@@ -60,8 +66,16 @@ pub fn inspect_from_mcp(call: &McpCall) -> Option<Inspect> {
             .ok()
             .map(|media_id| Inspect::GetMusic { media_id }),
         "find_shots" => Some(Inspect::FindShots {
-            scale: call.arguments.get("scale").and_then(Value::as_str).map(str::to_string),
-            camera: call.arguments.get("camera").and_then(Value::as_str).map(str::to_string),
+            scale: call
+                .arguments
+                .get("scale")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            camera: call
+                .arguments
+                .get("camera")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             motion_dir: call
                 .arguments
                 .get("motion_dir")
@@ -70,7 +84,11 @@ pub fn inspect_from_mcp(call: &McpCall) -> Option<Inspect> {
             min_quality: number(&call.arguments, "min_quality")
                 .ok()
                 .map(|n| n.clamp(1.0, 10.0) as u8),
-            subject: call.arguments.get("subject").and_then(Value::as_str).map(str::to_string),
+            subject: call
+                .arguments
+                .get("subject")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             limit: number(&call.arguments, "limit")
                 .ok()
                 .map(|n| n as usize)
@@ -360,8 +378,10 @@ pub fn mcp_tools() -> Vec<McpTool> {
             name: "submit_edit".into(),
             description: "Build the whole cut from a plan. Rust places the slots and snaps to the beat. \
                  It applies grade, fx, fades, cover, music volume, captions, and letterbox only when \
-                 you set them. Omit a field to leave that shot alone. Slots must sit on a real shot \
-                 or spoken line. A clean review queues the export."
+                 you set them. Omit a field to leave that shot alone. Mix the joins: omit transition \
+                 for a cut, and set a dissolve, wipe, or slide only on the slot that needs it. Leave \
+                 caption_look out; Rust styles each caption line from the words and the shot. Slots \
+                 must sit on a real shot or spoken line. A clean review queues the export."
                 .into(),
             input_schema: object(&[
                 ("style", str_prop("Note for yourself. It does not pick a look."), false),
@@ -370,11 +390,25 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 ("music_id", str_prop("Imported music file, when the piece needs a bed"), false),
                 ("music_volume", str_prop("0–1. Set below 1 to duck the bed under speech"), false),
                 ("captions", str_prop("true only when the words should be on screen"), false),
+                (
+                    "caption_mood",
+                    str_prop(
+                        "Omit. Shortcut only: clean, kinetic, or bold. Rust already styles each line.",
+                    ),
+                    false,
+                ),
+                (
+                    "caption_look",
+                    str_prop(
+                        "Omit this. Set one key only when that kind of line should differ. JSON string. Keys: hook, punch, explain, question, number, on_face. Example: {\"hook\":\"top display typewriter\"}. Any other key is chosen from the words and the shot.",
+                    ),
+                    false,
+                ),
                 ("grade", str_prop("Piece grade for slots that omit their own. Omit for no grade."), false),
                 (
                     "slots",
                     str_prop(
-                        "Array of {media_id, source_in, duration, transition?, speed?, end_scale?, grade?, fx?, fade_in?, fade_out?, cover?}",
+                        "Array of {media_id, source_in, duration, transition?, transition_duration?, speed?, end_scale?, grade?, fx?, fade_in?, fade_out?, cover?}. Omit transition for a cut. dissolve, fade_black, fade_white, wipe_left, slide_up on the slot that needs that join. end_scale about 1.08 is a push.",
                     ),
                     true,
                 ),
@@ -454,26 +488,43 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "add_captions".into(),
-            description: "Replace caption cues on the timeline.".into(),
-            input_schema: object(&[(
-                "cues",
+            description: "Replace caption cues. Omit caption_look and Rust styles each line from the words and the shot. Set caption_look only to override one kind of line. Set place, font, or effect on a cue only to lock that line.".into(),
+            input_schema: object(&[
                 (
-                    json!({
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start": { "type": "number" },
-                                "end": { "type": "number" },
-                                "text": { "type": "string" }
-                            },
-                            "required": ["start", "end", "text"]
-                        }
-                    }),
-                    "Caption cues",
+                    "caption_look",
+                    str_prop(
+                        "Omit. One key only, same as submit_edit caption_look. Wins over caption_mood.",
+                    ),
+                    false,
                 ),
-                true,
-            )]),
+                (
+                    "caption_mood",
+                    str_prop("Shortcut when caption_look is omitted: clean, kinetic, or bold. Default clean."),
+                    false,
+                ),
+                (
+                    "cues",
+                    (
+                        json!({
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "start": { "type": "number" },
+                                    "end": { "type": "number" },
+                                    "text": { "type": "string" },
+                                    "place": { "type": "string", "description": "bottom, lower, middle, top" },
+                                    "font": { "type": "string", "description": "sans, display, serif, mono" },
+                                    "effect": { "type": "string", "description": "pop, typewriter, fade, none" }
+                                },
+                                "required": ["start", "end", "text"]
+                            }
+                        }),
+                        "Caption cues",
+                    ),
+                    true,
+                ),
+            ]),
         },
         McpTool {
             name: "slip".into(),
@@ -924,26 +975,69 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
             amount: number(&call.arguments, "amount").unwrap_or(0.6) as f32,
         }),
         "add_captions" => {
-            let cues = call
+            let raw = call
                 .arguments
                 .get("cues")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let cues = cues
+            let recipe = caption_recipe(&call.arguments);
+            let mut cues = Vec::new();
+            let mut locked = Vec::new();
+            for cue in &raw {
+                let Some(start) = cue.get("start").and_then(Value::as_f64) else {
+                    continue;
+                };
+                let Some(end) = cue.get("end").and_then(Value::as_f64) else {
+                    continue;
+                };
+                let Some(text) = cue.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                locked.push(
+                    cue.get("place").is_some()
+                        || cue.get("font").is_some()
+                        || cue.get("effect").is_some(),
+                );
+                cues.push(oc_timeline::CaptionCue {
+                    start: Time::from_seconds(start),
+                    end: Time::from_seconds(end),
+                    text: text.to_string(),
+                    speaker: cue
+                        .get("speaker")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    place: cue
+                        .get("place")
+                        .and_then(Value::as_str)
+                        .map(oc_timeline::CaptionPlace::parse)
+                        .unwrap_or_default(),
+                    font: cue
+                        .get("font")
+                        .and_then(Value::as_str)
+                        .map(oc_timeline::CaptionFont::parse)
+                        .unwrap_or_default(),
+                    effect: cue
+                        .get("effect")
+                        .and_then(Value::as_str)
+                        .map(oc_timeline::CaptionEffect::parse)
+                        .unwrap_or_default(),
+                });
+            }
+            let fresh_at: Vec<usize> = locked
                 .iter()
-                .filter_map(|c| {
-                    Some(oc_timeline::CaptionCue {
-                        start: Time::from_seconds(c.get("start")?.as_f64()?),
-                        end: Time::from_seconds(c.get("end")?.as_f64()?),
-                        text: c.get("text")?.as_str()?.to_string(),
-                        speaker: c
-                            .get("speaker")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    })
-                })
+                .enumerate()
+                .filter(|(_, lock)| !**lock)
+                .map(|(index, _)| index)
                 .collect();
+            if !fresh_at.is_empty() {
+                let mut fresh: Vec<_> = fresh_at.iter().map(|index| cues[*index].clone()).collect();
+                let faces = vec![true; fresh.len()];
+                oc_timeline::dress_cues(&mut fresh, &recipe, &faces);
+                for (cue, index) in fresh.into_iter().zip(fresh_at) {
+                    cues[index] = cue;
+                }
+            }
             Ok(Op::AddCaptions {
                 style: oc_timeline::CaptionStyle::default(),
                 cues,
@@ -1288,11 +1382,7 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
     }
 }
 
-fn mcp_for_id(
-    id: crate::ToolId,
-    label: &'static str,
-    tip: &'static str,
-) -> Option<McpTool> {
+fn mcp_for_id(id: crate::ToolId, label: &'static str, tip: &'static str) -> Option<McpTool> {
     use crate::ToolId::*;
     let (name, schema) = match id {
         Split => (
@@ -1359,10 +1449,7 @@ fn mcp_for_id(
             object(&[("clip_id", str_prop("Any clip in the group"), true)]),
         ),
         Link => return None,
-        Unlink => (
-            "unlink",
-            object(&[("clip_id", str_prop("Clip id"), true)]),
-        ),
+        Unlink => ("unlink", object(&[("clip_id", str_prop("Clip id"), true)])),
         AddMarker => (
             "add_marker",
             object(&[
@@ -1382,6 +1469,30 @@ fn mcp_for_id(
     })
 }
 
+fn caption_recipe(arguments: &Value) -> oc_timeline::CaptionRecipe {
+    let mood = oc_timeline::CaptionMood::parse(
+        arguments
+            .get("caption_mood")
+            .and_then(Value::as_str)
+            .unwrap_or("clean"),
+    );
+    let parsed = arguments
+        .get("caption_look")
+        .and_then(|raw| match raw.as_str() {
+            Some(text) => oc_timeline::CaptionRecipe::from_loose(text),
+            None => serde_json::from_value(raw.clone()).ok(),
+        });
+    match parsed {
+        Some(mut recipe) if !recipe.is_blank() => {
+            if recipe.base.is_none() {
+                recipe.base = Some(mood);
+            }
+            recipe
+        }
+        _ => mood.recipe(),
+    }
+}
+
 fn object(fields: &[(&str, (Value, &str), bool)]) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
@@ -1399,11 +1510,17 @@ fn object(fields: &[(&str, (Value, &str), bool)]) -> Value {
 }
 
 fn str_prop(description: &str) -> (Value, &str) {
-    (json!({ "type": "string", "description": description }), description)
+    (
+        json!({ "type": "string", "description": description }),
+        description,
+    )
 }
 
 fn num_prop(description: &str) -> (Value, &str) {
-    (json!({ "type": "number", "description": description }), description)
+    (
+        json!({ "type": "number", "description": description }),
+        description,
+    )
 }
 
 fn clip_id(args: &Value, key: &str) -> Result<ClipId, String> {
@@ -1632,7 +1749,10 @@ mod parse_tests {
             name: "list_cues".into(),
             arguments: json!({ "media_id": "11111111-1111-1111-1111-111111111111" }),
         };
-        assert!(matches!(inspect_from_mcp(&call), Some(Inspect::ListCues { .. })));
+        assert!(matches!(
+            inspect_from_mcp(&call),
+            Some(Inspect::ListCues { .. })
+        ));
     }
 
     #[test]
@@ -1658,7 +1778,10 @@ mod parse_tests {
         .unwrap();
         assert!(matches!(
             inserted,
-            Op::PlaceMedia { mode: TimelineEditMode::Insert, .. }
+            Op::PlaceMedia {
+                mode: TimelineEditMode::Insert,
+                ..
+            }
         ));
         let overwritten = op_from_mcp(&McpCall {
             name: "overwrite".into(),
@@ -1667,7 +1790,10 @@ mod parse_tests {
         .unwrap();
         assert!(matches!(
             overwritten,
-            Op::PlaceMedia { mode: TimelineEditMode::Overwrite, .. }
+            Op::PlaceMedia {
+                mode: TimelineEditMode::Overwrite,
+                ..
+            }
         ));
         let jl = op_from_mcp(&McpCall {
             name: "jl_cut".into(),
@@ -1680,14 +1806,18 @@ mod parse_tests {
             arguments: json!({ "fps": 24 }),
         })
         .unwrap();
-        assert!(matches!(rate, Op::SetFrameRate { frame_rate } if frame_rate == oc_time::FrameRate::FPS_24));
+        assert!(
+            matches!(rate, Op::SetFrameRate { frame_rate } if frame_rate == oc_time::FrameRate::FPS_24)
+        );
         assert!(mcp_tools().iter().any(|tool| tool.name == "generate_broll"));
         assert!(mcp_tools().iter().any(|tool| tool.name == "add_design"));
-        assert!(op_from_mcp(&McpCall {
-            name: "add_design".into(),
-            arguments: json!({ "prompt": "a house", "at": 1.0 }),
-        })
-        .is_err());
+        assert!(
+            op_from_mcp(&McpCall {
+                name: "add_design".into(),
+                arguments: json!({ "prompt": "a house", "at": 1.0 }),
+            })
+            .is_err()
+        );
         assert!(mcp_tools().iter().any(|tool| tool.name == "import_cube"));
     }
 }

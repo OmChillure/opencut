@@ -2,11 +2,11 @@
 //! Rust then grades, covers jumps, lays music, and writes captions.
 
 use crate::finish::{self, CoverShot, SpokenLine};
-use crate::ops::{apply, Op};
+use crate::ops::{Op, apply};
 use oc_time::{Duration, Time};
 use oc_timeline::{
-    AspectRatio, CaptionStyle, Clip, ClipKind, EditPlan, EditSlot, MediaId, Timeline, TrackKind,
-    TransitionKind, UndoStack,
+    AspectRatio, CaptionCue, CaptionMood, CaptionStyle, Clip, ClipKind, EditPlan, EditSlot,
+    MediaId, Timeline, TrackKind, TransitionKind, UndoStack,
 };
 
 #[derive(Clone, Debug)]
@@ -17,6 +17,8 @@ pub struct SourceWindow {
     pub duration: f64,
     /// Shot look from the analysis (`dark`, `wide`, `close`, …). Empty when unknown.
     pub look: String,
+    /// What is in frame (`person`, `product`, …). Empty when unknown.
+    pub subject: String,
     /// True when this window has no speech. Used to cover a jump.
     pub silent: bool,
 }
@@ -24,16 +26,49 @@ pub struct SourceWindow {
 pub fn plan_from_value(value: &serde_json::Value) -> Result<EditPlan, String> {
     let mut value = value.clone();
     if let Some(obj) = value.as_object_mut() {
+        if let Some(raw) = obj.get("caption_mood").and_then(|v| v.as_str()) {
+            if raw.trim().is_empty() {
+                obj.remove("caption_mood");
+            } else {
+                obj.insert(
+                    "caption_mood".into(),
+                    serde_json::Value::String(CaptionMood::parse(raw).as_str().into()),
+                );
+            }
+        }
+        if let Some(raw) = obj.get("caption_look").cloned() {
+            match stored_caption_look(&raw) {
+                Some(parsed) => {
+                    obj.insert("caption_look".into(), parsed);
+                }
+                None => {
+                    obj.remove("caption_look");
+                }
+            }
+        }
         for key in ["slots", "grade", "changes"] {
             let Some(raw) = obj.get(key).and_then(|v| v.as_str()) else {
                 continue;
             };
-            let parsed: serde_json::Value = serde_json::from_str(raw)
-                .map_err(|e| format!("submit_edit {key}: {e}"))?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(raw).map_err(|e| format!("submit_edit {key}: {e}"))?;
             obj.insert(key.to_string(), parsed);
         }
     }
     serde_json::from_value(value).map_err(|e| format!("submit_edit: {e}"))
+}
+
+/// A caption note the model bothered to send. Prose that names nothing is dropped.
+fn stored_caption_look(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let recipe = if let Some(raw) = value.as_str() {
+        oc_timeline::CaptionRecipe::from_loose(raw)
+    } else if value.is_object() {
+        serde_json::from_value(value.clone()).ok()
+    } else {
+        None
+    };
+    let recipe = recipe.filter(|recipe| !recipe.is_blank());
+    recipe.and_then(|recipe| serde_json::to_value(recipe).ok())
 }
 
 pub fn build_plan(
@@ -45,6 +80,7 @@ pub fn build_plan(
     covers: &[CoverShot],
 ) -> Result<Vec<String>, String> {
     check_slots(&plan.slots, windows)?;
+    let slots = seated_slots(&plan.slots, windows, lines);
     let (kept_clips, kept_looks) = snapshot_layers(timeline);
     let mut undo = UndoStack::new();
     let mut notes = Vec::new();
@@ -52,7 +88,7 @@ pub fn build_plan(
     notes.push(cleared.note);
     let mut at = 0.0;
     let mut ids = Vec::new();
-    for slot in &plan.slots {
+    for slot in &slots {
         let placed = apply(
             timeline,
             &mut undo,
@@ -124,7 +160,9 @@ pub fn build_plan(
             .map_err(err)?;
         }
     }
-    notes.extend(finish_picture(timeline, &mut undo, plan, &ids, lines, covers)?);
+    notes.extend(finish_picture(
+        timeline, &mut undo, plan, &ids, windows, lines, covers,
+    )?);
     restore_layers(timeline, kept_clips, &kept_looks);
     timeline.edit_plan = Some(plan.clone());
     Ok(notes)
@@ -273,9 +311,7 @@ fn plan_cover_already(kept: &KeptClip, timeline: &Timeline) -> bool {
         .iter()
         .filter(|track| track.name == "GFX")
         .flat_map(|track| track.clips.iter())
-        .any(|clip| {
-            clip.media_id == Some(media) && (clip.source_in.as_seconds() - src).abs() < 0.3
-        })
+        .any(|clip| clip.media_id == Some(media) && (clip.source_in.as_seconds() - src).abs() < 0.3)
 }
 
 fn ensure_named(timeline: &mut Timeline, kind: TrackKind, name: &str) -> oc_timeline::TrackId {
@@ -294,15 +330,24 @@ fn finish_picture(
     undo: &mut UndoStack,
     plan: &EditPlan,
     ids: &[(oc_timeline::ClipId, EditSlot)],
+    windows: &[SourceWindow],
     lines: &[SpokenLine],
     covers: &[CoverShot],
 ) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     let mut graded = 0;
-    for (id, slot) in ids {
-        let grade = slot.grade.unwrap_or(plan.grade);
+    for (index, (id, slot)) in ids.iter().enumerate() {
+        let grade = grade_for_slot(slot, plan.grade, windows, index);
         if !grade.is_identity() {
-            apply(timeline, undo, Op::SetGrade { clip_id: *id, grade }).map_err(err)?;
+            apply(
+                timeline,
+                undo,
+                Op::SetGrade {
+                    clip_id: *id,
+                    grade,
+                },
+            )
+            .map_err(err)?;
             graded += 1;
         }
         if let Some(fx) = slot.fx {
@@ -334,9 +379,13 @@ fn finish_picture(
         if slot.cover != Some(true) {
             continue;
         }
-        let Some((_, clip)) = timeline.find_clip(*id) else { continue };
+        let Some((_, clip)) = timeline.find_clip(*id) else {
+            continue;
+        };
         let clip = clip.clone();
-        let Some((_, prev)) = timeline.find_clip(ids[index - 1].0) else { continue };
+        let Some((_, prev)) = timeline.find_clip(ids[index - 1].0) else {
+            continue;
+        };
         let prev = prev.clone();
         let Some(cover) = finish::pick_cover(covers, &prev, &clip) else {
             notes.push(format!("slot {index} asked for a cover and none was free"));
@@ -388,12 +437,20 @@ fn finish_picture(
             .map_err(err)?;
             notes.push(placed.note);
             if let Some(volume) = plan.music_volume {
-                if let Some(clip) = timeline.tracks.iter().flat_map(|t| t.clips.iter()).rev().find(|c| {
-                    c.media_id == Some(music) && matches!(c.kind, ClipKind::Audio { .. })
-                }) {
+                if let Some(clip) = timeline
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.clips.iter())
+                    .rev()
+                    .find(|c| c.media_id == Some(music) && matches!(c.kind, ClipKind::Audio { .. }))
+                {
                     let id = clip.id;
                     if let Some(clip) = timeline.clip_mut(id) {
-                        if let ClipKind::Audio { volume: level, ducked } = &mut clip.kind {
+                        if let ClipKind::Audio {
+                            volume: level,
+                            ducked,
+                        } = &mut clip.kind
+                        {
                             *level = volume.clamp(0.0, 1.0);
                             *ducked = volume < 0.99;
                         }
@@ -405,8 +462,12 @@ fn finish_picture(
     }
 
     if plan.captions || !lines.is_empty() {
-        let cues = finish::mapped_cues(&finish::program_clips(timeline), lines);
+        let mut cues = finish::mapped_cues(&finish::program_clips(timeline), lines);
         if !cues.is_empty() {
+            let recipe = caption_recipe(plan);
+            let clips = finish::program_clips(timeline);
+            let faces = cue_faces(&clips, windows, &cues);
+            oc_timeline::dress_cues(&mut cues, &recipe, &faces);
             let added = apply(
                 timeline,
                 undo,
@@ -417,6 +478,12 @@ fn finish_picture(
             )
             .map_err(err)?;
             notes.push(added.note);
+            let label = if plan.caption_look.is_some() {
+                "custom"
+            } else {
+                caption_mood(plan).as_str()
+            };
+            notes.push(format!("captions {label}"));
         }
     }
 
@@ -429,6 +496,65 @@ fn finish_picture(
         notes.push("letterbox on".into());
     }
     Ok(notes)
+}
+
+fn caption_mood(plan: &EditPlan) -> CaptionMood {
+    if let Some(mood) = plan.caption_mood {
+        return mood;
+    }
+    match plan.aspect.to_ascii_lowercase().as_str() {
+        "vertical" | "9:16" | "reel" | "portrait" => CaptionMood::Kinetic,
+        _ => CaptionMood::Clean,
+    }
+}
+
+/// The mix for this cut. A composed look wins. A named mood only fills empty roles.
+fn caption_recipe(plan: &EditPlan) -> oc_timeline::CaptionRecipe {
+    if let Some(look) = &plan.caption_look {
+        let mut recipe = look.clone();
+        if recipe.base.is_none() {
+            recipe.base = Some(caption_mood(plan));
+        }
+        return recipe;
+    }
+    caption_mood(plan).recipe()
+}
+
+/// True when the picture under that cue is a close person. Unknown stays true.
+#[must_use]
+pub fn cue_faces(clips: &[&Clip], windows: &[SourceWindow], cues: &[CaptionCue]) -> Vec<bool> {
+    cues.iter()
+        .map(|cue| face_at(clips, windows, cue.start.as_seconds()))
+        .collect()
+}
+
+fn face_at(clips: &[&Clip], windows: &[SourceWindow], at: f64) -> bool {
+    let Some(clip) = clips.iter().find(|clip| {
+        let start = clip.start.as_seconds();
+        let end = clip.end().as_seconds();
+        at >= start - 0.02 && at < end - 0.02
+    }) else {
+        return true;
+    };
+    let Some(media) = clip.media_id else {
+        return true;
+    };
+    let speed = if clip.speed.is_finite() && clip.speed > 0.0 {
+        f64::from(clip.speed)
+    } else {
+        1.0
+    };
+    let src = clip.source_in.as_seconds() + (at - clip.start.as_seconds()).max(0.0) * speed;
+    let hit = windows.iter().find(|window| {
+        window.media == media
+            && window.end > window.start + 0.05
+            && src >= window.start - 0.05
+            && src < window.end + 0.05
+    });
+    match hit {
+        Some(window) => oc_timeline::shot_is_face(&window.look, &window.subject),
+        None => true,
+    }
 }
 
 fn aspect_of(plan: &EditPlan) -> Option<AspectRatio> {
@@ -445,7 +571,8 @@ pub fn revise_plan(plan: &EditPlan, changes: &[serde_json::Value]) -> Result<Edi
         let index = change
             .get("slot")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| "revise_edit change needs slot".to_string())? as usize;
+            .ok_or_else(|| "revise_edit change needs slot".to_string())?
+            as usize;
         let slot = next
             .slots
             .get_mut(index)
@@ -496,6 +623,19 @@ pub fn revise_plan(plan: &EditPlan, changes: &[serde_json::Value]) -> Result<Edi
         if let Some(v) = change.get("captions").and_then(|v| v.as_bool()) {
             next.captions = v;
         }
+        if let Some(v) = change.get("caption_mood").and_then(|v| v.as_str()) {
+            next.caption_mood = Some(CaptionMood::parse(v));
+        }
+        if let Some(v) = change.get("caption_look") {
+            let recipe = if let Some(raw) = v.as_str() {
+                oc_timeline::CaptionRecipe::from_loose(raw)
+            } else {
+                serde_json::from_value(v.clone()).ok()
+            };
+            if let Some(recipe) = recipe.filter(|recipe| !recipe.is_blank()) {
+                next.caption_look = Some(recipe);
+            }
+        }
         if let Some(v) = change.get("letterbox").and_then(|v| v.as_bool()) {
             next.letterbox = v;
         }
@@ -513,7 +653,10 @@ fn check_slots(slots: &[EditSlot], windows: &[SourceWindow]) -> Result<(), Strin
     }
     let mut bad = Vec::new();
     for (index, slot) in slots.iter().enumerate() {
-        let rows: Vec<_> = windows.iter().filter(|w| w.media == slot.media_id).collect();
+        let rows: Vec<_> = windows
+            .iter()
+            .filter(|w| w.media == slot.media_id)
+            .collect();
         if rows.is_empty() {
             bad.push(format!("slot {index} uses a file that is not in the bin"));
             continue;
@@ -528,9 +671,9 @@ fn check_slots(slots: &[EditSlot], windows: &[SourceWindow]) -> Result<(), Strin
         }
         let known_shots = rows.iter().any(|w| w.end > w.start + 0.05);
         if known_shots {
-            let inside = rows.iter().any(|w| {
-                slot.source_in + 0.05 >= w.start - 0.15 && slot.source_in <= w.end + 0.15
-            });
+            let inside = rows
+                .iter()
+                .any(|w| slot.source_in + 0.05 >= w.start - 0.15 && slot.source_in <= w.end + 0.15);
             if !inside {
                 bad.push(format!(
                     "slot {index} source {:.2}s is not on a shot or a spoken line",
@@ -561,6 +704,184 @@ fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn seated_slots(
+    slots: &[EditSlot],
+    windows: &[SourceWindow],
+    lines: &[SpokenLine],
+) -> Vec<EditSlot> {
+    let mut seated = slots.to_vec();
+    for slot in &mut seated {
+        let file_end = windows
+            .iter()
+            .filter(|window| window.media == slot.media_id)
+            .map(|window| window.duration)
+            .fold(0.0, f64::max);
+        seat_on_speech(slot, lines, file_end);
+    }
+    seated
+}
+
+/// Pull a talking slot onto the lines it actually uses.
+/// A chopped last word is extended. A tail into the next sentence, or dead air, is cut.
+/// A silent slot is left where the model put it.
+fn seat_on_speech(slot: &mut EditSlot, lines: &[SpokenLine], file_end: f64) {
+    let speed = slot
+        .speed
+        .filter(|speed| speed.is_finite() && *speed > 0.05)
+        .map(f64::from)
+        .unwrap_or(1.0);
+    let src_in = slot.source_in.max(0.0);
+    let src_out = src_in + slot.duration.max(0.2) * speed;
+    let mut same: Vec<&SpokenLine> = lines
+        .iter()
+        .filter(|line| {
+            line.media == slot.media_id
+                && line.end > line.start + 0.05
+                && !crate::finish::is_filler(&line.text)
+        })
+        .collect();
+    same.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let kept: Vec<&&SpokenLine> = same
+        .iter()
+        .filter(|line| speech_kept(line.start, line.end, src_in, src_out))
+        .collect();
+    let Some(first) = kept.first().copied() else {
+        return;
+    };
+    let last = *kept.last().expect("kept");
+    let prev_end = same
+        .iter()
+        .rev()
+        .find(|line| line.end <= first.start + 0.02)
+        .map(|line| line.end);
+    let gap_before = prev_end.map(|end| first.start - end).unwrap_or(1.0);
+    let preroll = if gap_before >= 0.12 {
+        0.08_f64.min(gap_before * 0.5)
+    } else {
+        0.0
+    };
+    let mut new_in = (first.start - preroll).max(0.0);
+    let earliest = (src_in - 0.45).max(0.0);
+    if new_in < earliest {
+        new_in = earliest;
+    }
+    let next_start = same
+        .iter()
+        .find(|line| line.start >= last.end - 0.02)
+        .map(|line| line.start);
+    let gap_after = next_start.map(|start| start - last.end).unwrap_or(1.0);
+    let tail = if gap_after < 0.12 {
+        0.0
+    } else {
+        0.22_f64.min(gap_after * 0.5)
+    };
+    let mut new_out = last.end + tail;
+    if new_out > src_out + 0.45 {
+        new_out = src_out + 0.45;
+    }
+    if file_end > 0.2 {
+        new_out = new_out.min(file_end);
+        new_in = new_in.min((file_end - 0.4).max(0.0));
+    }
+    if new_out < new_in + 0.4 || new_in > last.end - 0.3 {
+        return;
+    }
+    let speech_tail = (new_out - last.end).max(0.0);
+    if let Some(fade) = slot.fade_out {
+        if fade > speech_tail + 0.02 {
+            slot.fade_out = (speech_tail >= 0.05).then_some(speech_tail);
+        }
+    }
+    slot.source_in = new_in;
+    slot.duration = (new_out - new_in) / speed;
+}
+
+fn speech_kept(start: f64, end: f64, src_in: f64, src_out: f64) -> bool {
+    let overlap = (end.min(src_out) - start.max(src_in)).max(0.0);
+    if overlap < 0.28 {
+        return false;
+    }
+    let line_len = (end - start).max(0.05);
+    let slot_len = (src_out - src_in).max(0.05);
+    overlap >= line_len * 0.55 || overlap >= slot_len * 0.55
+}
+
+fn grade_for_slot(
+    slot: &EditSlot,
+    shared: oc_timeline::Grade,
+    windows: &[SourceWindow],
+    index: usize,
+) -> oc_timeline::Grade {
+    if let Some(grade) = slot.grade {
+        return grade;
+    }
+    tune_shared_film(shared, &look_at_slot(slot, windows), index)
+}
+
+/// A shared film grade with no saturation of its own was greying flat phone footage.
+/// Flat shots get their color back and alternate warm / teal-orange. A rich shot keeps film.
+/// An explicit slot grade, including mono, is left alone.
+fn tune_shared_film(mut grade: oc_timeline::Grade, look: &str, index: usize) -> oc_timeline::Grade {
+    if grade.lut != oc_timeline::Lut::Film || grade.saturation.abs() > 0.04 || grade.cube.is_some()
+    {
+        return grade;
+    }
+    if look_is_flat(look) {
+        grade.saturation = 0.9;
+        if grade.contrast < 0.08 {
+            grade.contrast = 0.08;
+        }
+        grade.lut = if index % 2 == 0 {
+            oc_timeline::Lut::Warm
+        } else {
+            oc_timeline::Lut::TealOrange
+        };
+    } else {
+        grade.saturation = (grade.saturation + 0.12).clamp(-0.2, 0.6);
+        if grade.temperature.abs() < 0.02 {
+            grade.temperature = 0.03;
+        }
+    }
+    grade
+}
+
+fn look_at_slot(slot: &EditSlot, windows: &[SourceWindow]) -> String {
+    let src_in = slot.source_in.max(0.0);
+    let src_out = src_in + slot.duration.max(0.2);
+    let mut best: Option<(&SourceWindow, f64)> = None;
+    for window in windows.iter().filter(|window| {
+        window.media == slot.media_id && window.end > window.start + 0.05
+    }) {
+        let overlap = (window.end.min(src_out) - window.start.max(src_in)).max(0.0);
+        if overlap <= 0.0 {
+            continue;
+        }
+        if best.map(|(_, have)| overlap > have).unwrap_or(true) {
+            best = Some((window, overlap));
+        }
+    }
+    best.map(|(window, _)| window.look.clone())
+        .unwrap_or_default()
+}
+
+fn look_is_flat(look: &str) -> bool {
+    let look = look.trim().to_ascii_lowercase();
+    if look.is_empty() {
+        return true;
+    }
+    !(look.contains("bright")
+        || look.contains("landscape")
+        || look.contains("action")
+        || look.contains("graphic")
+        || look.contains("color")
+        || look.contains("outdoor")
+        || look.contains("street"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +894,7 @@ mod tests {
             end,
             duration: 80.0,
             look: look.into(),
+            subject: String::new(),
             silent,
         }
     }
@@ -619,6 +941,8 @@ mod tests {
             music_id: Some(music),
             music_volume: Some(0.4),
             captions: true,
+            caption_mood: None,
+            caption_look: None,
             grade: Grade::default(),
             slots: vec![first, second],
         };
@@ -656,7 +980,10 @@ mod tests {
         assert!(pictures[0].look.fade_in.as_seconds() > 0.0);
         assert_eq!(pictures[1].look.fade_in.as_seconds(), 0.0);
         assert!(pictures[1].look.transition == TransitionKind::Dissolve);
-        let cover = timeline.tracks.iter().any(|t| t.name == "GFX" && !t.clips.is_empty());
+        let cover = timeline
+            .tracks
+            .iter()
+            .any(|t| t.name == "GFX" && !t.clips.is_empty());
         assert!(cover, "{joined}");
         let ducked = timeline.tracks.iter().any(|t| {
             t.kind == TrackKind::Audio
@@ -741,6 +1068,8 @@ mod tests {
             music_id: None,
             music_volume: None,
             captions: false,
+            caption_mood: None,
+            caption_look: None,
             grade: Grade::default(),
             slots: vec![slot(picture, 2.0)],
         };
@@ -752,7 +1081,10 @@ mod tests {
             .find(|track| track.name == "Design")
             .expect("design track");
         assert!(
-            design.clips.iter().any(|clip| clip.media_id == Some(design_media)),
+            design
+                .clips
+                .iter()
+                .any(|clip| clip.media_id == Some(design_media)),
             "design survives the rebuild"
         );
         let program = timeline
@@ -778,6 +1110,8 @@ mod tests {
             music_id: None,
             music_volume: None,
             captions: false,
+            caption_mood: None,
+            caption_look: None,
             grade: Grade::default(),
             slots: vec![slot(picture, 2.0)],
         };
@@ -796,5 +1130,381 @@ mod tests {
             })
         });
         assert!(captioned);
+    }
+
+    #[test]
+    fn kinetic_words_follow_the_shot() {
+        let picture = MediaId::new();
+        let mut timeline = Timeline::default();
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: "vertical".into(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: true,
+            caption_mood: Some(CaptionMood::Kinetic),
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![slot(picture, 2.0), slot(picture, 40.0)],
+        };
+        let lines = vec![
+            SpokenLine {
+                media: picture,
+                start: 2.2,
+                end: 4.0,
+                text: "Go now".into(),
+            },
+            SpokenLine {
+                media: picture,
+                start: 40.2,
+                end: 43.0,
+                text: "Go now".into(),
+            },
+        ];
+        let mut wide = window(picture, 0.0, 10.0, "bright-wide", false);
+        wide.subject = "street".into();
+        let mut close = window(picture, 38.0, 50.0, "close", false);
+        close.subject = "person".into();
+        build_plan(&mut timeline, &plan, &[wide, close], &[], &lines, &[]).unwrap();
+        let cues = timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find_map(|clip| match &clip.kind {
+                ClipKind::Caption { cues, .. } => Some(cues.clone()),
+                _ => None,
+            })
+            .expect("captions");
+        assert_eq!(cues.len(), 2, "{cues:?}");
+        assert_eq!(cues[0].place, oc_timeline::CaptionPlace::Middle);
+        assert_eq!(cues[0].font, oc_timeline::CaptionFont::Display);
+        assert_eq!(cues[0].effect, oc_timeline::CaptionEffect::Typewriter);
+        assert_eq!(cues[1].place, oc_timeline::CaptionPlace::Lower);
+        assert_eq!(cues[1].font, oc_timeline::CaptionFont::Display);
+    }
+
+    #[test]
+    fn a_caption_look_overrides_the_named_mood() {
+        let picture = MediaId::new();
+        let mut timeline = Timeline::default();
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: true,
+            caption_mood: Some(CaptionMood::Clean),
+            caption_look: Some(oc_timeline::CaptionRecipe {
+                punch: Some(oc_timeline::LineLook::parse("top serif fade")),
+                on_face: Some(oc_timeline::CaptionPlace::Lower),
+                ..oc_timeline::CaptionRecipe::default()
+            }),
+            grade: Grade::default(),
+            slots: vec![slot(picture, 2.0)],
+        };
+        let lines = vec![SpokenLine {
+            media: picture,
+            start: 2.2,
+            end: 4.0,
+            text: "Go now".into(),
+        }];
+        let mut wide = window(picture, 0.0, 10.0, "bright-wide", false);
+        wide.subject = "street".into();
+        let notes = build_plan(&mut timeline, &plan, &[wide], &[], &lines, &[]).unwrap();
+        assert!(notes.iter().any(|note| note == "captions custom"));
+        let cue = timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find_map(|clip| match &clip.kind {
+                ClipKind::Caption { cues, .. } => cues.first().cloned(),
+                _ => None,
+            })
+            .expect("caption");
+        assert_eq!(cue.place, oc_timeline::CaptionPlace::Top);
+        assert_eq!(cue.font, oc_timeline::CaptionFont::Serif);
+        assert_eq!(cue.effect, oc_timeline::CaptionEffect::Fade);
+    }
+
+    #[test]
+    fn caption_look_arrives_as_a_json_string() {
+        let media = MediaId::new();
+        let raw = serde_json::json!({
+            "captions": true,
+            "caption_look": r#"{"punch":"top serif fade","on_face":"lower"}"#,
+            "slots": [{
+                "media_id": media.to_string(),
+                "source_in": 0.0,
+                "duration": 2.0
+            }]
+        });
+        let plan = plan_from_value(&raw).unwrap();
+        let look = plan.caption_look.expect("look");
+        let punch = look.punch.expect("punch");
+        assert_eq!(punch.place, Some(oc_timeline::CaptionPlace::Top));
+        assert_eq!(punch.font, Some(oc_timeline::CaptionFont::Serif));
+        assert_eq!(punch.effect, Some(oc_timeline::CaptionEffect::Fade));
+        assert_eq!(look.on_face, Some(oc_timeline::CaptionPlace::Lower));
+        assert!(plan.caption_mood.is_none());
+    }
+
+    #[test]
+    fn revise_plan_accepts_a_caption_look_string() {
+        let picture = MediaId::new();
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: true,
+            caption_mood: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![slot(picture, 2.0)],
+        };
+        let change = serde_json::json!({
+            "slot": 0,
+            "caption_look": r#"{"question":"middle serif fade"}"#
+        });
+        let next = revise_plan(&plan, &[change]).unwrap();
+        let question = next.caption_look.expect("look").question.expect("question");
+        assert_eq!(question.place, Some(oc_timeline::CaptionPlace::Middle));
+        assert_eq!(question.font, Some(oc_timeline::CaptionFont::Serif));
+        assert_eq!(question.effect, Some(oc_timeline::CaptionEffect::Fade));
+    }
+
+    #[test]
+    fn a_caption_note_that_names_nothing_is_dropped() {
+        let media = MediaId::new();
+        let raw = serde_json::json!({
+            "captions": true,
+            "aspect": "vertical",
+            "caption_look": "make it funky",
+            "slots": [{
+                "media_id": media.to_string(),
+                "source_in": 0.0,
+                "duration": 2.0
+            }]
+        });
+        let plan = plan_from_value(&raw).unwrap();
+        assert!(plan.caption_look.is_none());
+        assert!(plan.captions);
+    }
+
+    #[test]
+    fn one_caption_key_leaves_the_other_lines_to_the_shot() {
+        let picture = MediaId::new();
+        let mut timeline = Timeline::default();
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: "vertical".into(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: true,
+            caption_mood: None,
+            caption_look: oc_timeline::CaptionRecipe::from_loose("hook top display typewriter"),
+            grade: Grade::default(),
+            slots: vec![slot(picture, 2.0), slot(picture, 40.0)],
+        };
+        let lines = vec![
+            SpokenLine {
+                media: picture,
+                start: 2.2,
+                end: 4.0,
+                text: "Go now".into(),
+            },
+            SpokenLine {
+                media: picture,
+                start: 40.2,
+                end: 44.0,
+                text: "the city opens up from here".into(),
+            },
+        ];
+        let mut wide = window(picture, 0.0, 10.0, "bright-wide", false);
+        wide.subject = "street".into();
+        let mut later = window(picture, 38.0, 50.0, "bright-wide", false);
+        later.subject = "street".into();
+        build_plan(&mut timeline, &plan, &[wide, later], &[], &lines, &[]).unwrap();
+        let cues = timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find_map(|clip| match &clip.kind {
+                ClipKind::Caption { cues, .. } => Some(cues.clone()),
+                _ => None,
+            })
+            .expect("captions");
+        assert_eq!(cues.len(), 2, "{cues:?}");
+        assert_eq!(cues[0].place, oc_timeline::CaptionPlace::Top);
+        assert_eq!(cues[0].font, oc_timeline::CaptionFont::Display);
+        assert_eq!(cues[0].effect, oc_timeline::CaptionEffect::Typewriter);
+        assert_eq!(cues[1].place, oc_timeline::CaptionPlace::Lower);
+        assert_eq!(cues[1].font, oc_timeline::CaptionFont::Serif);
+        assert_eq!(cues[1].effect, oc_timeline::CaptionEffect::Fade);
+        assert_ne!(cues[0].place, cues[1].place);
+    }
+
+    #[test]
+    fn a_talking_slot_keeps_the_last_word_and_drops_the_next_sentence() {
+        let happen = MediaId::new();
+        let projects = MediaId::new();
+        let food = MediaId::new();
+        let closer = MediaId::new();
+        let quiet = MediaId::new();
+        let mut chopped = slot(happen, 0.0);
+        chopped.duration = 3.58;
+        let mut nibble = slot(projects, 3.92);
+        nibble.duration = 5.15;
+        let mut house = slot(food, 11.48);
+        house.duration = 5.97;
+        let mut ending = slot(closer, 4.82);
+        ending.duration = 3.08;
+        ending.fade_out = Some(0.55);
+        let mut silent = slot(quiet, 30.0);
+        silent.duration = 4.0;
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![chopped, nibble, house, ending, silent],
+        };
+        let lines = vec![
+            line(happen, 0.0, 3.60, "now is your time to make it happen"),
+            line(projects, 4.0, 9.0, "where you will build projects"),
+            line(projects, 9.0, 12.0, "and build using git and github"),
+            line(food, 8.0, 11.52, "from an external sponsor"),
+            line(food, 11.52, 13.68, "arduino kits for the winners"),
+            line(food, 13.68, 17.54, "food and refreshments are on the house"),
+            line(food, 17.54, 20.0, "the next sentence starts here"),
+            line(closer, 2.0, 4.80, "hurry up and register now"),
+            line(closer, 5.22, 7.46, "see you all at the campus"),
+        ];
+        let windows = vec![
+            window(happen, 0.0, 40.0, "interior", false),
+            window(projects, 0.0, 40.0, "interior", false),
+            window(food, 0.0, 40.0, "interior", false),
+            window(closer, 0.0, 40.0, "interior", false),
+            window(quiet, 0.0, 40.0, "wide", true),
+        ];
+        let mut timeline = Timeline::default();
+        build_plan(&mut timeline, &plan, &windows, &[], &lines, &[]).unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 5);
+        assert!(near(pictures[0].source_in.as_seconds(), 0.0), "{pictures:?}");
+        assert!(
+            near(pictures[0].source_out().as_seconds(), 3.82),
+            "last word kept {:?}",
+            pictures[0].source_out().as_seconds()
+        );
+        assert!(near(pictures[1].source_in.as_seconds(), 3.92));
+        assert!(
+            near(pictures[1].source_out().as_seconds(), 9.0),
+            "next sentence dropped {:?}",
+            pictures[1].source_out().as_seconds()
+        );
+        assert!(near(pictures[2].source_in.as_seconds(), 11.52));
+        assert!(
+            near(pictures[2].source_out().as_seconds(), 17.54),
+            "house finishes {:?}",
+            pictures[2].source_out().as_seconds()
+        );
+        assert!(near(pictures[3].source_in.as_seconds(), 5.14));
+        assert!(near(pictures[3].source_out().as_seconds(), 7.68));
+        assert!(
+            near(pictures[3].look.fade_out.as_seconds(), 0.22),
+            "fade {:?}",
+            pictures[3].look.fade_out.as_seconds()
+        );
+        assert!(near(pictures[4].source_in.as_seconds(), 30.0));
+        assert!(near(pictures[4].source_out().as_seconds(), 34.0));
+    }
+
+    #[test]
+    fn a_shared_film_grade_stays_colorful_and_changes_per_shot() {
+        let picture = MediaId::new();
+        let flat = slot(picture, 1.0);
+        let flat_next = slot(picture, 12.0);
+        let rich = slot(picture, 22.0);
+        let mut mono = slot(picture, 40.0);
+        mono.grade = Some(Grade {
+            lut: Lut::Mono,
+            ..Grade::default()
+        });
+        let mut own_film = slot(picture, 55.0);
+        own_film.grade = Some(Grade {
+            lut: Lut::Film,
+            ..Grade::default()
+        });
+        let plan = EditPlan {
+            style: "cinematic".into(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_look: None,
+            grade: Grade {
+                lut: Lut::Film,
+                ..Grade::default()
+            },
+            slots: vec![flat, flat_next, rich, mono, own_film],
+        };
+        let windows = vec![
+            window(picture, 0.0, 10.0, "interior", false),
+            window(picture, 10.0, 20.0, "dark", false),
+            window(picture, 20.0, 32.0, "bright-wide", false),
+            window(picture, 38.0, 50.0, "close", false),
+            window(picture, 52.0, 70.0, "interior", false),
+        ];
+        let mut timeline = Timeline::default();
+        build_plan(&mut timeline, &plan, &windows, &[], &[], &[]).unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 5);
+        assert_eq!(pictures[0].look.grade.lut, Lut::Warm);
+        assert!(pictures[0].look.grade.saturation > 0.6);
+        assert_eq!(pictures[1].look.grade.lut, Lut::TealOrange);
+        assert!(pictures[1].look.grade.saturation > 0.6);
+        assert_ne!(pictures[0].look.grade.lut, pictures[1].look.grade.lut);
+        assert_eq!(pictures[2].look.grade.lut, Lut::Film);
+        assert!(pictures[2].look.grade.saturation > 0.05);
+        assert!(pictures[2].look.grade.saturation < 0.4);
+        assert_eq!(pictures[3].look.grade.lut, Lut::Mono);
+        assert!(pictures[3].look.grade.saturation.abs() < 1e-4);
+        assert_eq!(pictures[4].look.grade.lut, Lut::Film);
+        assert!(pictures[4].look.grade.saturation.abs() < 1e-4);
+    }
+
+    fn near(actual: f64, expected: f64) -> bool {
+        (actual - expected).abs() < 0.02
+    }
+
+    fn line(media: MediaId, start: f64, end: f64, text: &str) -> SpokenLine {
+        SpokenLine {
+            media,
+            start,
+            end,
+            text: text.into(),
+        }
+    }
+
+    fn program_pictures(timeline: &Timeline) -> Vec<&Clip> {
+        timeline
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Video && track.name != "GFX")
+            .flat_map(|track| track.clips.iter())
+            .filter(|clip| matches!(clip.kind, ClipKind::Video { .. }))
+            .collect()
     }
 }

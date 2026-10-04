@@ -1,3 +1,4 @@
+mod caption;
 mod edit;
 mod ids;
 mod lut;
@@ -5,13 +6,14 @@ mod model;
 mod project;
 mod undo;
 
-pub use ids::{ClipId, GroupId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
+pub use caption::{caption_motion, caption_reveal, dress_cues, look_for, shot_is_face};
 pub use edit::PlaceMode;
+pub use ids::{ClipId, GroupId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
 pub use lut::{CubeLut, canonical_color, cube_text, ffmpeg_color, parse_cube};
 pub use model::{
-    AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipKind, ClipLook, Crop,
-    CurvePoint, Curves, Ease, EditPlan, EditSlot, FrameCard, Fx, Generator, Grade, Graphic,
-    GraphicKind, Lut,
+    AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionEffect, CaptionFont, CaptionMood,
+    CaptionPlace, CaptionRecipe, CaptionStyle, Clip, ClipKind, ClipLook, Crop, CurvePoint, Curves,
+    Ease, EditPlan, EditSlot, FrameCard, Fx, Generator, Grade, Graphic, GraphicKind, LineLook, Lut,
     Marker, MaskShape, Mix, SpeedKey, Timeline, Track, TrackKind, Transform, TransitionKind,
 };
 pub use project::Project;
@@ -170,7 +172,11 @@ mod tests {
         let id = tl.add_clip(track, clip).unwrap();
         let right = tl.split(id, Time::from_seconds(1.0)).unwrap();
         let right = tl.find_clip(right).unwrap().1;
-        assert!((right.source_in.as_seconds() - 12.0).abs() < 1e-2, "{}", right.source_in.as_seconds());
+        assert!(
+            (right.source_in.as_seconds() - 12.0).abs() < 1e-2,
+            "{}",
+            right.source_in.as_seconds()
+        );
         tl.merge_with_next(id).unwrap();
         let joined = tl.find_clip(id).unwrap().1;
         assert!((joined.duration.as_seconds() - 4.0).abs() < 1e-2);
@@ -185,8 +191,16 @@ mod tests {
         let id = tl.add_clip(track, clip).unwrap();
         let right_id = tl.split(id, Time::from_seconds(2.0)).unwrap();
         let right = tl.find_clip(right_id).unwrap().1;
-        assert!((right.source_in.as_seconds() - 3.0).abs() < 0.05, "{}", right.source_in.as_seconds());
-        assert!((right.speed - 2.0).abs() < 0.05, "right starts at the cut speed {}", right.speed);
+        assert!(
+            (right.source_in.as_seconds() - 3.0).abs() < 0.05,
+            "{}",
+            right.source_in.as_seconds()
+        );
+        assert!(
+            (right.speed - 2.0).abs() < 0.05,
+            "right starts at the cut speed {}",
+            right.speed
+        );
         let left = tl.find_clip(id).unwrap().1;
         assert!((left.look.speed_to.unwrap_or(0.0) - 2.0).abs() < 0.05);
         tl.merge_with_next(id).unwrap();
