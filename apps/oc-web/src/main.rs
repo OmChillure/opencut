@@ -2211,62 +2211,6 @@ fn add_track_after(
 }
 
 #[component]
-fn TrackRow(
-    name: String,
-    kind: &'static str,
-    clips: Vec<TimelineClip>,
-    span: f64,
-    can_remove: bool,
-    on_remove: EventHandler<()>,
-) -> Element {
-    let library = use_context::<Signal<Vec<MediaItem>>>();
-    let span = span.max(0.001);
-    rsx! {
-        div { class: "track",
-            div { class: "track-label",
-                span { "{name}" }
-                span { "{kind}" }
-                if can_remove {
-                    button {
-                        class: "track-x",
-                        title: "Remove track",
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_remove.call(());
-                        },
-                        "×"
-                    }
-                }
-            }
-            div { class: "lane",
-                for clip in clips.iter() {
-                    {
-                        let left = 100.0 * clip.start / span;
-                        let width = 100.0 * clip.duration / span;
-                        let label = clip_name(
-                            clip,
-                            library
-                                .read()
-                                .iter()
-                                .find(|item| item.id == clip.media_id)
-                                .map(|item| item.name.as_str()),
-                        );
-                        rsx! {
-                            div {
-                                class: "clip-bar",
-                                style: "left: {left}%; width: {width}%;",
-                                title: "{label}",
-                                "{label}"
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
 fn AiSidebar(
     draft: Signal<String>,
     mut messages: Signal<Vec<ChatMsg>>,
