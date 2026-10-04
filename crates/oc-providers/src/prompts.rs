@@ -135,6 +135,8 @@ mod tests {
         assert!(text.contains("picture editor"), "{text}");
         assert!(text.contains("place_clip"), "{text}");
         assert!(text.contains("source_in"), "{text}");
+        assert!(text.contains("leave `caption_look` out"), "{text}");
+        assert!(text.contains("caption_mood"), "{text}");
         assert!(!text.to_ascii_lowercase().contains("only claude"));
     }
 }

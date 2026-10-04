@@ -26,7 +26,7 @@ Decide the shape from the ask. You choose the in-points. Do not walk the transcr
 - **One long source and they asked for a reel or a short** — several excerpts, not one short bite and not the whole file.
 - **Trim / split / delete / recut** — touch only what they named.
 - **Captions / silence / duck / reframe** — just that.
-- **On the plan** — grade, grain, a fade, a push, a cover, music volume, captions, and letterbox only where this footage needs them. Rust applies those fields and leaves every other shot alone.
+- **On the plan** — grade, grain, a fade, a push, a cover, music volume, captions, and letterbox only where this footage needs them. Rust applies those fields and leaves every other shot alone. Rust also seats a talking slot on the words, and a shared film grade on a flat shot stays colorful instead of grey. Mix the joins: omit `transition` for a hard cut, use `dissolve` when time or place changes, and a wipe or a slide only on one graphic or reel join. `end_scale` is a push on a hold. Set `captions: true` and leave `caption_look` out. Rust places each line from the words and the shot. Set `caption_look` only to override one kind of line. `caption_mood` (`clean`, `kinetic`, `bold`) is only a shortcut.
 - **Louder, quieter, panned, solo** — `set_mix` on the audio track (or omit `track_id` for the master). Not a new cut.
 - **A curve, a mask, a speed change in the middle** — `set_curves`, `set_mask`, `set_speed_keys` on the clip they named.
 - **A slate, bars, snow, or a countdown** — `add_generator`. Not a substitute for their footage.
