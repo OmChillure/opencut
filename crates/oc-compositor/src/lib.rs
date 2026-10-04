@@ -1,11 +1,12 @@
 mod draw;
 
-pub use draw::{composite, FrameSource, Surface};
+pub use draw::{FrameSource, Surface, composite};
 
 use oc_time::Time;
 use oc_timeline::{
-    AlphaShape, CaptionStyle, Clip, ClipKind, Crop, Curves, FrameCard, Fx, Generator, Grade,
-    Graphic, MediaId, Timeline, TrackKind, Transform, TransitionKind,
+    AlphaShape, CaptionEffect, CaptionFont, CaptionPlace, CaptionStyle, Clip, ClipKind, Crop,
+    Curves, FrameCard, Fx, Generator, Grade, Graphic, MediaId, Timeline, TrackKind, Transform,
+    TransitionKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,12 @@ pub enum Layer {
         text: String,
         style: CaptionStyle,
         speaker: Option<String>,
+        #[serde(default)]
+        place: CaptionPlace,
+        #[serde(default)]
+        font: CaptionFont,
+        #[serde(default)]
+        effect: CaptionEffect,
     },
     Graphic {
         graphic: Graphic,
@@ -174,6 +181,9 @@ pub fn plan_frame(timeline: &Timeline, time: Time) -> FramePlan {
                     text: cue.text.clone(),
                     style: *style,
                     speaker: cue.speaker.clone(),
+                    place: cue.place,
+                    font: cue.font,
+                    effect: cue.effect,
                 });
             }
         }
@@ -358,11 +368,7 @@ fn is_join(a: &oc_timeline::Clip, b: &oc_timeline::Clip) -> bool {
 }
 
 /// Progress 0..1 through an outgoing mix (same-track or V1→V2 join).
-fn mix_at<'a>(
-    timeline: &'a Timeline,
-    clip: &oc_timeline::Clip,
-    time: Time,
-) -> MixAt<'a> {
+fn mix_at<'a>(timeline: &'a Timeline, clip: &oc_timeline::Clip, time: Time) -> MixAt<'a> {
     let none = MixAt {
         progress: 0.0,
         window: 0.0,
@@ -371,12 +377,16 @@ fn mix_at<'a>(
     if clip.look.transition == TransitionKind::Cut {
         return none;
     }
-    let next = timeline.tracks.iter().flat_map(|t| t.clips.iter()).find(|other| {
-        other.id != clip.id
-            && !other.disabled
-            && matches!(other.kind, ClipKind::Video { .. })
-            && is_join(clip, other)
-    });
+    let next = timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .find(|other| {
+            other.id != clip.id
+                && !other.disabled
+                && matches!(other.kind, ClipKind::Video { .. })
+                && is_join(clip, other)
+        });
     let Some(next) = next else {
         return none;
     };
@@ -559,7 +569,9 @@ mod tests {
             .layers
             .iter()
             .filter_map(|layer| match layer {
-                Layer::Video { media_id, overlay, .. } => Some((*media_id, *overlay)),
+                Layer::Video {
+                    media_id, overlay, ..
+                } => Some((*media_id, *overlay)),
                 _ => None,
             })
             .collect();

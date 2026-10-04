@@ -118,7 +118,8 @@ fn paint_mix(
             } else {
                 (x as f32, y as f32)
             };
-            let (ox, oy, ix, iy) = slide.map_or((0.0, 0.0, 0.0, 0.0), |(o, i)| (o.0, o.1, i.0, i.1));
+            let (ox, oy, ix, iy) =
+                slide.map_or((0.0, 0.0, 0.0, 0.0), |(o, i)| (o.0, o.1, i.0, i.1));
             let out = sample_layer(outgoing, sx - ox, sy - oy, width, height, sources, cubes);
             let inc = sample_layer(incoming, sx - ix, sy - iy, width, height, sources, cubes);
             let (wo, wi) = mix_weights(kind, p, x, y, width, height);
@@ -136,7 +137,11 @@ fn paint_mix(
             if matches!(kind, TransitionKind::FadeBlack | TransitionKind::FadeWhite) {
                 let dip = 1.0 - (p * 2.0 - 1.0).abs();
                 let keep = 1.0 - dip;
-                let lift = if kind == TransitionKind::FadeWhite { dip } else { 0.0 };
+                let lift = if kind == TransitionKind::FadeWhite {
+                    dip
+                } else {
+                    0.0
+                };
                 rgb[0] = rgb[0] * keep + lift;
                 rgb[1] = rgb[1] * keep + lift;
                 rgb[2] = rgb[2] * keep + lift;
@@ -146,7 +151,14 @@ fn paint_mix(
     }
 }
 
-fn mix_weights(kind: TransitionKind, p: f32, x: u32, y: u32, width: u32, height: u32) -> (f32, f32) {
+fn mix_weights(
+    kind: TransitionKind,
+    p: f32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> (f32, f32) {
     let u = (x as f32 + 0.5) / width as f32;
     let v = (y as f32 + 0.5) / height as f32;
     // Same edge as `TransitionKind::wipe_inset`: the outgoing plate is clipped
@@ -193,7 +205,12 @@ fn center_dist(u: f32, v: f32) -> f32 {
     (u - 0.5).hypot(v - 0.5)
 }
 
-fn slide_shift(kind: TransitionKind, p: f32, width: u32, height: u32) -> Option<((f32, f32), (f32, f32))> {
+fn slide_shift(
+    kind: TransitionKind,
+    p: f32,
+    width: u32,
+    height: u32,
+) -> Option<((f32, f32), (f32, f32))> {
     let (dx, dy) = kind.slide_delta()?;
     let ow = dx as f32 * p * width as f32;
     let oh = dy as f32 * p * height as f32;
@@ -237,7 +254,8 @@ fn paint_bounds(layer: &Layer, width: u32, height: u32) -> (u32, u32, u32, u32) 
         return (0, 0, width, height);
     };
     let (x, y, w, h) = placement(Some(*card), width, height);
-    let pad = 2.0 + transform.x.abs().max(transform.y.abs()) + (transform.scale - 1.0).abs() * w.max(h);
+    let pad =
+        2.0 + transform.x.abs().max(transform.y.abs()) + (transform.scale - 1.0).abs() * w.max(h);
     let x0 = (x - pad).floor().max(0.0) as u32;
     let y0 = (y - pad).floor().max(0.0) as u32;
     let x1 = (x + w + pad).ceil().min(width as f32) as u32;
@@ -339,10 +357,7 @@ fn dest_to_uv(
     let scale = transform.scale.abs().max(0.05);
     let sx = rx / scale;
     let sy = ry / scale;
-    (
-        (sx + rect_w * 0.5) / rect_w,
-        (sy + rect_h * 0.5) / rect_h,
-    )
+    ((sx + rect_w * 0.5) / rect_w, (sy + rect_h * 0.5) / rect_h)
 }
 
 fn pan_px(value: f32, span: f32) -> f32 {
@@ -488,17 +503,39 @@ fn glyph_bit(glyph: u32, col: u32, row: u32) -> bool {
         return false;
     }
     let rows: [u8; 7] = match glyph {
-        0 => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        1 => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        2 => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-        3 => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-        4 => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        5 => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-        6 => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        7 => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        8 => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        9 => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
-        _ => [0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000],
+        0 => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        1 => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        2 => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        3 => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        4 => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        5 => [
+            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ],
+        6 => [
+            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        7 => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        8 => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        9 => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
+        ],
+        _ => [
+            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
+        ],
     };
     rows[row as usize] & (1 << (4 - col)) != 0
 }
@@ -534,9 +571,9 @@ fn grade_rgb(rgb: [f32; 3], grade: &Grade, cubes: &[CubeLut]) -> [f32; 3] {
         Lut::Film => {
             let gray = luma(out);
             [
-                gray + (out[0] - gray) * 0.9 + 0.04,
-                gray + (out[1] - gray) * 0.9,
-                gray + (out[2] - gray) * 0.9 - 0.03,
+                gray + (out[0] - gray) * 1.16 + 0.03,
+                gray + (out[1] - gray) * 1.16,
+                gray + (out[2] - gray) * 1.16 - 0.015,
             ]
         }
         Lut::Cool => [out[0] - 0.04, out[1], out[2] + 0.08],
@@ -642,9 +679,8 @@ fn mask_alpha(mask: AlphaShape, u: f32, v: f32) -> f32 {
 fn parse_hex(color: &str) -> [f32; 3] {
     let hex = oc_timeline::canonical_color(color);
     let bytes = hex.trim_start_matches('#');
-    let parse = |start: usize| {
-        u8::from_str_radix(&bytes[start..start + 2], 16).unwrap_or(0) as f32 / 255.0
-    };
+    let parse =
+        |start: usize| u8::from_str_radix(&bytes[start..start + 2], 16).unwrap_or(0) as f32 / 255.0;
     if bytes.len() >= 6 {
         [parse(0), parse(2), parse(4)]
     } else {
@@ -699,8 +735,8 @@ mod tests {
     use super::*;
     use oc_time::{Duration, Time};
     use oc_timeline::{
-        AlphaShape, ClipId, ClipKind, ClipLook, CurvePoint, FrameCard, MaskShape, MediaId, Timeline,
-        TrackKind, Transform,
+        AlphaShape, ClipId, ClipKind, ClipLook, CurvePoint, FrameCard, MaskShape, MediaId,
+        Timeline, TrackKind, Transform,
     };
 
     fn solid(media: MediaId, rgb: [u8; 3], n: u32) -> FrameSource {
@@ -888,7 +924,10 @@ mod tests {
         let plan = crate::plan_frame(&tl, Time::from_seconds(0.2));
         let surface = composite(
             &plan,
-            &[solid(speaker, [200, 0, 0], 8), solid(design, [0, 180, 0], 8)],
+            &[
+                solid(speaker, [200, 0, 0], 8),
+                solid(design, [0, 180, 0], 8),
+            ],
             &[],
         );
         let left = pixel(&surface, 2, 5);
@@ -903,10 +942,7 @@ mod tests {
         let mut tl = Timeline::new(oc_timeline::FrameRate::FPS_30, 4, 4);
         let track = tl.first_track(TrackKind::Video).unwrap().id;
         let mut look = ClipLook::default();
-        look.curves.all = vec![
-            CurvePoint { x: 0.0, y: 0.0 },
-            CurvePoint { x: 1.0, y: 0.4 },
-        ];
+        look.curves.all = vec![CurvePoint { x: 0.0, y: 0.0 }, CurvePoint { x: 1.0, y: 0.4 }];
         tl.add_clip(
             track,
             oc_timeline::Clip {
@@ -982,7 +1018,10 @@ mod tests {
             &[],
         );
         let opposite = pixel(&surface, 7, 7);
-        assert!(opposite[0] > 200, "180° parks the mark on the far corner {opposite:?}");
+        assert!(
+            opposite[0] > 200,
+            "180° parks the mark on the far corner {opposite:?}"
+        );
     }
 
     #[test]
@@ -995,7 +1034,8 @@ mod tests {
             transition: oc_timeline::TransitionKind::WipeLeft,
             ..ClipLook::default()
         };
-        tl.add_clip(track, plate(outgoing, look, Time::ZERO)).unwrap();
+        tl.add_clip(track, plate(outgoing, look, Time::ZERO))
+            .unwrap();
         tl.add_clip(
             track,
             plate(incoming, ClipLook::default(), Time::from_seconds(4.0)),
@@ -1013,7 +1053,10 @@ mod tests {
         let left = pixel(&surface, 2, 4);
         let right = pixel(&surface, 17, 4);
         assert!(left[0] > left[1], "outgoing stays on the left {left:?}");
-        assert!(right[1] > right[0], "incoming enters from the right {right:?}");
+        assert!(
+            right[1] > right[0],
+            "incoming enters from the right {right:?}"
+        );
     }
 
     #[test]
@@ -1026,7 +1069,8 @@ mod tests {
             transition: oc_timeline::TransitionKind::Pixelize,
             ..ClipLook::default()
         };
-        tl.add_clip(track, plate(outgoing, look, Time::ZERO)).unwrap();
+        tl.add_clip(track, plate(outgoing, look, Time::ZERO))
+            .unwrap();
         tl.add_clip(
             track,
             plate(incoming, ClipLook::default(), Time::from_seconds(4.0)),
@@ -1120,7 +1164,10 @@ mod tests {
         let left = pixel(&surface, 2, 5);
         let right = pixel(&surface, 16, 5);
         assert!(left[0] > left[1], "program keeps the early frame {left:?}");
-        assert!(right[1] > right[0], "corner keeps the later frame {right:?}");
+        assert!(
+            right[1] > right[0],
+            "corner keeps the later frame {right:?}"
+        );
     }
 
     fn plate(media: MediaId, look: ClipLook, start: Time) -> oc_timeline::Clip {
