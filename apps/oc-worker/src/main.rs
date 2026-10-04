@@ -1,7 +1,7 @@
 use anyhow::Context;
-use std::path::Path;
 use oc_core::{CaptionCue, Op, UndoStack, apply};
 use oc_db::Db;
+use std::path::Path;
 
 use oc_db::R2;
 use serde::Deserialize;
@@ -27,7 +27,9 @@ async fn main() -> anyhow::Result<()> {
     if oc_voice::groq_stt_configured() {
         tracing::info!("understand = ffmpeg look + Groq Whisper");
     } else {
-        tracing::info!("understand = ffmpeg look + local Whisper (set GROQ_API_KEY for Groq Whisper)");
+        tracing::info!(
+            "understand = ffmpeg look + local Whisper (set GROQ_API_KEY for Groq Whisper)"
+        );
     }
 
     tracing::info!("worker polling jobs");
@@ -54,12 +56,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(err) => {
                 fail = fail.saturating_add(1);
-                tracing::error!(
-                    size = db.size(),
-                    idle = db.num_idle(),
-                    fail,
-                    "claim: {err}"
-                );
+                tracing::error!(size = db.size(), idle = db.num_idle(), fail, "claim: {err}");
                 if err.is_pool_timeout() {
                     match oc_db::connect().await {
                         Ok(next) => {
@@ -76,8 +73,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 }
-
-
 
 #[derive(Deserialize)]
 struct TranscribePayload {
@@ -154,11 +149,7 @@ async fn open_media(r2: Option<&R2>, key: &str) -> anyhow::Result<OpenedMedia> {
     anyhow::bail!("media not found: {key}");
 }
 
-async fn transcribe(
-    db: &Db,
-    r2: Option<&R2>,
-    p: TranscribePayload,
-) -> anyhow::Result<()> {
+async fn transcribe(db: &Db, r2: Option<&R2>, p: TranscribePayload) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     tracing::info!(media = %p.media_id, key = %p.r2_key, "transcribe start");
     let opened = match open_media(r2, &p.r2_key).await {
@@ -277,7 +268,10 @@ enum LabelError {
     LabelFailed(String),
 }
 
-async fn label_with_subscription(path: &Path, look: &mut oc_media::VisualDigest) -> Result<usize, LabelError> {
+async fn label_with_subscription(
+    path: &Path,
+    look: &mut oc_media::VisualDigest,
+) -> Result<usize, LabelError> {
     let stills = match oc_media::shot_stills(path, &look.shots).await {
         Ok(stills) => stills,
         Err(err) => return Err(LabelError::LabelFailed(err)),
@@ -298,15 +292,24 @@ async fn label_with_subscription(path: &Path, look: &mut oc_media::VisualDigest)
     let text = oc_providers::ask_with_stills(oc_media::shot_label_prompt(), &frames)
         .await
         .map_err(|err| LabelError::LabelFailed(err.to_string()))?;
-    oc_media::apply_shot_reply(&mut look.shots, &stills, &text)
-        .map_err(LabelError::LabelFailed)?;
+    oc_media::apply_shot_reply(&mut look.shots, &stills, &text).map_err(LabelError::LabelFailed)?;
     Ok(look.shots.iter().filter(|shot| shot.card.is_some()).count())
 }
 
 async fn music_grid(path: &Path) -> Option<oc_media::MusicAnalysis> {
     let output = tokio::process::Command::new("ffmpeg")
         .args([
-            "-v", "error", "-i", &path.to_string_lossy(), "-ac", "1", "-ar", "22050", "-f", "f32le", "-",
+            "-v",
+            "error",
+            "-i",
+            &path.to_string_lossy(),
+            "-ac",
+            "1",
+            "-ar",
+            "22050",
+            "-f",
+            "f32le",
+            "-",
         ])
         .output()
         .await
@@ -353,13 +356,14 @@ async fn save_transcript(
     )
     .await?;
 
-    let cues: Vec<CaptionCue> = transcript
+    let mut cues: Vec<CaptionCue> = transcript
         .cues
         .iter()
         .cloned()
         .map(|c| c.into_timeline())
         .collect();
     let mut project = oc_db::get_project(db, p.project_id).await?;
+    dress_safe(&mut cues, &project.timeline);
     let mut undo = UndoStack::new();
     apply(
         &mut project.timeline,
@@ -374,12 +378,26 @@ async fn save_transcript(
     Ok(())
 }
 
+fn dress_safe(cues: &mut [oc_core::CaptionCue], timeline: &oc_core::Timeline) {
+    let recipe = if timeline.height > timeline.width {
+        oc_core::CaptionMood::Kinetic.recipe()
+    } else {
+        oc_core::CaptionMood::Clean.recipe()
+    };
+    let faces = vec![true; cues.len()];
+    oc_core::dress_cues(cues, &recipe, &faces);
+}
+
 async fn lay_captions(
     db: &Db,
     project_id: Uuid,
     timeline: &mut oc_core::Timeline,
 ) -> anyhow::Result<()> {
     if oc_tools::has_burnable_captions(timeline) {
+        if oc_tools::redress_unset_captions(timeline) {
+            oc_db::save_timeline(db, project_id, timeline).await?;
+            tracing::info!(project = %project_id, "restyled captions that were still one bottom bar");
+        }
         return Ok(());
     }
     let rows = oc_db::list_transcripts_for_project(db, project_id).await?;
@@ -393,10 +411,11 @@ async fn lay_captions(
         })
         .collect();
     let clips = oc_tools::program_clips(timeline);
-    let cues = oc_tools::mapped_cues(&clips, &lines);
+    let mut cues = oc_tools::mapped_cues(&clips, &lines);
     if cues.is_empty() {
         return Ok(());
     }
+    dress_safe(&mut cues, timeline);
     let n = cues.len();
     let mut undo = UndoStack::new();
     apply(
@@ -437,10 +456,10 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
             tracing::warn!(media = %row.id, key = %row.r2_key, "skip missing source");
             continue;
         }
-        let has_video = row.content_type.starts_with("video/")
-            || row.content_type.starts_with("image/");
-        let has_audio = row.content_type.starts_with("audio/")
-            || row.content_type.starts_with("video/");
+        let has_video =
+            row.content_type.starts_with("video/") || row.content_type.starts_with("image/");
+        let has_audio =
+            row.content_type.starts_with("audio/") || row.content_type.starts_with("video/");
         media.insert(
             oc_timeline::MediaId::from_uuid(row.id),
             oc_render::MediaSource {
