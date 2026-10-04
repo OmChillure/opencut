@@ -6,13 +6,13 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use futures_util::StreamExt;
+use oc_core::time::TICKS_PER_SECOND;
 use oc_core::{
     MediaId, Op, Project, ProjectId, Timeline, UndoStack, apply, is_director_request, mcp_tools,
     review_cut,
 };
-use oc_core::time::TICKS_PER_SECOND;
-use oc_providers::{ChatEvent, ChatTurn, LlmReply};
 use oc_media::{ObjectKind, object_key};
+use oc_providers::{ChatEvent, ChatTurn, LlmReply};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -38,9 +38,7 @@ impl From<oc_db::DbError> for ApiError {
     fn from(value: oc_db::DbError) -> Self {
         match value {
             oc_db::DbError::NotFound => Self::new(StatusCode::NOT_FOUND, "not found"),
-            oc_db::DbError::BadUser => {
-                Self::new(StatusCode::BAD_REQUEST, "sign in with an email")
-            }
+            oc_db::DbError::BadUser => Self::new(StatusCode::BAD_REQUEST, "sign in with an email"),
             other => Self::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         }
     }
@@ -97,9 +95,7 @@ pub async fn update_project(
     if name.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "name required"));
     }
-    Ok(Json(
-        oc_db::rename_project(&state.db, id, name).await?,
-    ))
+    Ok(Json(oc_db::rename_project(&state.db, id, name).await?))
 }
 
 #[derive(Serialize)]
@@ -254,8 +250,7 @@ async fn wait_for_understand(state: &AppState, tx: &mpsc::Sender<String>, jobs: 
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut last_note = Instant::now();
     loop {
-        let pending = jobs.len()
-            - futures(jobs, state).await;
+        let pending = jobs.len() - futures(jobs, state).await;
         if pending == 0 {
             push(
                 tx,
@@ -409,9 +404,9 @@ async fn run_chat(
         "chat context"
     );
     if !media.is_empty() {
-        let understood = media.iter().any(|m| {
-            speech.contains_key(&m.id) || looks.contains_key(&m.id)
-        });
+        let understood = media
+            .iter()
+            .any(|m| speech.contains_key(&m.id) || looks.contains_key(&m.id));
         let needs_scan = media.iter().any(|m| {
             if m.content_type.starts_with("image/") {
                 return false;
@@ -440,12 +435,10 @@ async fn run_chat(
                     (l.has_video && crate::edit::shot_looks(l).is_empty())
                         || crate::edit::look_needs_vision(l)
                 });
-                if (speech.contains_key(&row.id) || looks.contains_key(&row.id)) && !stale_look
-                {
+                if (speech.contains_key(&row.id) || looks.contains_key(&row.id)) && !stale_look {
                     continue;
                 }
-                let on_disk = oc_db::local_media_path(&row.r2_key)
-                    .is_some_and(|p| p.is_file())
+                let on_disk = oc_db::local_media_path(&row.r2_key).is_some_and(|p| p.is_file())
                     || std::path::Path::new(&row.r2_key).is_file();
                 if !oc_db::is_r2_object_key(&row.r2_key) && !on_disk {
                     continue;
@@ -508,12 +501,8 @@ async fn run_chat(
     )
     .await
     .map_err(|e| e.to_string())?;
-    let mut message = oc_providers::opening_prompt(
-        &system,
-        &turns,
-        &tools,
-        !mcp_servers.is_empty(),
-    );
+    let mut message =
+        oc_providers::opening_prompt(&system, &turns, &tools, !mcp_servers.is_empty());
     let mut note_rounds = 0_u32;
     let mut seen: Vec<oc_providers::PromptImage> = Vec::new();
     for turn_i in 0..8 {
@@ -589,7 +578,9 @@ async fn run_chat(
                         let preset = export_preset(&fresh.timeline);
                         match edit::queue_export(&state.db, id, preset).await {
                             Ok(()) => notes.push(format!("export queued {}", preset.label())),
-                            Err(err) => tracing::error!(project = %id, "export queue failed: {err}"),
+                            Err(err) => {
+                                tracing::error!(project = %id, "export queue failed: {err}")
+                            }
                         }
                     }
                 }
@@ -613,32 +604,27 @@ async fn run_chat(
                     let (ok, result) = if call.name == "see" {
                         see_host(&state, id, &call.arguments, &mut seen).await
                     } else {
-                        match edit::call_tool(
-                        &state.db,
-                        id,
-                        &call.name,
-                        call.arguments.clone(),
-                    )
-                    .await
-                    {
-                        Ok(out) => {
-                            if !out.starts_with("bin:")
-                                && !out.starts_with("Current timeline")
-                                && !out.starts_with("media ")
-                            {
-                                notes.push(out.clone());
+                        match edit::call_tool(&state.db, id, &call.name, call.arguments.clone())
+                            .await
+                        {
+                            Ok(out) => {
+                                if !out.starts_with("bin:")
+                                    && !out.starts_with("Current timeline")
+                                    && !out.starts_with("media ")
+                                {
+                                    notes.push(out.clone());
+                                }
+                                batch.push_str(&compact_tool(&call.name, &out));
+                                batch.push('\n');
+                                (true, out)
                             }
-                            batch.push_str(&compact_tool(&call.name, &out));
-                            batch.push('\n');
-                            (true, out)
+                            Err(err) => {
+                                let msg = format!("tool error: {err}");
+                                batch.push_str(&msg);
+                                batch.push('\n');
+                                (false, msg)
+                            }
                         }
-                        Err(err) => {
-                            let msg = format!("tool error: {err}");
-                            batch.push_str(&msg);
-                            batch.push('\n');
-                            (false, msg)
-                        }
-                    }
                     };
                     if call.name == "see" {
                         batch.push_str(&compact_tool("see", &result));
@@ -708,7 +694,10 @@ async fn see_host(
     arguments: &serde_json::Value,
     seen: &mut Vec<oc_providers::PromptImage>,
 ) -> (bool, String) {
-    let media = arguments.get("media_id").and_then(|v| v.as_str()).unwrap_or("");
+    let media = arguments
+        .get("media_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let at = arguments.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let Ok(media_id) = Uuid::parse_str(media) else {
         return (false, format!("tool error: bad media id {media}"));
@@ -768,12 +757,7 @@ async fn emit_host_tool(
     .await;
 }
 
-async fn finish_chat(
-    tx: &mpsc::Sender<String>,
-    text: &str,
-    notes: &[String],
-    timeline: &Timeline,
-) {
+async fn finish_chat(tx: &mpsc::Sender<String>, text: &str, notes: &[String], timeline: &Timeline) {
     push(
         tx,
         serde_json::json!({
@@ -785,7 +769,6 @@ async fn finish_chat(
     )
     .await;
 }
-
 
 #[derive(Deserialize)]
 pub struct UploadBody {
@@ -936,11 +919,8 @@ async fn media_play_url(project_id: Uuid, media_id: Uuid, key: &str) -> Option<S
         return Some(media_file_url(project_id, media_id));
     }
     if key.starts_with("workspace/") {
-        let guessed = oc_db::local_media_path(&oc_db::local_media_key(
-            project_id,
-            media_id,
-            "media.bin",
-        ));
+        let guessed =
+            oc_db::local_media_path(&oc_db::local_media_key(project_id, media_id, "media.bin"));
         if guessed.is_some_and(|p| p.is_file()) {
             return Some(media_file_url(project_id, media_id));
         }
@@ -1042,7 +1022,10 @@ fn latest_export(id: Uuid) -> Result<std::path::PathBuf, ApiError> {
     let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(&prefix) || !name.ends_with(".mp4") {
+        if !name.starts_with(&prefix) || !name.ends_with(".mp4") || name.starts_with('.') {
+            continue;
+        }
+        if !mp4_has_moov(&entry.path()) {
             continue;
         }
         let modified = entry
@@ -1067,6 +1050,7 @@ pub async fn head_export(Path(id): Path<Uuid>) -> ApiResult<Response> {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/mp4")
         .header(header::CONTENT_LENGTH, len)
+        .header(header::CACHE_CONTROL, "no-store")
         .header(header::ACCEPT_RANGES, "bytes")
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty())))
@@ -1077,7 +1061,62 @@ pub async fn get_export(
     headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
     let path = latest_export(id)?;
-    serve_local_file(&path, "video/mp4", headers.get(header::RANGE)).await
+    serve_local_file(&path, "video/mp4", headers.get(header::RANGE))
+        .await
+        .map(with_no_store)
+}
+
+fn with_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// A file ffmpeg is still writing has `ftyp` and an `mdat` that runs to EOF.
+/// `moov` is only there after the encode finishes. Serving before that plays
+/// the first GOP and then goes blank, and a download has no playable stream.
+fn mp4_has_moov(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let len = match file.metadata() {
+        Ok(meta) => meta.len(),
+        Err(_) => return false,
+    };
+    let mut pos = 0u64;
+    while pos + 8 <= len {
+        if file.seek(SeekFrom::Start(pos)).is_err() {
+            return false;
+        }
+        let mut header = [0u8; 8];
+        if file.read_exact(&mut header).is_err() {
+            return false;
+        }
+        let size32 = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        if &header[4..8] == b"moov" {
+            return true;
+        }
+        let box_size = if size32 == 1 {
+            let mut large = [0u8; 8];
+            if file.read_exact(&mut large).is_err() {
+                return false;
+            }
+            u64::from_be_bytes(large)
+        } else if size32 == 0 {
+            return false;
+        } else {
+            u64::from(size32)
+        };
+        if box_size < 8 || pos.saturating_add(box_size) > len {
+            return false;
+        }
+        pos += box_size;
+    }
+    false
 }
 
 async fn serve_local_file(
@@ -1094,19 +1133,22 @@ async fn serve_local_file(
     } else {
         content_type
     };
-    if let Some(range) = range.and_then(|v| v.to_str().ok()).and_then(parse_byte_range) {
+    if let Some(range) = range
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_byte_range)
+    {
         let (start, end) = range;
         let start = start.min(len.saturating_sub(1));
-        let end = end.unwrap_or(len.saturating_sub(1)).min(len.saturating_sub(1)).max(start);
+        let end = end
+            .unwrap_or(len.saturating_sub(1))
+            .min(len.saturating_sub(1))
+            .max(start);
         let slice = data[start as usize..=end as usize].to_vec();
         return Ok(Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_TYPE, ctype)
             .header(header::ACCEPT_RANGES, "bytes")
-            .header(
-                header::CONTENT_RANGE,
-                format!("bytes {start}-{end}/{len}"),
-            )
+            .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
             .header(header::CONTENT_LENGTH, slice.len())
             .body(Body::from(slice))
             .unwrap_or_else(|_| Response::new(Body::empty())));
@@ -1125,7 +1167,11 @@ fn parse_byte_range(raw: &str) -> Option<(u64, Option<u64>)> {
     let spec = spec.split(',').next()?.trim();
     let (a, b) = spec.split_once('-')?;
     let start = if a.is_empty() { 0 } else { a.parse().ok()? };
-    let end = if b.is_empty() { None } else { Some(b.parse().ok()?) };
+    let end = if b.is_empty() {
+        None
+    } else {
+        Some(b.parse().ok()?)
+    };
     Some((start, end))
 }
 
@@ -1267,14 +1313,8 @@ pub async fn save_chat_messages(
     Path((id, chat_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<SaveChatBody>,
 ) -> ApiResult<Json<oc_db::ChatRow>> {
-    let chat = oc_db::save_chat_messages(
-        &state.db,
-        id,
-        chat_id,
-        &body.user,
-        &body.messages,
-    )
-    .await?;
+    let chat =
+        oc_db::save_chat_messages(&state.db, id, chat_id, &body.user, &body.messages).await?;
     tracing::info!(project = %id, chat = %chat_id, n = body.messages.len(), "chat saved");
     Ok(Json(chat))
 }
@@ -1305,5 +1345,38 @@ mod tests {
             "status": "pending"
         });
         assert!(!tool_finished(&pending));
+    }
+
+    fn box_bytes(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (8 + payload.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn an_unfinished_mp4_is_not_served() {
+        let dir = std::env::temp_dir().join("oc-moov-check");
+        std::fs::create_dir_all(&dir).unwrap();
+        let done = dir.join("done.mp4");
+        let writing = dir.join("writing.mp4");
+        let decoy = dir.join("decoy.mp4");
+        let mut finished = box_bytes(b"ftyp", b"isom");
+        finished.extend(box_bytes(b"moov", b"mvhd"));
+        finished.extend(box_bytes(b"mdat", b"frames"));
+        std::fs::write(&done, &finished).unwrap();
+        // size 0 means the box runs to EOF, which is how ffmpeg leaves mdat.
+        let mut partial = box_bytes(b"ftyp", b"isom");
+        partial.extend_from_slice(&0u32.to_be_bytes());
+        partial.extend_from_slice(b"mdat");
+        partial.extend_from_slice(b"moov-is-not-a-box-here");
+        std::fs::write(&writing, &partial).unwrap();
+        let mut bait = box_bytes(b"ftyp", b"isom");
+        bait.extend(box_bytes(b"free", b"moov"));
+        std::fs::write(&decoy, &bait).unwrap();
+        assert!(mp4_has_moov(&done));
+        assert!(!mp4_has_moov(&writing));
+        assert!(!mp4_has_moov(&decoy));
     }
 }
