@@ -6,8 +6,8 @@
 mod captions;
 mod graph;
 
-pub use captions::{captions_for_cut, to_srt, BurnedCue};
-pub use graph::{compile, Compiled};
+pub use captions::{BurnedCue, captions_for_cut, to_srt};
+pub use graph::{Compiled, compile};
 
 use oc_timeline::{MediaId, Timeline};
 use oc_tools::ExportPreset;
@@ -76,6 +76,20 @@ pub fn ffmpeg_available() -> bool {
 }
 
 #[must_use]
+pub fn font_dir() -> Option<&'static str> {
+    const CANDIDATES: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype",
+        "/usr/share/fonts/TTF",
+        "/usr/share/fonts",
+    ];
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|path| std::path::Path::new(path).is_dir())
+}
+
+#[must_use]
 pub fn font_path() -> Option<String> {
     const CANDIDATES: &[&str] = &[
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -109,7 +123,10 @@ pub fn render(req: &RenderRequest) -> Result<RenderResult, RenderError> {
     std::fs::create_dir_all(&work)?;
     let compiled = compile(&req.timeline, &req.media, req.preset, &work)?;
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    cmd.arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error");
     for input in &compiled.inputs {
         if still_input(input) {
             cmd.arg("-loop")
@@ -125,8 +142,18 @@ pub fn render(req: &RenderRequest) -> Result<RenderResult, RenderError> {
         .arg(format!("[{}]", compiled.video_label));
     if let Some(a) = &compiled.audio_label {
         cmd.arg("-map").arg(format!("[{a}]"));
-        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("192k").arg("-shortest");
+        cmd.arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("192k")
+            .arg("-shortest");
     }
+    let stem = req
+        .output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+    let partial = parent.join(format!(".{stem}.partial.mp4"));
     cmd.arg("-c:v")
         .arg("libx264")
         .arg("-pix_fmt")
@@ -137,12 +164,14 @@ pub fn render(req: &RenderRequest) -> Result<RenderResult, RenderError> {
         .arg("20")
         .arg("-movflags")
         .arg("+faststart")
-        .arg(&req.output);
+        .arg(&partial);
     let out = cmd.output()?;
     if !out.status.success() {
+        let _ = std::fs::remove_file(&partial);
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(RenderError::Ffmpeg(stderr.chars().take(2000).collect()));
     }
+    std::fs::rename(&partial, &req.output)?;
     let _ = std::fs::remove_dir_all(&work);
     Ok(RenderResult {
         output: req.output.clone(),

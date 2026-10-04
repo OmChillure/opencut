@@ -127,6 +127,136 @@ fn graph_uses_xfade_for_dissolve() {
 }
 
 #[test]
+fn dissolves_do_not_insert_black_between_shots() {
+    let mut tl = Timeline::default();
+    let mut undo = UndoStack::new();
+    let track = tl.first_track(TrackKind::Video).unwrap().id;
+    let mut ids = Vec::new();
+    for (i, start) in [0.0, 2.0, 4.0].into_iter().enumerate() {
+        let id = MediaId::new();
+        let clip = tl.add_clip(track, video_on(id, start, 2.0)).unwrap();
+        if i < 2 {
+            apply(
+                &mut tl,
+                &mut undo,
+                Op::SetTransition {
+                    clip_id: clip,
+                    kind: TransitionKind::Dissolve,
+                    duration: Some(0.4),
+                },
+            )
+            .unwrap();
+        }
+        ids.push(id);
+    }
+    let dir = std::env::temp_dir().join("oc-render-dissolve");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut media = HashMap::new();
+    for (i, id) in ids.iter().copied().enumerate() {
+        let path = dir.join(format!("{i}.mp4"));
+        std::fs::write(&path, b"x").unwrap();
+        media.insert(id, source(id, path));
+    }
+    let compiled = compile(&tl, &media, ExportPreset::Youtube1080, &dir).unwrap();
+    assert_eq!(
+        compiled.filter.matches("xfade=transition=fade").count(),
+        2,
+        "{}",
+        compiled.filter
+    );
+    assert_eq!(
+        compiled.filter.matches("acrossfade=").count(),
+        2,
+        "{}",
+        compiled.filter
+    );
+    assert!(
+        !compiled.filter.contains("color=c="),
+        "a dissolve must not be filled with black: {}",
+        compiled.filter
+    );
+}
+
+#[test]
+fn a_real_gap_still_gets_black() {
+    let mut tl = Timeline::default();
+    let track = tl.first_track(TrackKind::Video).unwrap().id;
+    let a_id = MediaId::new();
+    let b_id = MediaId::new();
+    let _ = tl.add_clip(track, video_on(a_id, 0.0, 2.0)).unwrap();
+    let _ = tl.add_clip(track, video_on(b_id, 3.0, 2.0)).unwrap();
+    let dir = std::env::temp_dir().join("oc-render-gap");
+    let _ = std::fs::create_dir_all(&dir);
+    let a_path = dir.join("a.mp4");
+    let b_path = dir.join("b.mp4");
+    std::fs::write(&a_path, b"x").unwrap();
+    std::fs::write(&b_path, b"x").unwrap();
+    let mut media = HashMap::new();
+    media.insert(a_id, source(a_id, a_path));
+    media.insert(b_id, source(b_id, b_path));
+    let compiled = compile(&tl, &media, ExportPreset::Youtube1080, &dir).unwrap();
+    assert!(
+        compiled.filter.contains("color=c=") && compiled.filter.contains("d=1.0000"),
+        "{}",
+        compiled.filter
+    );
+    assert!(!compiled.filter.contains("xfade="), "{}", compiled.filter);
+}
+
+#[test]
+fn caption_times_follow_the_dissolve_overlap() {
+    let mut tl = Timeline::default();
+    let mut undo = UndoStack::new();
+    let track = tl.first_track(TrackKind::Video).unwrap().id;
+    let a_id = MediaId::new();
+    let b_id = MediaId::new();
+    let a = tl.add_clip(track, video_on(a_id, 0.0, 2.0)).unwrap();
+    let _b = tl.add_clip(track, video_on(b_id, 2.0, 2.0)).unwrap();
+    apply(
+        &mut tl,
+        &mut undo,
+        Op::SetTransition {
+            clip_id: a,
+            kind: TransitionKind::Dissolve,
+            duration: Some(0.5),
+        },
+    )
+    .unwrap();
+    tl.replace_caption_cues(
+        CaptionStyle::Stacked,
+        vec![CaptionCue {
+            start: Time::from_seconds(2.4),
+            end: Time::from_seconds(3.2),
+            text: "HELLO".into(),
+            speaker: None,
+            place: oc_core::CaptionPlace::Bottom,
+            font: oc_core::CaptionFont::Sans,
+            effect: oc_core::CaptionEffect::None,
+        }],
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join("oc-render-caption-shift");
+    let _ = std::fs::create_dir_all(&dir);
+    let a_path = dir.join("a.mp4");
+    let b_path = dir.join("b.mp4");
+    std::fs::write(&a_path, b"x").unwrap();
+    std::fs::write(&b_path, b"x").unwrap();
+    let mut media = HashMap::new();
+    media.insert(a_id, source(a_id, a_path));
+    media.insert(b_id, source(b_id, b_path));
+    let compiled = compile(&tl, &media, ExportPreset::Youtube1080, &dir).unwrap();
+    let ass = std::fs::read_to_string(compiled.srt.expect("ass")).unwrap();
+    assert!(
+        ass.contains("0:00:01.90"),
+        "cue at 2.4s should move back by the 0.5s dissolve: {ass}"
+    );
+    assert!(
+        !ass.contains("0:00:02.40"),
+        "timeline time must not be burned as-is: {ass}"
+    );
+}
+
+#[test]
 fn graph_draws_title_and_grade() {
     let mut tl = Timeline::default();
     let mut undo = UndoStack::new();
