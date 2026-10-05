@@ -235,8 +235,10 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "set_move".into(),
-            description: "Animate zoom and pan across the clip. end_x and end_y are fractions of the frame. \
-                 ease is linear, in, out, or in_out."
+            description: "Animate zoom and pan across a hold whose shot-list motion is none. \
+                 Skip this when motion is l2r, r2l, toward, or away — that camera is already moving. \
+                 end_x and end_y are fractions of the frame. \
+                 ease is in_out for a breath, out to arrive, in to leave, linear only for a constant creep."
                 .into(),
             input_schema: object(&[
                 ("clip_id", str_prop("Clip id"), true),
@@ -411,7 +413,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 (
                     "slots",
                     str_prop(
-                        "Array of {media_id, source_in, duration, transition?, transition_duration?, speed?, end_scale?, grade?, fx?, fade_in?, fade_out?, cover?}. Omit transition for a cut. dissolve, fade_black, fade_white, wipe_left, slide_up on the slot that needs that join. end_scale about 1.08 is a push.",
+                        "Array of {media_id, source_in, duration, transition?, transition_duration?, speed?, end_scale?, ease?, grade?, fx?, fade_in?, fade_out?, cover?}. Omit transition for a cut. dissolve, fade_black, fade_white, wipe_left, slide_up on the slot that needs that join. end_scale about 1.06 to 1.08 only on a hold whose motion is none. ease is in_out, in, out, or linear.",
                     ),
                     true,
                 ),
@@ -805,10 +807,10 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "add_design".into(),
-            description: "Animate what the person is explaining, full frame, for the whole spoken line. \
-                 A bullish flag is that chart pattern drawing itself (pole, flag, breakout), not a flag on a pole. \
+            description: "Animate what the person is explaining, one move, for the whole spoken line. \
+                 A bullish flag is that chart pattern drawing itself in one stroke, not a flag on a pole. \
                  A house rises until it fills the frame. \
-                 prompt is the motion across the clip. The subject fills the frame. No letters and no numbers. \
+                 prompt is where the form starts and where it ends. It crosses the frame. No letters and no numbers. \
                  text is the short label, the real words, drawn by the editor. Omit text to show the animation alone. \
                  at is the timeline start. duration is the length of that spoken line, up to 15 seconds. \
                  layout: cutaway (animation fills the frame, voice continues), \
@@ -1129,12 +1131,12 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
             clip_id: clip_id(&call.arguments, "clip_id")?,
             end_x: number(&call.arguments, "end_x").unwrap_or(0.0) as f32,
             end_y: number(&call.arguments, "end_y").unwrap_or(0.0) as f32,
-            end_scale: number(&call.arguments, "end_scale").unwrap_or(1.12) as f32,
+            end_scale: number(&call.arguments, "end_scale").unwrap_or(1.08) as f32,
             ease: oc_timeline::Ease::parse(
                 call.arguments
                     .get("ease")
                     .and_then(Value::as_str)
-                    .unwrap_or("linear"),
+                    .unwrap_or("in_out"),
             ),
         }),
         "set_speed_ramp" => Ok(Op::SetSpeedRamp {

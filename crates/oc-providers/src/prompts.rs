@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 const FALLBACK_DIRECTOR: &str = include_str!("../../../prompts/00-director.md");
 const FALLBACK_PLAN: &str = include_str!("../../../prompts/01-edit-plan.md");
+const FALLBACK_MOTION: &str = include_str!("../../../prompts/02-motion.md");
 
 /// All shared director briefs, concatenated. Cached after first read.
 #[must_use]
@@ -52,7 +53,7 @@ fn load() -> String {
             return from_disk;
         }
     }
-    format!("{FALLBACK_DIRECTOR}\n\n{FALLBACK_PLAN}\n")
+    format!("{FALLBACK_DIRECTOR}\n\n{FALLBACK_PLAN}\n\n{FALLBACK_MOTION}\n")
 }
 
 fn prompts_dir() -> PathBuf {
@@ -137,6 +138,8 @@ mod tests {
         assert!(text.contains("source_in"), "{text}");
         assert!(text.contains("leave `caption_look` out"), "{text}");
         assert!(text.contains("caption_mood"), "{text}");
+        assert!(text.contains("one path"), "{text}");
+        assert!(text.contains("shot list already has `motion`"), "{text}");
         assert!(!text.to_ascii_lowercase().contains("only claude"));
     }
 }

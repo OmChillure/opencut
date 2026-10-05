@@ -143,7 +143,7 @@ pub fn build_plan(
                     end_x: 0.0,
                     end_y: 0.0,
                     end_scale: scale,
-                    ease: slot.ease.unwrap_or_default(),
+                    ease: slot.ease.unwrap_or(oc_timeline::Ease::InOut),
                 },
             )
             .map_err(err)?;
@@ -596,6 +596,9 @@ pub fn revise_plan(plan: &EditPlan, changes: &[serde_json::Value]) -> Result<Edi
         if let Some(v) = change.get("end_scale").and_then(|v| v.as_f64()) {
             slot.end_scale = Some(v as f32);
         }
+        if let Some(v) = change.get("ease").and_then(|v| v.as_str()) {
+            slot.ease = Some(oc_timeline::Ease::parse(v));
+        }
         if let Some(v) = change.get("why").and_then(|v| v.as_str()) {
             slot.why = v.to_string();
         }
@@ -819,7 +822,7 @@ fn grade_for_slot(slot: &EditSlot, shared: oc_timeline::Grade) -> oc_timeline::G
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oc_timeline::{AlphaShape, ClipId, ClipLook, Grade, Lut, MaskShape, Transform};
+    use oc_timeline::{AlphaShape, ClipId, ClipLook, Ease, Grade, Lut, MaskShape, Transform};
 
     fn window(media: MediaId, start: f64, end: f64, look: &str, silent: bool) -> SourceWindow {
         SourceWindow {
@@ -934,6 +937,42 @@ mod tests {
             })
         });
         assert!(captioned, "{joined}");
+    }
+
+    #[test]
+    fn a_push_eases_in_out_unless_the_plan_says_linear() {
+        let picture = MediaId::new();
+        let mut timeline = Timeline::default();
+        let mut pushed = slot(picture, 1.0);
+        pushed.end_scale = Some(1.08);
+        let mut creep = slot(picture, 20.0);
+        creep.end_scale = Some(1.04);
+        creep.ease = Some(Ease::Linear);
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![pushed, creep],
+        };
+        let windows = vec![window(picture, 0.0, 40.0, "wide", true)];
+        build_plan(&mut timeline, &plan, &windows, &[], &[], &[]).unwrap();
+        let pictures: Vec<_> = timeline
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Video)
+            .flat_map(|track| track.clips.iter())
+            .filter(|clip| matches!(clip.kind, ClipKind::Video { .. }))
+            .collect();
+        assert_eq!(pictures.len(), 2);
+        assert_eq!(pictures[0].look.move_ease, Some(Ease::InOut));
+        assert!((pictures[0].look.move_to.unwrap().scale - 1.08).abs() < 0.001);
+        assert_eq!(pictures[1].look.move_ease, Some(Ease::Linear));
     }
 
     #[test]

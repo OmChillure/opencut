@@ -312,14 +312,28 @@ fn design_layout(raw: Option<&str>) -> oc_core::DesignLayout {
 
 fn design_prompt(subject: &str) -> String {
     format!(
-        "Full-frame flat motion graphic on one solid background color. \
-         The artwork touches the left, right, top, and bottom edges. \
-         No empty margin, no border, no watermark, no letters, no numbers, no people. \
-         Animate the subject itself happening across the whole clip: \
-         the first stroke at the start, the finished form filling the frame at the end. \
-         If this is a chart pattern or a diagram, draw that diagram forming, \
-         not a real-world object with the same name. {subject}"
+        "Flat motion graphic on one solid background. The artwork touches all four edges. \
+         No letters, no numbers, no people, no border. \
+         One subject and one move: it starts in one place in the frame and ends in another, \
+         so the change of place is obvious. It does not bob in place. \
+         If this is a chart pattern or a diagram, that diagram draws itself in one continuous stroke \
+         until the finished form fills the frame. It is not a real-world object with the same name. \
+         {subject}"
     )
+}
+
+#[cfg(test)]
+mod design_prompt_tests {
+    use super::design_prompt;
+
+    #[test]
+    fn a_graphic_is_one_move_with_the_words_left_out() {
+        let prompt = design_prompt("a bullish flag drawing itself");
+        assert!(prompt.contains("one move"), "{prompt}");
+        assert!(prompt.contains("No letters"), "{prompt}");
+        assert!(prompt.contains("continuous stroke"), "{prompt}");
+        assert!(prompt.contains("bullish flag"), "{prompt}");
+    }
 }
 
 fn broll_aspect(timeline: &Timeline, requested: Option<&str>) -> String {
