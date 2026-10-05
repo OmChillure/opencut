@@ -5,8 +5,24 @@ edition.workspace = true
 license.workspace = true
 description = "Plan a playhead frame and draw it"
 
+[features]
+gpu = [
+    "dep:wgpu",
+    "dep:bytemuck",
+    "dep:pollster",
+    "dep:wasm-bindgen",
+    "dep:web-sys",
+    "dep:wasm-bindgen-futures",
+]
+
 [dependencies]
 oc-time.workspace = true
 oc-timeline.workspace = true
 serde.workspace = true
 uuid.workspace = true
+wgpu = { version = "30", optional = true }
+bytemuck = { version = "1.21", features = ["derive"], optional = true }
+pollster = { version = "0.4", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "console", "Node", "Window", "Performance"], optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }

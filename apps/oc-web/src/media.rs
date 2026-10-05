@@ -1317,6 +1317,14 @@ fn preroll_ready(video: &HtmlVideoElement, shot: &ProgramShot) -> bool {
 }
 
 fn set_class_off(selector: &str, off: bool) {
+    set_class_token(selector, "off", off);
+}
+
+fn set_gpu_class(selector: &str, on: bool) {
+    set_class_token(selector, "gpu", on);
+}
+
+fn set_class_token(selector: &str, token: &str, on: bool) {
     let Some(el) = web_sys::window()
         .and_then(|w| w.document())
         .and_then(|d| d.query_selector(selector).ok().flatten())
@@ -1324,9 +1332,12 @@ fn set_class_off(selector: &str, off: bool) {
         return;
     };
     let class = el.get_attribute("class").unwrap_or_default();
-    let mut parts: Vec<&str> = class.split_whitespace().filter(|p| *p != "off").collect();
-    if off {
-        parts.push("off");
+    let mut parts: Vec<&str> = class
+        .split_whitespace()
+        .filter(|part| *part != token)
+        .collect();
+    if on {
+        parts.push(token);
     }
     let _ = el.set_attribute("class", &parts.join(" "));
 }
@@ -2869,8 +2880,74 @@ fn paint_program(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
     let mut fitted = plan;
     fitted.width = w;
     fitted.height = h;
-    let surface = oc_core::compositor::composite(&fitted, &sources, &engine.cubes);
-    let stabilize = fitted.layers.iter().any(|layer| {
+    match oc_core::compositor::monitor_path() {
+        oc_core::compositor::MonitorPath::Waiting => {
+            // The probe has not touched the canvas. Hiding it leaves the video element up.
+            set_class_off("#program-canvas", true);
+        }
+        oc_core::compositor::MonitorPath::Gpu => {
+            let (shift, scope) = monitor_shift_and_scope(&fitted, &sources, &engine.cubes, now);
+            store_gpu_scope(scope);
+            if oc_core::compositor::present_monitor(
+                &canvas,
+                &fitted,
+                &sources,
+                &engine.cubes,
+                shift,
+            ) {
+                set_gpu_class("#program-canvas", true);
+                set_class_off("#program-canvas", false);
+                set_class_off(".preview-mask-host", true);
+                set_class_off(".preview-letterbox", true);
+                set_class_off(".preview-vignette", true);
+            } else {
+                set_class_off("#program-canvas", true);
+            }
+        }
+        oc_core::compositor::MonitorPath::Cpu => {
+            set_gpu_class("#program-canvas", false);
+            clear_gpu_scope();
+            let surface = oc_core::compositor::composite(&fitted, &sources, &engine.cubes);
+            let stabilize = fitted.layers.iter().any(|layer| {
+                matches!(
+                    layer,
+                    oc_core::compositor::Layer::Video {
+                        stabilize: true,
+                        overlay: false,
+                        ..
+                    }
+                )
+            });
+            let surface = if stabilize {
+                stabilize_surface(surface, now)
+            } else {
+                reset_stabilize();
+                surface
+            };
+            if !blit_surface(&canvas, &surface) {
+                set_class_off("#program-canvas", true);
+                return;
+            }
+            set_class_off("#program-canvas", false);
+            // Grain stays in CSS above the canvas. The paint already has the mask, bars, and vignette.
+            set_class_off(".preview-mask-host", true);
+            set_class_off(".preview-letterbox", true);
+            set_class_off(".preview-vignette", true);
+        }
+    }
+}
+
+fn monitor_shift_and_scope(
+    plan: &oc_core::compositor::FramePlan,
+    sources: &[oc_core::compositor::FrameSource],
+    cubes: &[oc_core::CubeLut],
+    now: f64,
+) -> ((i32, i32), Vec<u8>) {
+    let mut thumb_plan = plan.clone();
+    thumb_plan.width = GRADE_W;
+    thumb_plan.height = GRADE_H;
+    let thumb = oc_core::compositor::composite(&thumb_plan, sources, cubes);
+    let stabilize = plan.layers.iter().any(|layer| {
         matches!(
             layer,
             oc_core::compositor::Layer::Video {
@@ -2880,21 +2957,22 @@ fn paint_program(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
             }
         )
     });
-    let surface = if stabilize {
-        stabilize_surface(surface, now)
-    } else {
+    if !stabilize {
         reset_stabilize();
-        surface
-    };
-    if !blit_surface(&canvas, &surface) {
-        set_class_off("#program-canvas", true);
-        return;
+        return ((0, 0), thumb.rgba);
     }
-    set_class_off("#program-canvas", false);
-    // Grain stays in CSS above the canvas. The paint already has the mask, bars, and vignette.
-    set_class_off(".preview-mask-host", true);
-    set_class_off(".preview-letterbox", true);
-    set_class_off(".preview-vignette", true);
+    let correction = STAB.with(|slot| {
+        let mut state = slot.borrow_mut();
+        stab_correction(&mut state, &thumb, now)
+    });
+    let scope = if correction == (0, 0) {
+        thumb.rgba
+    } else {
+        shift_surface(&thumb, correction.0, correction.1).rgba
+    };
+    let dx = ((correction.0 as f32) * (plan.width as f32 / STAB_W as f32)).round() as i32;
+    let dy = ((correction.1 as f32) * (plan.height as f32 / STAB_H as f32)).round() as i32;
+    ((dx, dy), scope)
 }
 
 fn sources_ready(
@@ -3161,6 +3239,15 @@ impl Default for StabMem {
 
 thread_local! {
     static STAB: RefCell<StabMem> = RefCell::new(StabMem::default());
+    static GPU_SCOPE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+fn store_gpu_scope(pixels: Vec<u8>) {
+    GPU_SCOPE.with(|slot| *slot.borrow_mut() = Some(pixels));
+}
+
+fn clear_gpu_scope() {
+    GPU_SCOPE.with(|slot| *slot.borrow_mut() = None);
 }
 
 fn reset_stabilize() {
@@ -3345,6 +3432,9 @@ fn program_scope_sample() -> Option<Vec<u8>> {
     let class = canvas.get_attribute("class").unwrap_or_default();
     if class.split_whitespace().any(|part| part == "off") {
         return None;
+    }
+    if class.split_whitespace().any(|part| part == "gpu") {
+        return GPU_SCOPE.with(|slot| slot.borrow().clone());
     }
     let w = canvas.width();
     let h = canvas.height();

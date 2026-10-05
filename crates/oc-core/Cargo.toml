@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Re-export of the OpenCut editor crates"
 
+[features]
+gpu = ["oc-compositor/gpu"]
+
 [dependencies]
 oc-compositor.workspace = true
 oc-tools.workspace = true

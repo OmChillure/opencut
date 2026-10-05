@@ -360,7 +360,7 @@ fn dest_to_uv(
     ((sx + rect_w * 0.5) / rect_w, (sy + rect_h * 0.5) / rect_h)
 }
 
-fn pan_px(value: f32, span: f32) -> f32 {
+pub(crate) fn pan_px(value: f32, span: f32) -> f32 {
     if value.abs() <= 1.5 {
         value * span
     } else {
@@ -473,27 +473,36 @@ fn counter_rgb(seconds: f64, x: f32, y: f32, width: u32, height: u32) -> [f32; 3
     let mm = (total / 60) % 100;
     let ss = total % 60;
     let glyphs = [mm / 10, mm % 10, 10, ss / 10, ss % 10];
-    let digit_h = (height as f32 * 0.28).max(7.0);
-    let cell = digit_h / 7.0;
-    let gap = cell;
-    let glyph_w = cell * 5.0;
-    let run = 5.0 * glyph_w + 4.0 * gap;
-    let x0 = (width as f32 - run) * 0.5;
-    let y0 = (height as f32 - digit_h) * 0.5;
-    if x < x0 || y < y0 || x >= x0 + run || y >= y0 + digit_h {
+    // Integer cells. A float cell lands one ulp under a column edge, and the
+    // GPU division rounds the other way.
+    let xi = x.floor().max(0.0) as u32;
+    let yi = y.floor().max(0.0) as u32;
+    let cell = (height * 28 / 100).max(7) / 7;
+    if cell == 0 {
+        return dark;
+    }
+    let glyph_w = cell * 5;
+    let digit_h = cell * 7;
+    let run = glyph_w * 5 + cell * 4;
+    if run > width || digit_h > height {
+        return dark;
+    }
+    let x0 = (width - run) / 2;
+    let y0 = (height - digit_h) / 2;
+    if xi < x0 || yi < y0 || xi >= x0 + run || yi >= y0 + digit_h {
         return dark;
     }
     let mut cursor = x0;
     for glyph in glyphs {
-        if x >= cursor && x < cursor + glyph_w {
-            let col = ((x - cursor) / cell).floor() as u32;
-            let row = ((y - y0) / cell).floor() as u32;
+        if xi >= cursor && xi < cursor + glyph_w {
+            let col = (xi - cursor) / cell;
+            let row = (yi - y0) / cell;
             if glyph_bit(glyph, col, row) {
                 return light;
             }
             return dark;
         }
-        cursor += glyph_w + gap;
+        cursor += glyph_w + cell;
     }
     dark
 }
@@ -676,7 +685,7 @@ fn mask_alpha(mask: AlphaShape, u: f32, v: f32) -> f32 {
     if mask.invert { 1.0 - inside } else { inside }
 }
 
-fn parse_hex(color: &str) -> [f32; 3] {
+pub(crate) fn parse_hex(color: &str) -> [f32; 3] {
     let hex = oc_timeline::canonical_color(color);
     let bytes = hex.trim_start_matches('#');
     let parse =
