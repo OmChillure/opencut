@@ -15,21 +15,15 @@ pub struct PromptImage {
 /// True when Claude, Grok, or Codex is signed in on this machine.
 #[must_use]
 pub fn subscription_ready() -> bool {
-    ProviderId::Claude.connected()
-        || ProviderId::Xai.connected()
-        || ProviderId::Openai.connected()
+    ProviderId::Claude.connected() || ProviderId::Xai.connected() || ProviderId::Openai.connected()
 }
 
 /// One still-labeling turn on a local subscription. Claude, then Grok, then Codex.
 pub async fn ask_with_stills(prompt: &str, frames: &[PromptImage]) -> Result<String, LlmError> {
-    let ready = [
-        ProviderId::Claude,
-        ProviderId::Xai,
-        ProviderId::Openai,
-    ]
-    .into_iter()
-    .filter(|id| id.connected())
-    .collect::<Vec<_>>();
+    let ready = [ProviderId::Claude, ProviderId::Xai, ProviderId::Openai]
+        .into_iter()
+        .filter(|id| id.connected())
+        .collect::<Vec<_>>();
     if ready.is_empty() {
         return Err(LlmError::Message(
             "Sign in with `claude auth login`, `grok`, or `codex`. Shot labels use that subscription."
@@ -146,11 +140,19 @@ async fn run_provider(
         tracing::warn!(bin = %bin, "acp adapter not on PATH — print fallback");
         return match id {
             ProviderId::Claude => {
-                emit(events, ChatEvent::status("ACP adapter missing — `claude -p`")).await;
+                emit(
+                    events,
+                    ChatEvent::status("ACP adapter missing — `claude -p`"),
+                )
+                .await;
                 claude_print(prompt, frames).await
             }
             ProviderId::Openai => {
-                emit(events, ChatEvent::status("ACP adapter missing — `codex exec`")).await;
+                emit(
+                    events,
+                    ChatEvent::status("ACP adapter missing — `codex exec`"),
+                )
+                .await;
                 codex_print(prompt, frames).await
             }
             ProviderId::Xai => Err(LlmError::Message(format!("ACP adapter missing: {bin}"))),
@@ -231,10 +233,7 @@ fn claude_launch(model: &str) -> (String, Vec<String>) {
     if npx_ok() {
         return (
             "npx".into(),
-            vec![
-                "-y".into(),
-                "@agentclientprotocol/claude-agent-acp".into(),
-            ],
+            vec!["-y".into(), "@agentclientprotocol/claude-agent-acp".into()],
         );
     }
     // No adapter on PATH — run_provider falls through to `claude -p`.
@@ -242,19 +241,46 @@ fn claude_launch(model: &str) -> (String, Vec<String>) {
 }
 
 fn codex_launch(model: &str) -> (String, Vec<String>) {
-    if let Ok(bin) = std::env::var("OPENCUT_CODEX_ACP") {
-        return (bin, acp_model_args(model));
+    let explicit = std::env::var("OPENCUT_CODEX_ACP")
+        .ok()
+        .filter(|path| !path.is_empty());
+    let resolved = explicit
+        .or_else(|| resolve_bin("codex-acp"))
+        .or_else(|| npm_global_bin("codex-acp"));
+    codex_command(model, resolved.as_deref(), resolve_bin("npx").is_some())
+}
+
+/// `codex-acp` takes the model later, through `session/set_config_option`.
+/// A `--model` argument is ignored unless the process is the bundled CLI.
+fn codex_command(model: &str, resolved: Option<&str>, npx: bool) -> (String, Vec<String>) {
+    let _ = model;
+    if let Some(bin) = resolved.map(str::trim).filter(|path| !path.is_empty()) {
+        return (bin.to_string(), Vec::new());
     }
-    if which("codex-acp") {
-        return ("codex-acp".into(), acp_model_args(model));
-    }
-    if npx_ok() {
+    if npx {
         return (
             "npx".into(),
             vec!["-y".into(), "@agentclientprotocol/codex-acp".into()],
         );
     }
-    ("codex-acp".into(), acp_model_args(model))
+    ("codex-acp".into(), Vec::new())
+}
+
+fn npm_global_bin(name: &str) -> Option<String> {
+    let npm = resolve_bin("npm")?;
+    let output = std::process::Command::new(npm)
+        .args(["prefix", "-g"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if prefix.is_empty() {
+        return None;
+    }
+    let path = format!("{prefix}/bin/{name}");
+    std::path::Path::new(&path).is_file().then_some(path)
 }
 
 fn acp_model_args(model: &str) -> Vec<String> {
@@ -290,7 +316,9 @@ fn resolve_bin(bin: &str) -> Option<String> {
         format!("{home}/.local/bin/{bin}"),
         format!("{home}/.nvm/versions/node/v24.10.0/bin/{bin}"),
     ];
-    extras.into_iter().find(|p| std::path::Path::new(p).is_file())
+    extras
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
 }
 
 fn npx_ok() -> bool {
@@ -309,7 +337,12 @@ async fn spawn_acp(
     frames: &[PromptImage],
     events: Option<&EventSink>,
 ) -> Result<String, LlmError> {
-    tracing::info!(bin, mcp = mcp_servers.len(), frames = frames.len(), "acp connect");
+    tracing::info!(
+        bin,
+        mcp = mcp_servers.len(),
+        frames = frames.len(),
+        "acp connect"
+    );
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".into());
@@ -377,10 +410,7 @@ impl DirectorSession {
                 .await
             {
                 Ok(session_id) => Ok(Self {
-                    inner: SessionInner::Acp {
-                        client,
-                        session_id,
-                    },
+                    inner: SessionInner::Acp { client, session_id },
                     chars: 0,
                     started: false,
                 }),
@@ -423,10 +453,11 @@ impl DirectorSession {
         self.chars += message.len();
         self.started = true;
         let text = match &mut self.inner {
-            SessionInner::Acp {
-                client,
-                session_id,
-            } => client.continue_prompt(session_id, message, frames, events).await?,
+            SessionInner::Acp { client, session_id } => {
+                client
+                    .continue_prompt(session_id, message, frames, events)
+                    .await?
+            }
             SessionInner::Stateless => {
                 return Err(LlmError::Message(
                     "no ACP session — use complete_stream".into(),
@@ -477,7 +508,10 @@ fn build_prompt(system: &str, turns: &[ChatTurn], tools: &[McpTool], mcp_attache
         );
         for tool in tools {
             let schema = serde_json::to_string(&tool.input_schema).unwrap_or_else(|_| "{}".into());
-            out.push_str(&format!("- {}: {} {}\n", tool.name, tool.description, schema));
+            out.push_str(&format!(
+                "- {}: {} {}\n",
+                tool.name, tool.description, schema
+            ));
         }
         out.push_str("If you edit, output TOOL lines first. Then a short sentence for the user.\n");
     }
@@ -523,7 +557,9 @@ async fn claude_print(prompt: &str, frames: &[PromptImage]) -> Result<String, Ll
                 LlmError::Message(format!("spawn claude: {e}. Run `claude auth login` first."))
             })?;
         if !out.status.success() {
-            return Err(LlmError::Message(String::from_utf8_lossy(&out.stderr).into()));
+            return Err(LlmError::Message(
+                String::from_utf8_lossy(&out.stderr).into(),
+            ));
         }
         return Ok(String::from_utf8_lossy(&out.stdout).into());
     }
@@ -561,10 +597,7 @@ async fn claude_print(prompt: &str, frames: &[PromptImage]) -> Result<String, Ll
         })?;
     }
     let out = child.wait_with_output().await.map_err(|e| {
-        LlmError::Message(format!(
-            "claude: {e}. Stills are at {}",
-            still_list(&paths)
-        ))
+        LlmError::Message(format!("claude: {e}. Stills are at {}", still_list(&paths)))
     })?;
     if !out.status.success() {
         return Err(LlmError::Message(format!(
@@ -634,9 +667,15 @@ async fn write_stills(frames: &[PromptImage]) -> Result<Vec<std::path::PathBuf>,
     Ok(paths)
 }
 
-fn prompt_with_stills(prompt: &str, paths: &[std::path::PathBuf], frames: &[PromptImage]) -> String {
+fn prompt_with_stills(
+    prompt: &str,
+    paths: &[std::path::PathBuf],
+    frames: &[PromptImage],
+) -> String {
     let mut out = prompt.to_string();
-    out.push_str("\n\nStills for this turn (also attached). Read the file if the image block is missing:\n");
+    out.push_str(
+        "\n\nStills for this turn (also attached). Read the file if the image block is missing:\n",
+    );
     for (path, frame) in paths.iter().zip(frames) {
         out.push_str(&format!("- {} — {}\n", path.display(), frame.caption));
     }
@@ -746,9 +785,8 @@ mod tests {
 
     #[test]
     fn parses_tool_lines() {
-        let reply = parse_tool_reply(
-            "TOOL list_bin {}\nTOOL split {\"at\": 1.2}\nCut at 1.2s.".into(),
-        );
+        let reply =
+            parse_tool_reply("TOOL list_bin {}\nTOOL split {\"at\": 1.2}\nCut at 1.2s.".into());
         match reply {
             LlmReply::Tools(calls) => {
                 assert_eq!(calls.len(), 2);
@@ -757,6 +795,25 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn codex_launches_the_resolved_binary_without_a_model_flag() {
+        let (bin, args) = codex_command("gpt-5", Some("/opt/codex-acp"), false);
+        assert_eq!(bin, "/opt/codex-acp");
+        assert!(args.is_empty());
+        let (bin, args) = codex_command("gpt-5", None, true);
+        assert_eq!(bin, "npx");
+        assert_eq!(
+            args,
+            vec![
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp".to_string()
+            ]
+        );
+        let (bin, args) = codex_command("", Some("  "), false);
+        assert_eq!(bin, "codex-acp");
+        assert!(args.is_empty());
     }
 
     #[test]
