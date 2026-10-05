@@ -98,7 +98,9 @@ pub async fn put_media_bytes(
     bytes: Vec<u8>,
 ) -> Result<(), String> {
     let res = reqwest::Client::new()
-        .put(format!("{API}/v1/projects/{project_id}/media/{media_id}/bytes"))
+        .put(format!(
+            "{API}/v1/projects/{project_id}/media/{media_id}/bytes"
+        ))
         .header("content-type", content_type)
         .body(bytes)
         .send()
@@ -474,8 +476,7 @@ async fn wasm_read_ndjson(
 
 #[cfg(target_arch = "wasm32")]
 fn js_err(err: wasm_bindgen::JsValue) -> String {
-    err.as_string()
-        .unwrap_or_else(|| format!("{err:?}"))
+    err.as_string().unwrap_or_else(|| format!("{err:?}"))
 }
 
 const API: &str = "http://127.0.0.1:8787";
@@ -623,20 +624,18 @@ pub async fn list_media(project_id: &str) -> Result<Vec<MediaItem>, String> {
     Ok(rows
         .into_iter()
         .map(|row| {
-            {
-                let id = value_to_id(row.id);
-                let play = row
-                    .play_url
-                    .filter(|u| !u.is_empty() && !u.starts_with("blob:"))
-                    .unwrap_or_else(|| media_file_url(project_id, &id));
-                bind::media_from_api(
-                    &id,
-                    row.filename,
-                    &row.content_type,
-                    row.duration_ticks,
-                    Some(play),
-                )
-            }
+            let id = value_to_id(row.id);
+            let play = row
+                .play_url
+                .filter(|u| !u.is_empty() && !u.starts_with("blob:"))
+                .unwrap_or_else(|| media_file_url(project_id, &id));
+            bind::media_from_api(
+                &id,
+                row.filename,
+                &row.content_type,
+                row.duration_ticks,
+                Some(play),
+            )
         })
         .collect())
 }
@@ -707,9 +706,7 @@ pub async fn upload_media(
     if !pending.status().is_success() {
         let status = pending.status();
         let body = pending.text().await.unwrap_or_default();
-        return Err(format!(
-            "upload {status} for project {project_id}: {body}"
-        ));
+        return Err(format!("upload {status} for project {project_id}: {body}"));
     }
     let res: UploadResponse = pending.json().await.map_err(|e| e.to_string())?;
     let media_id = value_to_id(res.media_id);

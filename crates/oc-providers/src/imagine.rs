@@ -6,7 +6,11 @@ const SIGN_IN: &str = "Sign in with `grok`. B-roll and motion design use that su
 const EXPIRED: &str = "Grok sign-in expired. Run `grok` and try again.";
 
 /// One silent mp4. `requested` is seconds. Returns the file bytes and its duration.
-pub async fn imagine_clip(prompt: &str, requested: u32, aspect: &str) -> Result<(Vec<u8>, f64), String> {
+pub async fn imagine_clip(
+    prompt: &str,
+    requested: u32,
+    aspect: &str,
+) -> Result<(Vec<u8>, f64), String> {
     let token = session_token().await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(90))
@@ -59,7 +63,11 @@ pub async fn imagine_clip(prompt: &str, requested: u32, aspect: &str) -> Result<
             return Err(format!("video poll {status}: {}", clip_body(&body)));
         }
         let body: Value = polled.json().await.map_err(|e| e.to_string())?;
-        match body.get("status").and_then(Value::as_str).unwrap_or("pending") {
+        match body
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending")
+        {
             "done" => {
                 video_url = body
                     .pointer("/video/url")

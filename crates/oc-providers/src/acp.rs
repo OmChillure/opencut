@@ -334,7 +334,10 @@ fn is_incoming_request(msg: &Rpc) -> bool {
 fn extract_text(params: &Option<Value>) -> Option<String> {
     let v = params.as_ref()?;
     let kind = session_update_kind(v);
-    if matches!(kind.as_deref(), Some("agent_message_chunk" | "agent_message")) {
+    if matches!(
+        kind.as_deref(),
+        Some("agent_message_chunk" | "agent_message")
+    ) {
         if let Some(text) = content_text(v) {
             return Some(text);
         }
@@ -725,7 +728,10 @@ mod tests {
         let visible = user_visible_text(format!(
             "{dump}\n\nI'll cut a 40 second vlog from the clips you imported."
         ));
-        assert_eq!(visible, "I'll cut a 40 second vlog from the clips you imported.");
+        assert_eq!(
+            visible,
+            "I'll cut a 40 second vlog from the clips you imported."
+        );
         assert!(user_visible_text(dump.to_string()).is_empty());
         assert_eq!(
             user_visible_text("I'll cut a 40 second vlog from the clips.".into()),
@@ -738,7 +744,10 @@ mod tests {
         let log = "acp: [2m2026-10-01T08:59:20Z[0m [32m INFO[0m sampling.request model=grok-4.7 auth_prefix=hidden sse_chunk encrypted_content api_backend=responses";
         assert!(cli_noise(log));
         assert!(stderr_chat_note(log).is_none());
-        assert!(stderr_chat_note("INFO sampling.request base_url=https://cli-chat-proxy.grok.com/v1").is_none());
+        assert!(
+            stderr_chat_note("INFO sampling.request base_url=https://cli-chat-proxy.grok.com/v1")
+                .is_none()
+        );
         assert_eq!(
             stderr_chat_note("Error: grok is not logged in").as_deref(),
             Some("acp: Error: grok is not logged in")

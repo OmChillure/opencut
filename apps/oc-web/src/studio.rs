@@ -1,13 +1,11 @@
 //! Editor surfaces modeled on Kdenlive: audio mixer, curves, alpha shapes,
 //! scopes, generators, time remap, undo history, multicam, and the rendered file.
 
+use crate::WorkspaceSave;
 use crate::media::{self, Clock, MediaItem, capture_pointer};
 use crate::tools;
-use crate::WorkspaceSave;
 use dioxus::prelude::*;
-use oc_core::{
-    AlphaShape, CurvePoint, Curves, Generator, MaskShape, Mix, SpeedKey, TrackKind,
-};
+use oc_core::{AlphaShape, CurvePoint, Curves, Generator, MaskShape, Mix, SpeedKey, TrackKind};
 use oc_tools::ToolId;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -322,10 +320,7 @@ pub fn CurvesPanel(selected: String, track: String, at: f64) -> Element {
 }
 
 fn curve_ends() -> Vec<CurvePoint> {
-    vec![
-        CurvePoint { x: 0.0, y: 0.0 },
-        CurvePoint { x: 1.0, y: 1.0 },
-    ]
+    vec![CurvePoint { x: 0.0, y: 0.0 }, CurvePoint { x: 1.0, y: 1.0 }]
 }
 
 fn nearest_point(points: &[CurvePoint], x: f32, y: f32) -> Option<usize> {
@@ -367,7 +362,14 @@ pub fn MaskPanel(selected: String, track: String, at: f64) -> Element {
     let track_clear = track.clone();
     use_effect(move || {
         let id = selected_load.clone();
-        let mask = save.engine.read().tracks.iter().flat_map(|row| row.clips.iter()).find(|clip| clip.id.to_string() == id).and_then(|clip| clip.look.mask);
+        let mask = save
+            .engine
+            .read()
+            .tracks
+            .iter()
+            .flat_map(|row| row.clips.iter())
+            .find(|clip| clip.id.to_string() == id)
+            .and_then(|clip| clip.look.mask);
         if let Some(mask) = mask {
             shape.set(mask.shape);
             feather.set(mask.feather);
@@ -734,10 +736,20 @@ pub fn MulticamBank() -> Element {
         .filter(|t| t.kind == TrackKind::Video)
         .enumerate()
         .filter_map(|(i, track)| {
-            let clip = track.clips.iter().find(|c| c.contains(oc_core::Time::from_seconds(at)))?;
-            let url = clip.media_id.and_then(|id| {
-                library.read().iter().find(|m| m.id == id.to_string()).map(|m| m.url.clone())
-            }).unwrap_or_default();
+            let clip = track
+                .clips
+                .iter()
+                .find(|c| c.contains(oc_core::Time::from_seconds(at)))?;
+            let url = clip
+                .media_id
+                .and_then(|id| {
+                    library
+                        .read()
+                        .iter()
+                        .find(|m| m.id == id.to_string())
+                        .map(|m| m.url.clone())
+                })
+                .unwrap_or_default();
             let src = clip
                 .source_time_at(oc_core::Time::from_seconds(at))
                 .map(|t| t.as_seconds())
@@ -852,7 +864,9 @@ async fn paint_film(url: &str, tiles: i32, host: &str) {
     let tiles = tiles.max(1) as u32;
     for i in 0..tiles.min(list.length()) {
         let Some(node) = list.item(i) else { continue };
-        let Ok(canvas) = node.dyn_into::<HtmlCanvasElement>() else { continue };
+        let Ok(canvas) = node.dyn_into::<HtmlCanvasElement>() else {
+            continue;
+        };
         let at = if tiles == 1 {
             0.0
         } else {
@@ -866,7 +880,8 @@ async fn paint_film(url: &str, tiles: i32, host: &str) {
             .flatten()
             .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
         {
-            let _ = ctx.draw_image_with_html_video_element_and_dw_and_dh(&video, 0.0, 0.0, 48.0, 36.0);
+            let _ =
+                ctx.draw_image_with_html_video_element_and_dw_and_dh(&video, 0.0, 0.0, 48.0, 36.0);
         }
     }
 }
@@ -904,12 +919,18 @@ pub fn Waveform(url: String, bars: usize, seed: String) -> Element {
 
 async fn decode_peaks(url: &str, bars: usize) -> Option<Vec<u8>> {
     let win = web_sys::window()?;
-    let resp = wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(url)).await.ok()?;
+    let resp = wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(url))
+        .await
+        .ok()?;
     let resp: web_sys::Response = resp.dyn_into().ok()?;
-    let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().ok()?).await.ok()?;
+    let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().ok()?)
+        .await
+        .ok()?;
     let buf: js_sys::ArrayBuffer = buf.dyn_into().ok()?;
     let ctx = web_sys::AudioContext::new().ok()?;
-    let audio = wasm_bindgen_futures::JsFuture::from(ctx.decode_audio_data(&buf).ok()?).await.ok()?;
+    let audio = wasm_bindgen_futures::JsFuture::from(ctx.decode_audio_data(&buf).ok()?)
+        .await
+        .ok()?;
     let audio: web_sys::AudioBuffer = audio.dyn_into().ok()?;
     let data = audio.get_channel_data(0).ok()?;
     let bars = bars.max(1);

@@ -23,9 +23,15 @@ pub type EventSink = mpsc::Sender<ChatEvent>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEvent {
-    Status { text: String },
-    Text { text: String },
-    Thought { text: String },
+    Status {
+        text: String,
+    },
+    Text {
+        text: String,
+    },
+    Thought {
+        text: String,
+    },
     Tool {
         id: String,
         name: String,
@@ -35,7 +41,9 @@ pub enum ChatEvent {
         result: Option<String>,
         status: String,
     },
-    Note { text: String },
+    Note {
+        text: String,
+    },
 }
 
 impl ChatEvent {

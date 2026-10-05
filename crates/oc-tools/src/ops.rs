@@ -502,7 +502,10 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
     let note = match &op {
         Op::Split { clip_id, at } => {
             let right = timeline.split(*clip_id, *at)?;
-            format!("split clip {clip_id} at {}; new clip {right}", at.as_seconds())
+            format!(
+                "split clip {clip_id} at {}; new clip {right}",
+                at.as_seconds()
+            )
         }
         Op::Trim {
             clip_id,
@@ -786,9 +789,7 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
                     };
                 }
                 _ => {
-                    return Err(OpError::Message(
-                        "transform is for video clips".into(),
-                    ));
+                    return Err(OpError::Message("transform is for video clips".into()));
                 }
             }
             format!(
@@ -803,7 +804,8 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             duration,
         } => {
             let track_id = overlay_track(timeline);
-            let mut picture = clip_for_media(*media_id, *at, *duration, TrackKind::Video, *source_in);
+            let mut picture =
+                clip_for_media(*media_id, *at, *duration, TrackKind::Video, *source_in);
             if let ClipKind::Video { transform } = &mut picture.kind {
                 transform.scale = 1.28;
             }
@@ -988,13 +990,15 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             duration,
         } => {
             let track_id = resolve_track(timeline, None, TrackKind::Video);
-            let mut clip = clip_for_media(MediaId::new(), *at, *duration, TrackKind::Video, Time::ZERO);
+            let mut clip =
+                clip_for_media(MediaId::new(), *at, *duration, TrackKind::Video, Time::ZERO);
             clip.media_id = None;
             clip.look.generator = Some(generator.clone());
             let id = timeline.place_clip(track_id, clip, PlaceMode::Normal)?;
             if matches!(generator, Generator::WhiteNoise | Generator::Counter) {
                 let audio_track = resolve_track(timeline, None, TrackKind::Audio);
-                let mut bed = clip_for_media(MediaId::new(), *at, *duration, TrackKind::Audio, Time::ZERO);
+                let mut bed =
+                    clip_for_media(MediaId::new(), *at, *duration, TrackKind::Audio, Time::ZERO);
                 bed.media_id = None;
                 bed.look.generator = Some(generator.clone());
                 if let ClipKind::Audio { volume, .. } = &mut bed.kind {
@@ -1077,7 +1081,11 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             let id = timeline.import_cube(*clip_id, text)?;
             format!("cube {id} on {clip_id}")
         }
-        Op::JlCut { clip_id, lead, tail } => {
+        Op::JlCut {
+            clip_id,
+            lead,
+            tail,
+        } => {
             let id = timeline.jl_cut(*clip_id, *lead, *tail)?;
             format!(
                 "J/L {id} lead {:.2}s tail {:.2}s",
@@ -1131,15 +1139,12 @@ fn snap_joins(timeline: &mut Timeline, tolerance_frames: u32, beats: &[f64]) -> 
 }
 
 fn nearest(beats: &[f64], at: f64) -> Option<f64> {
-    beats
-        .iter()
-        .copied()
-        .min_by(|a, b| {
-            (a - at)
-                .abs()
-                .partial_cmp(&(b - at).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+    beats.iter().copied().min_by(|a, b| {
+        (a - at)
+            .abs()
+            .partial_cmp(&(b - at).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 fn clip_for_media(
@@ -1283,7 +1288,8 @@ fn named_video_track(timeline: &mut Timeline, name: &str) -> TrackId {
 
 fn speaker_under(timeline: &Timeline, at: Time) -> Option<&Clip> {
     timeline.tracks.iter().find_map(|track| {
-        if track.kind != TrackKind::Video || matches!(track.name.as_str(), "Design" | "Front" | "GFX")
+        if track.kind != TrackKind::Video
+            || matches!(track.name.as_str(), "Design" | "Front" | "GFX")
         {
             return None;
         }
@@ -1443,7 +1449,10 @@ fn assemble_short(
     };
     let a1 = resolve_track(timeline, None, TrackKind::Audio);
 
-    let excerpt_n = a_roll.iter().map(|i| i.excerpts.len().max(1)).sum::<usize>() as f64;
+    let excerpt_n = a_roll
+        .iter()
+        .map(|i| i.excerpts.len().max(1))
+        .sum::<usize>() as f64;
     let n_a = excerpt_n.max(1.0);
     let target = target_seconds.unwrap_or((n_a * 5.0).clamp(30.0, 60.0));
     let per = (target / n_a).clamp(2.8, 10.0);
@@ -1513,7 +1522,9 @@ fn assemble_short(
     }
 
     if let Some(bed) = music.first() {
-        let take = span.as_seconds().min(bed.duration.as_seconds().max(span.as_seconds()));
+        let take = span
+            .as_seconds()
+            .min(bed.duration.as_seconds().max(span.as_seconds()));
         let clip = clip_for_media(
             bed.media_id,
             Time::ZERO,
@@ -1658,13 +1669,18 @@ fn cut_ranges(timeline: &mut Timeline, ranges: &[TimeRange]) -> Result<usize> {
 /// Pick keep-takes from timestamped speech so one long source can become a short.
 #[must_use]
 /// Excerpts for a timed short. A quoted line in the request becomes the open.
-pub fn excerpts_for_request(cues: &[(Time, Time, &str)], request: &str, target_s: f64) -> Vec<Excerpt> {
+pub fn excerpts_for_request(
+    cues: &[(Time, Time, &str)],
+    request: &str,
+    target_s: f64,
+) -> Vec<Excerpt> {
     let quote = quoted_line(request);
     if let Some(q) = quote {
         let needle = q.to_ascii_lowercase();
-        if let Some(i) = cues.iter().position(|(_, _, text)| {
-            text.to_ascii_lowercase().contains(needle.trim())
-        }) {
+        if let Some(i) = cues
+            .iter()
+            .position(|(_, _, text)| text.to_ascii_lowercase().contains(needle.trim()))
+        {
             return excerpts_from(cues, i, target_s);
         }
     }
@@ -1846,10 +1862,7 @@ pub fn choose_piece(beats: &[SourceBeat], request: &str, target_s: f64) -> Vec<P
     let target = target_s.clamp(8.0, 90.0);
     let quote = quoted_line(request).map(|q| q.to_ascii_lowercase());
     let quote = quote.as_deref();
-    let mut pool: Vec<&SourceBeat> = beats
-        .iter()
-        .filter(|b| score_beat(b, quote) >= 3)
-        .collect();
+    let mut pool: Vec<&SourceBeat> = beats.iter().filter(|b| score_beat(b, quote) >= 3).collect();
     let any_speech = pool.iter().any(|b| b.role == "speech");
     if any_speech {
         pool.retain(|b| b.role == "speech");
@@ -2012,7 +2025,12 @@ fn overlaps_pick(pool: &[&SourceBeat], selected: &[usize], i: usize) -> bool {
     })
 }
 
-fn uncovered_jump(beats: &[SourceBeat], pool: &[&SourceBeat], selected: &[usize], i: usize) -> bool {
+fn uncovered_jump(
+    beats: &[SourceBeat],
+    pool: &[&SourceBeat],
+    selected: &[usize],
+    i: usize,
+) -> bool {
     let beat = pool[i];
     selected.iter().any(|&s| {
         let other = pool[s];
@@ -2055,8 +2073,10 @@ fn cover_for<'a>(beats: &'a [SourceBeat], a: PiecePick, b: PiecePick) -> Option<
             return false;
         }
         if c.media == a.media {
-            let overlaps_a = c.start < a.source_in + a.duration - 0.05 && c.end > a.source_in + 0.05;
-            let overlaps_b = c.start < b.source_in + b.duration - 0.05 && c.end > b.source_in + 0.05;
+            let overlaps_a =
+                c.start < a.source_in + a.duration - 0.05 && c.end > a.source_in + 0.05;
+            let overlaps_b =
+                c.start < b.source_in + b.duration - 0.05 && c.end > b.source_in + 0.05;
             if overlaps_a || overlaps_b {
                 return false;
             }
@@ -2249,7 +2269,9 @@ mod tests {
         apply(
             &mut tl,
             &mut undo,
-            Op::SetTimeline { timeline: next.clone() },
+            Op::SetTimeline {
+                timeline: next.clone(),
+            },
         )
         .unwrap();
         assert_eq!(tl.width, 1080);
@@ -2316,8 +2338,14 @@ mod tests {
             Op::SetSpeedKeys {
                 clip_id: id,
                 keys: vec![
-                    oc_timeline::SpeedKey { at: 0.0, speed: 1.0 },
-                    oc_timeline::SpeedKey { at: 1.0, speed: 2.0 },
+                    oc_timeline::SpeedKey {
+                        at: 0.0,
+                        speed: 1.0,
+                    },
+                    oc_timeline::SpeedKey {
+                        at: 1.0,
+                        speed: 2.0,
+                    },
                 ],
             },
         )
@@ -2527,7 +2555,14 @@ mod tests {
         let media = MediaId::new();
         let beats = vec![
             beat(media, 1.0, 4.0, "", "speech", "the road was empty"),
-            beat(media, 40.0, 44.0, "close", "speech", "what if we left tonight?"),
+            beat(
+                media,
+                40.0,
+                44.0,
+                "close",
+                "speech",
+                "what if we left tonight?",
+            ),
             beat(media, 50.0, 54.0, "wide", "speech", "we made it by dawn"),
             beat(media, 4.2, 4.8, "close", "filler", "um"),
         ];
@@ -2603,10 +2638,26 @@ mod tests {
                 Time::from_seconds(4.0),
                 "what if we just left tonight?",
             ),
-            (Time::from_seconds(4.2), Time::from_seconds(7.0), "pack the car"),
-            (Time::from_seconds(20.0), Time::from_seconds(24.0), "the road was empty"),
-            (Time::from_seconds(40.0), Time::from_seconds(44.0), "we made it by dawn"),
-            (Time::from_seconds(80.0), Time::from_seconds(84.0), "that was the whole trip"),
+            (
+                Time::from_seconds(4.2),
+                Time::from_seconds(7.0),
+                "pack the car",
+            ),
+            (
+                Time::from_seconds(20.0),
+                Time::from_seconds(24.0),
+                "the road was empty",
+            ),
+            (
+                Time::from_seconds(40.0),
+                Time::from_seconds(44.0),
+                "we made it by dawn",
+            ),
+            (
+                Time::from_seconds(80.0),
+                Time::from_seconds(84.0),
+                "that was the whole trip",
+            ),
         ];
         let takes = pick_reel_excerpts(&cues, 30.0);
         assert!(takes.len() >= 3, "{takes:?}");

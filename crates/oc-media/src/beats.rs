@@ -33,11 +33,7 @@ pub fn detect_beats(samples: &[f32], sample_rate: u32) -> MusicAnalysis {
         i += hop;
     }
     let mean = flux.iter().copied().sum::<f32>() / flux.len().max(1) as f32;
-    let var = flux
-        .iter()
-        .map(|v| (v - mean).powi(2))
-        .sum::<f32>()
-        / flux.len().max(1) as f32;
+    let var = flux.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / flux.len().max(1) as f32;
     let thresh = mean + var.sqrt() * 0.8;
     let mut beats = Vec::new();
     let mut last = -1.0;

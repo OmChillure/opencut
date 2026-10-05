@@ -1,8 +1,8 @@
 use crate::media::{EditorTrack, MediaItem, MediaKind, TimelineClip, TrackKindUi};
 use oc_core::time::TICKS_PER_SECOND;
 use oc_core::{
-    Clip, ClipId, Duration, GroupId, LinkId, MediaId, Time, Timeline, Track, TrackId,
-    TrackKind, timeline::ClipKind,
+    Clip, ClipId, Duration, GroupId, LinkId, MediaId, Time, Timeline, Track, TrackId, TrackKind,
+    timeline::ClipKind,
 };
 use uuid::Uuid;
 
@@ -21,10 +21,7 @@ pub fn tracks_from_timeline(timeline: &Timeline) -> Vec<EditorTrack> {
                 .iter()
                 .map(|clip| TimelineClip {
                     id: clip.id.to_string(),
-                    media_id: clip
-                        .media_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_default(),
+                    media_id: clip.media_id.map(|id| id.to_string()).unwrap_or_default(),
                     start: clip.start.as_seconds(),
                     duration: clip.duration.as_seconds(),
                     source_in: clip.source_in.as_seconds(),
@@ -92,7 +89,10 @@ pub fn timeline_from_tracks(
 fn clip_from_ui(clip: &TimelineClip, kind: TrackKindUi, prev: &Timeline) -> Clip {
     let id = parse_clip_id(&clip.id);
     let prev_kind = prev.find_clip(id).map(|(_, c)| c.kind.clone());
-    let look = prev.find_clip(id).map(|(_, c)| c.look.clone()).unwrap_or_default();
+    let look = prev
+        .find_clip(id)
+        .map(|(_, c)| c.look.clone())
+        .unwrap_or_default();
     let kind = match kind {
         TrackKindUi::Video => match prev_kind {
             Some(k @ ClipKind::Video { .. }) => k,

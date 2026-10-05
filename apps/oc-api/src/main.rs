@@ -14,11 +14,10 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use crate::routes::{
-    apply_ops, chat, complete_upload, create_chat, create_project, delete_project, get_chat,
-    get_project, health, list_chats, save_chat_messages,
-    get_export, get_media_file, head_export, list_ai_providers, list_media, list_projects,
-    patch_media, put_media_bytes, generate_captions, register_media, request_upload,
-    transcribe_media, update_project,
+    apply_ops, chat, complete_upload, create_chat, create_project, delete_project,
+    generate_captions, get_chat, get_export, get_media_file, get_project, head_export, health,
+    list_ai_providers, list_chats, list_media, list_projects, patch_media, put_media_bytes,
+    register_media, request_upload, save_chat_messages, transcribe_media, update_project,
 };
 use crate::state::AppState;
 
@@ -44,16 +43,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let state = AppState::connect().await.context("connect dependencies")?;
-    oc_db::migrate(&state.db)
-        .await
-        .context("run migrations")?;
+    oc_db::migrate(&state.db).await.context("run migrations")?;
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/projects", get(list_projects).post(create_project))
         .route(
             "/v1/projects/{id}",
-            get(get_project).patch(update_project).delete(delete_project),
+            get(get_project)
+                .patch(update_project)
+                .delete(delete_project),
         )
         .route("/v1/projects/{id}/ops", post(apply_ops))
         .route("/v1/ai/providers", get(list_ai_providers))
@@ -64,12 +63,12 @@ async fn main() -> anyhow::Result<()> {
             "/v1/projects/{id}/chats/{chat_id}/messages",
             put(save_chat_messages),
         )
-        .route("/v1/projects/{id}/media", get(list_media).post(register_media))
-        .route("/v1/projects/{id}/media/upload", post(request_upload))
         .route(
-            "/v1/projects/{id}/media/{media_id}",
-            patch(patch_media),
+            "/v1/projects/{id}/media",
+            get(list_media).post(register_media),
         )
+        .route("/v1/projects/{id}/media/upload", post(request_upload))
+        .route("/v1/projects/{id}/media/{media_id}", patch(patch_media))
         .route(
             "/v1/projects/{id}/media/{media_id}/bytes",
             axum::routing::put(put_media_bytes).layer(DefaultBodyLimit::max(max_upload_bytes())),
@@ -78,7 +77,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/projects/{id}/media/{media_id}/file",
             get(get_media_file),
         )
-        .route("/v1/projects/{id}/export", get(get_export).head(head_export))
+        .route(
+            "/v1/projects/{id}/export",
+            get(get_export).head(head_export),
+        )
         .route(
             "/v1/projects/{id}/media/{media_id}/complete",
             post(complete_upload),

@@ -2,8 +2,8 @@ use crate::bind;
 use crate::{WorkspaceSave, api};
 use dioxus::prelude::*;
 use oc_core::{
-    ClipId, Duration, Fx, Grade, Graphic, Intent, Op, Time, TrackId, TransitionKind,
-    UndoStack, apply, parse_intent,
+    ClipId, Duration, Fx, Grade, Graphic, Intent, Op, Time, TrackId, TransitionKind, UndoStack,
+    apply, parse_intent,
 };
 use uuid::Uuid;
 
@@ -228,9 +228,8 @@ fn clip_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<ClipId, Strin
         .flat_map(|track| track.clips.iter().map(move |c| (track.id.as_str(), c)))
         .find(|(_, clip)| at + 1e-4 >= clip.start && at < clip.end())
         .and_then(|(_, clip)| parse_clip_id(&clip.id));
-    from_ui.ok_or_else(|| {
-        "no clip at the playhead — click the shot, then apply the mix".to_string()
-    })
+    from_ui
+        .ok_or_else(|| "no clip at the playhead — click the shot, then apply the mix".to_string())
 }
 
 pub fn delete_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<String>, String> {
@@ -246,7 +245,12 @@ pub fn delete_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<Str
     run_ops(save, vec![Op::RippleDelete { clip_id }])
 }
 
-pub fn trim_clip(save: WorkspaceSave, clip_id: &str, start: f64, duration: f64) -> Result<Vec<String>, String> {
+pub fn trim_clip(
+    save: WorkspaceSave,
+    clip_id: &str,
+    start: f64,
+    duration: f64,
+) -> Result<Vec<String>, String> {
     let clip_id = parse_clip_id(clip_id).ok_or_else(|| "bad clip id".to_string())?;
     run_ops(
         save,
@@ -268,20 +272,17 @@ pub fn run_intent(
         Intent::Split => split_at(save, track_id, at),
         Intent::Merge => merge_at(save, track_id, at),
         Intent::Delete => delete_at(save, track_id, at),
-        Intent::TrimIn | Intent::TrimOut => {
-            Err("drag a clip edge to trim, or split first".into())
+        Intent::TrimIn | Intent::TrimOut => Err("drag a clip edge to trim, or split first".into()),
+        Intent::Slip | Intent::Roll | Intent::Slide | Intent::Stretch => {
+            Err("select that tool and drag the clip".into())
         }
-        Intent::Slip | Intent::Roll | Intent::Slide | Intent::Stretch => Err(
-            "select that tool and drag the clip".into(),
-        ),
         Intent::SplitAll => split_all_at(save, at),
         Intent::DetachAudio => detach_audio_at(save, track_id, at),
         Intent::Marker => add_marker_at(save, at, "Marker"),
         Intent::Direct => Ok(Vec::new()),
-        Intent::Unknown => Err(
-            "I can split, merge, delete, split all, detach audio, or add a marker."
-                .into(),
-        ),
+        Intent::Unknown => {
+            Err("I can split, merge, delete, split all, detach audio, or add a marker.".into())
+        }
     }
 }
 
@@ -294,7 +295,11 @@ pub fn split_all_at(save: WorkspaceSave, at: f64) -> Result<Vec<String>, String>
     )
 }
 
-pub fn detach_audio_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<String>, String> {
+pub fn detach_audio_at(
+    save: WorkspaceSave,
+    track_id: &str,
+    at: f64,
+) -> Result<Vec<String>, String> {
     let clip_id = clip_at(save, track_id, at)?;
     run_ops(save, vec![Op::DetachAudio { clip_id }])
 }
@@ -328,7 +333,11 @@ pub fn mark_out_at(save: WorkspaceSave, at: f64) -> Result<Vec<String>, String> 
     )
 }
 
-pub fn insert_space_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<String>, String> {
+pub fn insert_space_at(
+    save: WorkspaceSave,
+    track_id: &str,
+    at: f64,
+) -> Result<Vec<String>, String> {
     run_ops(
         save,
         vec![Op::InsertSpace {
@@ -339,7 +348,11 @@ pub fn insert_space_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<V
     )
 }
 
-pub fn delete_space_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<String>, String> {
+pub fn delete_space_at(
+    save: WorkspaceSave,
+    track_id: &str,
+    at: f64,
+) -> Result<Vec<String>, String> {
     run_ops(
         save,
         vec![Op::DeleteSpace {
@@ -412,12 +425,8 @@ pub fn multicam_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<S
 
 pub fn sync_engine_from_tracks(mut save: WorkspaceSave) {
     let engine = save.engine.peek().clone();
-    let next = bind::timeline_from_tracks(
-        &save.tracks.peek(),
-        &engine,
-        engine.width,
-        engine.height,
-    );
+    let next =
+        bind::timeline_from_tracks(&save.tracks.peek(), &engine, engine.width, engine.height);
     save.engine.set(next);
 }
 
@@ -446,7 +455,14 @@ pub fn set_transition_at(
     kind: TransitionKind,
 ) -> Result<Vec<String>, String> {
     let clip_id = selected_or_playhead(save, selected, track_id, at)?;
-    let mut notes = run_ops(save, vec![Op::SetTransition { clip_id, kind, duration: None }])?;
+    let mut notes = run_ops(
+        save,
+        vec![Op::SetTransition {
+            clip_id,
+            kind,
+            duration: None,
+        }],
+    )?;
     let has_next = save.engine.peek().tracks.iter().any(|track| {
         let Some(i) = track.clips.iter().position(|c| c.id == clip_id) else {
             return false;
@@ -458,8 +474,7 @@ pub fn set_transition_at(
     });
     if kind != TransitionKind::Cut && !has_next {
         notes.push(
-            "applied — add or split a following shot so the mix has something to blend into"
-                .into(),
+            "applied — add or split a following shot so the mix has something to blend into".into(),
         );
     } else if kind != TransitionKind::Cut {
         notes.push("play across the join to see it".into());
@@ -588,7 +603,12 @@ pub fn set_frame_rate(
 }
 
 pub fn set_background(save: WorkspaceSave, color: &str) -> Result<Vec<String>, String> {
-    run_ops(save, vec![Op::SetBackground { color: color.to_string() }])
+    run_ops(
+        save,
+        vec![Op::SetBackground {
+            color: color.to_string(),
+        }],
+    )
 }
 
 pub fn import_cube_text(

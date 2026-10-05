@@ -69,10 +69,7 @@ pub fn codex_models() -> Vec<ModelInfo> {
         let Some(id) = id else {
             continue;
         };
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or(id);
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or(id);
         out.push(ModelInfo::new(id, name));
     }
     out
@@ -109,10 +106,8 @@ fn grok_auth_entry() -> Option<serde_json::Value> {
     let raw = std::fs::read_to_string(path).ok()?;
     let data: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let map = data.as_object()?;
-    map.iter().find_map(|(key, entry)| {
-        key.starts_with("https://auth.x.ai")
-            .then(|| entry.clone())
-    })
+    map.iter()
+        .find_map(|(key, entry)| key.starts_with("https://auth.x.ai").then(|| entry.clone()))
 }
 
 pub(crate) fn access_token_expired(key: &str) -> bool {

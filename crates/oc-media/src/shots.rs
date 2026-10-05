@@ -47,7 +47,8 @@ pub fn brief_shots(picture: &[ShotLook], cues: &[(f64, f64, &str)]) -> Vec<ShotB
             .copied()
             .filter(|(s, e, _)| {
                 let mid = (s + e) * 0.5;
-                mid >= shot.start - 0.001 && (mid < shot.end - 0.001 || (i == last && mid <= shot.end + 0.001))
+                mid >= shot.start - 0.001
+                    && (mid < shot.end - 0.001 || (i == last && mid <= shot.end + 0.001))
             })
             .collect();
         if inside.is_empty() {
@@ -186,9 +187,17 @@ mod tests {
             (8.0, 10.0, "the train was already gone"),
         ];
         let shots = brief_shots(&picture, &cues);
-        assert!(shots.iter().any(|s| s.role == ShotRole::Speech && s.text.contains("left tonight")));
+        assert!(
+            shots
+                .iter()
+                .any(|s| s.role == ShotRole::Speech && s.text.contains("left tonight"))
+        );
         assert!(shots.iter().any(|s| s.role == ShotRole::Filler));
-        assert!(shots.iter().any(|s| s.role == ShotRole::Silence && s.start >= 4.0 && s.end <= 8.1));
+        assert!(
+            shots
+                .iter()
+                .any(|s| s.role == ShotRole::Silence && s.start >= 4.0 && s.end <= 8.1)
+        );
         assert!(shots.iter().all(|s| s.look == "close"));
     }
 

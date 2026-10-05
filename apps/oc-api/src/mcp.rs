@@ -2,7 +2,7 @@
 //! with OPENCUT_PROJECT_ID set. ACP `session/new` gets this as `mcpServers`.
 
 use oc_core::mcp_tools;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 use tracing_subscriber::EnvFilter;
@@ -16,14 +16,15 @@ pub async fn serve() -> anyhow::Result<()> {
     // stderr only — stdout is JSON-RPC for the ACP agent.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("info,oc_api=debug")
-        }))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,oc_api=debug")),
+        )
         .init();
     let raw = std::env::var("OPENCUT_PROJECT_ID")
         .map_err(|_| anyhow::anyhow!("OPENCUT_PROJECT_ID required for `oc-api mcp`"))?;
-    let project_id = Uuid::parse_str(raw.trim())
-        .map_err(|_| anyhow::anyhow!("bad OPENCUT_PROJECT_ID"))?;
+    let project_id =
+        Uuid::parse_str(raw.trim()).map_err(|_| anyhow::anyhow!("bad OPENCUT_PROJECT_ID"))?;
     tracing::info!(project = %project_id, "opencut mcp starting");
     let db = oc_db::connect().await?;
     let _ = PROJECT_ID.set(project_id);
@@ -291,9 +292,6 @@ mod tests {
         assert_eq!(mcp["name"], "opencut");
         assert_eq!(mcp["args"][0], "mcp");
         let env = mcp["env"].as_array().unwrap();
-        assert!(
-            env.iter()
-                .any(|e| e["name"] == "OPENCUT_PROJECT_ID")
-        );
+        assert!(env.iter().any(|e| e["name"] == "OPENCUT_PROJECT_ID"));
     }
 }
