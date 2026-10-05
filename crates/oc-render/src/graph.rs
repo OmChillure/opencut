@@ -719,37 +719,19 @@ fn eq_filters(
     cube_file: Option<&Path>,
 ) -> String {
     let mut s = String::new();
-    let numeric = grade.exposure.abs() > 1e-4
-        || grade.contrast.abs() > 1e-4
-        || grade.saturation.abs() > 1e-4
-        || grade.temperature.abs() > 1e-3
-        || grade.lift.abs() > 1e-3
-        || grade.gamma.abs() > 1e-3
-        || grade.gain.abs() > 1e-3;
-    if numeric {
-        let b = (grade.exposure * 0.45).clamp(-1.0, 1.0);
-        let c = (1.0 + grade.contrast).clamp(0.2, 3.0);
-        let sat = (1.0 + grade.saturation).clamp(0.0, 3.0);
-        s.push_str(&format!(
-            ",eq=brightness={b:.3}:contrast={c:.3}:saturation={sat:.3}"
-        ));
-        if grade.temperature.abs() > 1e-3 {
-            let t = grade.temperature.clamp(-1.0, 1.0);
-            s.push_str(&format!(",colorbalance=rs={t:.3}:bs={:.3}", -t));
+    // The monitor grades in RGB. `colorbalance` on yuv420p is a different picture:
+    // it lifts the blacks and knocks the color out. Do the same math here, in RGB,
+    // then convert to video levels once.
+    let procedural = grade_moves(grade);
+    if procedural || cube_file.is_some() {
+        s.push_str(",format=gbrp");
+        if procedural {
+            s.push_str(&grade_geq(grade));
         }
-        if grade.lift.abs() > 1e-3 || grade.gamma.abs() > 1e-3 || grade.gain.abs() > 1e-3 {
-            let lift = grade.lift.clamp(-1.0, 1.0);
-            let gamma = grade.gamma.clamp(-1.0, 1.0);
-            let gain = grade.gain.clamp(-1.0, 1.0);
-            s.push_str(&format!(
-                ",colorbalance=rs={lift:.3}:gs={lift:.3}:bs={lift:.3}:rm={gamma:.3}:gm={gamma:.3}:bm={gamma:.3}:rh={gain:.3}:gh={gain:.3}:bh={gain:.3}"
-            ));
+        if let Some(path) = cube_file {
+            s.push_str(&format!(",lut3d=file={}", escape_path(path)));
         }
-    }
-    if let Some(path) = cube_file {
-        s.push_str(&format!(",lut3d=file={}", escape_path(path)));
-    } else if grade.lut != oc_timeline::Lut::None {
-        s.push_str(lut_filter(grade.lut));
+        s.push_str(",format=yuv420p");
     }
     if fx.grain > 0.02 {
         let alls = (fx.grain * 28.0).clamp(1.0, 40.0);
@@ -766,15 +748,81 @@ fn eq_filters(
     s
 }
 
-fn lut_filter(lut: oc_timeline::Lut) -> &'static str {
+fn grade_moves(grade: &oc_timeline::Grade) -> bool {
+    grade.exposure.abs() > 1e-4
+        || grade.contrast.abs() > 1e-4
+        || grade.saturation.abs() > 1e-4
+        || grade.temperature.abs() > 1e-3
+        || grade.lift.abs() > 1e-3
+        || grade.gamma.abs() > 1e-3
+        || grade.gain.abs() > 1e-3
+        || grade.lut != oc_timeline::Lut::None
+}
+
+/// Same formula as `oc_compositor` `grade_rgb`: contrast around mid gray, then a
+/// brightness multiply, saturation around luma, a small temperature add, then the lut.
+fn grade_geq(grade: &oc_timeline::Grade) -> String {
+    let contrast = 1.0 + grade.contrast + grade.gamma * 0.45;
+    let brightness = 1.0 + grade.exposure + grade.gain * 0.35 + grade.lift * 0.15;
+    let sat = (1.0 + grade.saturation).max(0.0);
+    let temperature = grade.temperature * 0.15;
+    let r0 = rgb_base("r", contrast, brightness);
+    let g0 = rgb_base("g", contrast, brightness);
+    let b0 = rgb_base("b", contrast, brightness);
+    let y = luma_expr(&r0, &g0, &b0);
+    let r1 = format!("({}+{temperature:.5})", sat_expr(&r0, &y, sat));
+    let g1 = sat_expr(&g0, &y, sat);
+    let b1 = format!("({}-{temperature:.5})", sat_expr(&b0, &y, sat));
+    let (r, g, b) = lut_expr(grade.lut, &r1, &g1, &b1);
+    // `b` is geq's interpolation flag, so the blue plane has to use the long name.
+    format!(
+        ",geq=interpolation=nearest:red_expr='clip(255*({r})\\,0\\,255)':green_expr='clip(255*({g})\\,0\\,255)':blue_expr='clip(255*({b})\\,0\\,255)'"
+    )
+}
+
+fn rgb_base(channel: &str, contrast: f32, brightness: f32) -> String {
+    format!("((({channel}(X\\,Y)/255)-0.5)*{contrast:.5}+0.5)*{brightness:.5}")
+}
+
+fn luma_expr(r: &str, g: &str, b: &str) -> String {
+    format!("(0.2126*({r})+0.7152*({g})+0.0722*({b}))")
+}
+
+fn sat_expr(channel: &str, y: &str, sat: f32) -> String {
+    format!("(({y})+(({channel})-({y}))*{sat:.5})")
+}
+
+fn lut_expr(lut: oc_timeline::Lut, r: &str, g: &str, b: &str) -> (String, String, String) {
     use oc_timeline::Lut;
     match lut {
-        Lut::None => "",
-        Lut::Film => ",eq=saturation=1.16:contrast=1.06,colorbalance=rs=0.03:bs=-0.015",
-        Lut::Cool => ",colorbalance=bs=0.08:bh=0.06:rs=-0.04",
-        Lut::Warm => ",colorbalance=rs=0.08:rh=0.05:bs=-0.04",
-        Lut::TealOrange => ",colorbalance=bs=0.07:rs=0.06:rm=0.04:bh=-0.02",
-        Lut::Mono => ",hue=s=0",
+        Lut::None => (r.to_string(), g.to_string(), b.to_string()),
+        Lut::Warm => (
+            format!("(({r})+0.08000)"),
+            format!("(({g})+0.03000)"),
+            format!("(({b})-0.04000)"),
+        ),
+        Lut::Cool => (
+            format!("(({r})-0.04000)"),
+            g.to_string(),
+            format!("(({b})+0.08000)"),
+        ),
+        Lut::TealOrange => (
+            format!("(({r})+0.06000)"),
+            g.to_string(),
+            format!("(({b})+0.05000)"),
+        ),
+        Lut::Film => {
+            let y = luma_expr(r, g, b);
+            (
+                format!("(({y})+(({r})-({y}))*1.16000+0.03000)"),
+                format!("(({y})+(({g})-({y}))*1.16000)"),
+                format!("(({y})+(({b})-({y}))*1.16000-0.01500)"),
+            )
+        }
+        Lut::Mono => {
+            let y = luma_expr(r, g, b);
+            (y.clone(), y.clone(), y)
+        }
     }
 }
 
@@ -1427,4 +1475,147 @@ fn escape_path(path: &Path) -> String {
         .replace('\\', "\\\\")
         .replace(':', "\\:")
         .replace('\'', "\\'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eq_filters;
+    use oc_timeline::{Grade, Lut};
+
+    fn monitor(rgb: [f32; 3], grade: &Grade) -> [f32; 3] {
+        let brightness = 1.0 + grade.exposure + grade.gain * 0.35 + grade.lift * 0.15;
+        let contrast = 1.0 + grade.contrast + grade.gamma * 0.45;
+        let sat = (1.0 + grade.saturation).max(0.0);
+        let mut out = rgb.map(|c| ((c - 0.5) * contrast + 0.5) * brightness);
+        let y = 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2];
+        out[0] = y + (out[0] - y) * sat;
+        out[1] = y + (out[1] - y) * sat;
+        out[2] = y + (out[2] - y) * sat;
+        out[0] += grade.temperature * 0.15;
+        out[2] -= grade.temperature * 0.15;
+        out = match grade.lut {
+            Lut::None => out,
+            Lut::Film => {
+                let gray = 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2];
+                [
+                    gray + (out[0] - gray) * 1.16 + 0.03,
+                    gray + (out[1] - gray) * 1.16,
+                    gray + (out[2] - gray) * 1.16 - 0.015,
+                ]
+            }
+            Lut::Cool => [out[0] - 0.04, out[1], out[2] + 0.08],
+            Lut::Warm => [out[0] + 0.08, out[1] + 0.03, out[2] - 0.04],
+            Lut::TealOrange => [out[0] + 0.06, out[1], out[2] + 0.05],
+            Lut::Mono => {
+                let gray = 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2];
+                [gray, gray, gray]
+            }
+        };
+        out.map(|c| c.clamp(0.0, 1.0))
+    }
+
+    #[test]
+    fn a_clear_frame_adds_no_grade_filter() {
+        let filter = eq_filters(&Grade::default(), &oc_timeline::Fx::default(), None);
+        assert!(filter.is_empty(), "{filter}");
+    }
+
+    #[test]
+    fn export_grade_uses_the_monitor_math_not_yuv_colorbalance() {
+        let filter = eq_filters(&Grade::punchy(), &oc_timeline::Fx::default(), None);
+        assert!(filter.contains("format=gbrp"), "{filter}");
+        assert!(filter.contains("geq="), "{filter}");
+        assert!(
+            !filter.contains("colorbalance"),
+            "yuv colorbalance washes the picture: {filter}"
+        );
+        let ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output();
+        let Ok(version) = ffmpeg else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+        let grade = Grade {
+            exposure: 0.28,
+            contrast: 0.18,
+            saturation: 0.22,
+            temperature: 0.12,
+            lift: 0.15,
+            gamma: 0.08,
+            gain: 0.10,
+            lut: Lut::Warm,
+            cube: None,
+        };
+        let samples: [[u8; 3]; 4] = [
+            [16, 16, 16],
+            [128, 128, 128],
+            [190, 140, 115],
+            [235, 235, 235],
+        ];
+        let chain = eq_filters(&grade, &oc_timeline::Fx::default(), None);
+        let dir = std::env::temp_dir().join("oc-grade-match");
+        let _ = std::fs::create_dir_all(&dir);
+        for (i, px) in samples.iter().enumerate() {
+            let mut raw = Vec::new();
+            for _ in 0..4 {
+                raw.extend_from_slice(px);
+                raw.push(255);
+            }
+            let input = dir.join(format!("in{i}.rgba"));
+            std::fs::write(&input, &raw).unwrap();
+            let rgb_grade = chain.trim_end_matches(",format=yuv420p");
+            let filter = format!("[0:v]scale=2:2:flags=neighbor{rgb_grade},format=rgb24");
+            let out = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba",
+                    "-s",
+                    "2x2",
+                    "-i",
+                ])
+                .arg(&input)
+                .args([
+                    "-filter_complex",
+                    &filter,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "pipe:1",
+                ])
+                .output()
+                .expect("ffmpeg");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let rgb = [
+                px[0] as f32 / 255.0,
+                px[1] as f32 / 255.0,
+                px[2] as f32 / 255.0,
+            ];
+            let want = monitor(rgb, &grade);
+            let got = &out.stdout[..3];
+            for c in 0..3 {
+                let expect = (want[c] * 255.0).round() as i32;
+                let actual = got[c] as i32;
+                assert!(
+                    (expect - actual).abs() <= 1,
+                    "sample {i} channel {c}: export {actual} monitor {expect}"
+                );
+            }
+        }
+    }
 }
