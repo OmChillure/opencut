@@ -42,6 +42,9 @@ pub struct ShotCard {
     pub quality: u8,
     #[serde(default)]
     pub best_moment: f64,
+    /// Grade the model chose while looking at this frame. Absent when it did not grade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<oc_timeline::Grade>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -96,7 +99,10 @@ impl VisualDigest {
     }
 }
 
-pub async fn analyze_local(bytes: &[u8], filename: &str) -> Result<VisualDigest, crate::MediaError> {
+pub async fn analyze_local(
+    bytes: &[u8],
+    filename: &str,
+) -> Result<VisualDigest, crate::MediaError> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -500,7 +506,12 @@ fn look_label(s: &FrameStats, motion: f32) -> &'static str {
     }
 }
 
-fn fold_frames(frames: Vec<FrameStats>, scene_n: usize, duration: f64, has_audio: bool) -> VisualDigest {
+fn fold_frames(
+    frames: Vec<FrameStats>,
+    scene_n: usize,
+    duration: f64,
+    has_audio: bool,
+) -> VisualDigest {
     if frames.is_empty() {
         return VisualDigest {
             look: "unknown".into(),
@@ -546,7 +557,6 @@ impl VisualDigest {
             && self.shots.iter().any(|shot| shot.card.is_none())
             && !matches!(self.vision.as_deref(), Some("labeled" | "failed"))
     }
-
 }
 
 fn path_str(path: &Path) -> String {

@@ -15,7 +15,8 @@ pub struct SourceWindow {
     pub start: f64,
     pub end: f64,
     pub duration: f64,
-    /// Shot look from the analysis (`dark`, `wide`, `close`, …). Empty when unknown.
+    /// Framing the caption seater reads (`close`, `wide`, `medium`, …).
+    /// When the shot has no card, this is the pixel look instead.
     pub look: String,
     /// What is in frame (`person`, `product`, …). Empty when unknown.
     pub subject: String,
@@ -336,8 +337,8 @@ fn finish_picture(
 ) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     let mut graded = 0;
-    for (index, (id, slot)) in ids.iter().enumerate() {
-        let grade = grade_for_slot(slot, plan.grade, windows, index);
+    for (id, slot) in ids.iter() {
+        let grade = grade_for_slot(slot, plan.grade);
         if !grade.is_identity() {
             apply(
                 timeline,
@@ -810,76 +811,9 @@ fn speech_kept(start: f64, end: f64, src_in: f64, src_out: f64) -> bool {
     overlap >= line_len * 0.55 || overlap >= slot_len * 0.55
 }
 
-fn grade_for_slot(
-    slot: &EditSlot,
-    shared: oc_timeline::Grade,
-    windows: &[SourceWindow],
-    index: usize,
-) -> oc_timeline::Grade {
-    if let Some(grade) = slot.grade {
-        return grade;
-    }
-    tune_shared_film(shared, &look_at_slot(slot, windows), index)
-}
-
-/// A shared film grade with no saturation of its own was greying flat phone footage.
-/// Flat shots get their color back and alternate warm / teal-orange. A rich shot keeps film.
-/// An explicit slot grade, including mono, is left alone.
-fn tune_shared_film(mut grade: oc_timeline::Grade, look: &str, index: usize) -> oc_timeline::Grade {
-    if grade.lut != oc_timeline::Lut::Film || grade.saturation.abs() > 0.04 || grade.cube.is_some()
-    {
-        return grade;
-    }
-    if look_is_flat(look) {
-        grade.saturation = 0.9;
-        if grade.contrast < 0.08 {
-            grade.contrast = 0.08;
-        }
-        grade.lut = if index % 2 == 0 {
-            oc_timeline::Lut::Warm
-        } else {
-            oc_timeline::Lut::TealOrange
-        };
-    } else {
-        grade.saturation = (grade.saturation + 0.12).clamp(-0.2, 0.6);
-        if grade.temperature.abs() < 0.02 {
-            grade.temperature = 0.03;
-        }
-    }
-    grade
-}
-
-fn look_at_slot(slot: &EditSlot, windows: &[SourceWindow]) -> String {
-    let src_in = slot.source_in.max(0.0);
-    let src_out = src_in + slot.duration.max(0.2);
-    let mut best: Option<(&SourceWindow, f64)> = None;
-    for window in windows.iter().filter(|window| {
-        window.media == slot.media_id && window.end > window.start + 0.05
-    }) {
-        let overlap = (window.end.min(src_out) - window.start.max(src_in)).max(0.0);
-        if overlap <= 0.0 {
-            continue;
-        }
-        if best.map(|(_, have)| overlap > have).unwrap_or(true) {
-            best = Some((window, overlap));
-        }
-    }
-    best.map(|(window, _)| window.look.clone())
-        .unwrap_or_default()
-}
-
-fn look_is_flat(look: &str) -> bool {
-    let look = look.trim().to_ascii_lowercase();
-    if look.is_empty() {
-        return true;
-    }
-    !(look.contains("bright")
-        || look.contains("landscape")
-        || look.contains("action")
-        || look.contains("graphic")
-        || look.contains("color")
-        || look.contains("outdoor")
-        || look.contains("street"))
+fn grade_for_slot(slot: &EditSlot, shared: oc_timeline::Grade) -> oc_timeline::Grade {
+    // The model that looked at the frame sets this. Rust does not invent one.
+    slot.grade.unwrap_or(shared)
 }
 
 #[cfg(test)]
@@ -1400,7 +1334,10 @@ mod tests {
         build_plan(&mut timeline, &plan, &windows, &[], &lines, &[]).unwrap();
         let pictures = program_pictures(&timeline);
         assert_eq!(pictures.len(), 5);
-        assert!(near(pictures[0].source_in.as_seconds(), 0.0), "{pictures:?}");
+        assert!(
+            near(pictures[0].source_in.as_seconds(), 0.0),
+            "{pictures:?}"
+        );
         assert!(
             near(pictures[0].source_out().as_seconds(), 3.82),
             "last word kept {:?}",
@@ -1430,21 +1367,23 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_film_grade_stays_colorful_and_changes_per_shot() {
+    fn a_piece_grade_stays_until_the_model_sets_one() {
         let picture = MediaId::new();
-        let flat = slot(picture, 1.0);
-        let flat_next = slot(picture, 12.0);
-        let rich = slot(picture, 22.0);
+        let mut own = slot(picture, 12.0);
+        own.grade = Some(Grade {
+            lut: Lut::Warm,
+            saturation: 0.3,
+            ..Grade::default()
+        });
         let mut mono = slot(picture, 40.0);
         mono.grade = Some(Grade {
             lut: Lut::Mono,
             ..Grade::default()
         });
-        let mut own_film = slot(picture, 55.0);
-        own_film.grade = Some(Grade {
+        let shared = Grade {
             lut: Lut::Film,
             ..Grade::default()
-        });
+        };
         let plan = EditPlan {
             style: "cinematic".into(),
             aspect: String::new(),
@@ -1454,35 +1393,24 @@ mod tests {
             captions: false,
             caption_mood: None,
             caption_look: None,
-            grade: Grade {
-                lut: Lut::Film,
-                ..Grade::default()
-            },
-            slots: vec![flat, flat_next, rich, mono, own_film],
+            grade: shared,
+            slots: vec![slot(picture, 1.0), own, slot(picture, 22.0), mono],
         };
         let windows = vec![
             window(picture, 0.0, 10.0, "interior", false),
             window(picture, 10.0, 20.0, "dark", false),
             window(picture, 20.0, 32.0, "bright-wide", false),
             window(picture, 38.0, 50.0, "close", false),
-            window(picture, 52.0, 70.0, "interior", false),
         ];
         let mut timeline = Timeline::default();
         build_plan(&mut timeline, &plan, &windows, &[], &[], &[]).unwrap();
         let pictures = program_pictures(&timeline);
-        assert_eq!(pictures.len(), 5);
-        assert_eq!(pictures[0].look.grade.lut, Lut::Warm);
-        assert!(pictures[0].look.grade.saturation > 0.6);
-        assert_eq!(pictures[1].look.grade.lut, Lut::TealOrange);
-        assert!(pictures[1].look.grade.saturation > 0.6);
-        assert_ne!(pictures[0].look.grade.lut, pictures[1].look.grade.lut);
-        assert_eq!(pictures[2].look.grade.lut, Lut::Film);
-        assert!(pictures[2].look.grade.saturation > 0.05);
-        assert!(pictures[2].look.grade.saturation < 0.4);
+        assert_eq!(pictures.len(), 4);
+        assert_eq!(pictures[0].look.grade, shared);
+        assert_eq!(pictures[2].look.grade, shared);
+        assert_eq!(pictures[1].look.grade.lut, Lut::Warm);
+        assert!((pictures[1].look.grade.saturation - 0.3).abs() < 1e-4);
         assert_eq!(pictures[3].look.grade.lut, Lut::Mono);
-        assert!(pictures[3].look.grade.saturation.abs() < 1e-4);
-        assert_eq!(pictures[4].look.grade.lut, Lut::Film);
-        assert!(pictures[4].look.grade.saturation.abs() < 1e-4);
     }
 
     fn near(actual: f64, expected: f64) -> bool {

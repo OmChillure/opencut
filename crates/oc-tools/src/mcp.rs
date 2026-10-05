@@ -377,11 +377,14 @@ pub fn mcp_tools() -> Vec<McpTool> {
         McpTool {
             name: "submit_edit".into(),
             description: "Build the whole cut from a plan. Rust places the slots and snaps to the beat. \
-                 It applies grade, fx, fades, cover, music volume, captions, and letterbox only when \
-                 you set them. Omit a field to leave that shot alone. Mix the joins: omit transition \
-                 for a cut, and set a dissolve, wipe, or slide only on the slot that needs it. Leave \
-                 caption_look out; Rust styles each caption line from the words and the shot. Slots \
-                 must sit on a real shot or spoken line. A clean review queues the export."
+                 It applies fx, fades, cover, music volume, captions, and letterbox only when \
+                 you set them. A shot the model has watched keeps the grade from that frame. \
+                 A slot grade you set after see replaces it. Shots still ungraded are shown to \
+                 the model, which grades each frame. The piece grade covers only a shot the model \
+                 could not see. Omit transition for a cut, and set a dissolve, wipe, or slide only \
+                 on the slot that needs it. Leave caption_look out; Rust styles each caption line \
+                 from the words and the shot. Slots must sit on a real shot or spoken line. \
+                 A clean review queues the export."
                 .into(),
             input_schema: object(&[
                 ("style", str_prop("Note for yourself. It does not pick a look."), false),
@@ -404,7 +407,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                     ),
                     false,
                 ),
-                ("grade", str_prop("Piece grade for slots that omit their own. Omit for no grade."), false),
+                ("grade", str_prop("Piece grade for a shot the model could not see. Omit to keep the grade from the frame."), false),
                 (
                     "slots",
                     str_prop(

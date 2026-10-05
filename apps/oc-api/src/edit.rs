@@ -949,6 +949,9 @@ fn compact_shots(picture: &[oc_media::ShotLook], briefs: &[oc_media::ShotBrief])
                 "{start:.1}-{end:.1} {} {subject} {} {} \"{}\" q{} {color} {role}",
                 card.scale, card.camera, card.motion_dir, card.action, card.quality
             ));
+            if let Some(grade) = card.grade {
+                out.push_str(&format!(" grade:{:?}", grade.lut));
+            }
             if !speech.is_empty() && role != "silence" {
                 out.push(' ');
                 out.push('"');
@@ -1043,7 +1046,7 @@ async fn apply_submitted_plan(
     let mut project = oc_db::get_project(db, project_id)
         .await
         .map_err(|e| e.to_string())?;
-    let plan = if name == "revise_edit" {
+    let mut plan = if name == "revise_edit" {
         let current = project
             .timeline
             .edit_plan
@@ -1058,6 +1061,8 @@ async fn apply_submitted_plan(
     } else {
         oc_core::plan_from_value(arguments)?
     };
+    let watched = apply_grades_the_model_watched(&mut plan, looks);
+    let looked = look_and_grade(&mut plan, media).await;
     let windows = source_windows(media, speech, looks);
     let beats = plan
         .music_id
@@ -1081,7 +1086,7 @@ async fn apply_submitted_plan(
             end: w.end,
         })
         .collect();
-    let notes = oc_core::build_plan(
+    let mut notes = oc_core::build_plan(
         &mut project.timeline,
         &plan,
         &windows,
@@ -1089,6 +1094,15 @@ async fn apply_submitted_plan(
         &lines,
         &covers,
     )?;
+    if watched > 0 {
+        notes.insert(
+            0,
+            format!("graded {watched} shots from the frames the model watched"),
+        );
+    }
+    if let Some(note) = looked {
+        notes.insert(0, note);
+    }
     oc_db::save_timeline(db, project_id, &project.timeline)
         .await
         .map_err(|e| e.to_string())?;
@@ -1102,6 +1116,150 @@ async fn apply_submitted_plan(
     );
     let review = oc_core::review_with(&project.timeline, &spoken, "", &facts);
     Ok(format!("{}\n{}", notes.join("\n"), review.text))
+}
+
+/// Copy a grade the vision model already wrote while it looked at that shot.
+fn apply_grades_the_model_watched(
+    plan: &mut oc_core::EditPlan,
+    looks: &HashMap<Uuid, oc_db::AnalysisRow>,
+) -> usize {
+    let mut filled = 0;
+    for slot in &mut plan.slots {
+        if slot.grade.is_some() {
+            continue;
+        }
+        let Some(row) = looks.get(&slot.media_id.as_uuid()) else {
+            continue;
+        };
+        let start = slot.source_in.max(0.0);
+        let end = start + slot.duration.max(0.2);
+        let Some(grade) = oc_media::watched_grade(&shot_looks(row), start, end) else {
+            continue;
+        };
+        slot.grade = Some(grade);
+        filled += 1;
+    }
+    filled
+}
+
+/// Show each ungraded slot to the signed-in model and keep the grade it returns.
+async fn look_and_grade(plan: &mut oc_core::EditPlan, media: &[oc_db::MediaRow]) -> Option<String> {
+    let pending: Vec<usize> = plan
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.grade.is_none())
+        .map(|(index, _)| index)
+        .collect();
+    if pending.is_empty() {
+        return None;
+    }
+    if !oc_providers::subscription_ready() {
+        return Some(
+            "piece grade kept — sign in with claude, grok, or codex so a model can grade the frames"
+                .into(),
+        );
+    }
+    let r2 = oc_db::R2::from_env().await.ok();
+    let mut temps = Vec::new();
+    let mut opened: HashMap<Uuid, std::path::PathBuf> = HashMap::new();
+    let dir = std::env::temp_dir().join(format!("oc-grade-{}", std::process::id()));
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let mut frames = Vec::new();
+    let mut indexes = Vec::new();
+    for index in pending {
+        let slot = &plan.slots[index];
+        let Some(row) = media
+            .iter()
+            .find(|row| oc_core::MediaId::from_uuid(row.id) == slot.media_id)
+        else {
+            continue;
+        };
+        if row.content_type.starts_with("audio/") {
+            continue;
+        }
+        let path = if let Some(path) = opened.get(&row.id) {
+            path.clone()
+        } else {
+            let Some(path) = open_for_frames(row, r2.as_ref(), &mut temps).await else {
+                continue;
+            };
+            opened.insert(row.id, path.clone());
+            path
+        };
+        let at = (slot.source_in + slot.duration.max(0.2) * 0.5).max(0.0);
+        let dest = dir.join(format!("s{index}.jpg"));
+        if oc_media::grab_jpeg(&path, at, &dest).await.is_err() {
+            continue;
+        }
+        let Ok(jpeg) = tokio::fs::read(&dest).await else {
+            continue;
+        };
+        if jpeg.len() < 32 {
+            continue;
+        }
+        frames.push(oc_providers::PromptImage {
+            caption: format!("Shot {index}, source {at:.1}s"),
+            jpeg,
+        });
+        indexes.push(index);
+    }
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    for temp in temps {
+        let _ = tokio::fs::remove_dir_all(temp).await;
+    }
+    if frames.is_empty() {
+        return Some(
+            "piece grade kept — the frames are not on disk, so the model could not look".into(),
+        );
+    }
+    let text = match oc_providers::ask_with_stills(oc_media::grade_prompt(), &frames).await {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::warn!("grade look failed: {err}");
+            return Some("piece grade kept — the model could not grade the frames".into());
+        }
+    };
+    let parsed = match oc_media::grades_from_reply(&text) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!("grade reply: {err}");
+            return Some(
+                "piece grade kept — the model did not return a grade for the frames".into(),
+            );
+        }
+    };
+    let matched = parsed.len() == indexes.len() && parsed.iter().all(|(i, _)| indexes.contains(i));
+    let pairs: Vec<(usize, oc_core::Grade)> = if matched {
+        parsed
+    } else if parsed.len() == indexes.len() {
+        indexes
+            .into_iter()
+            .zip(parsed.into_iter().map(|(_, grade)| grade))
+            .collect()
+    } else {
+        parsed
+            .into_iter()
+            .filter(|(index, _)| indexes.contains(index))
+            .collect()
+    };
+    let mut filled = 0;
+    for (index, grade) in pairs {
+        let Some(slot) = plan.slots.get_mut(index) else {
+            continue;
+        };
+        if slot.grade.is_some() {
+            continue;
+        }
+        slot.grade = Some(grade);
+        filled += 1;
+    }
+    if filled == 0 {
+        return Some("piece grade kept — the model did not return a grade for the frames".into());
+    }
+    Some(format!(
+        "graded {filled} shots from the frames the model saw"
+    ))
 }
 
 fn source_windows(

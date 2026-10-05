@@ -4,7 +4,10 @@ mod shots;
 mod vision;
 
 pub use beats::{MusicAnalysis, MusicSection, detect_beats, format_music};
-pub use label::{apply_shot_reply, shot_label_prompt, shot_stills, ShotStill};
+pub use label::{
+    ShotStill, apply_shot_reply, grade_from_value, grade_prompt, grades_from_reply,
+    shot_label_prompt, shot_stills, watched_grade,
+};
 pub use shots::{ShotBrief, ShotRole, brief_shots, format_shot_list};
 pub use vision::{
     ShotCard, ShotLook, VisualDigest, analyze_local, analyze_path, grab_jpeg, picture_ranges,
@@ -56,12 +59,7 @@ impl ObjectKind {
 }
 
 #[must_use]
-pub fn object_key(
-    kind: ObjectKind,
-    project: ProjectId,
-    media: MediaId,
-    filename: &str,
-) -> String {
+pub fn object_key(kind: ObjectKind, project: ProjectId, media: MediaId, filename: &str) -> String {
     let safe: String = filename
         .chars()
         .map(|c| {
