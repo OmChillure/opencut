@@ -1384,6 +1384,8 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                         playsinline: true,
                         muted: true,
                     }
+                    audio { class: "preview-bed", preload: "auto" }
+                    audio { class: "preview-bed-b", preload: "auto" }
                     img { class: "preview-image off", alt: "" }
                     img { class: "preview-design off", alt: "" }
                     video {

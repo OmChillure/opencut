@@ -401,6 +401,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   z-index: 0;
 }
 .preview-video-b { z-index: 1; }
+.preview-bed, .preview-bed-b { display: none; }
 .preview-design, .preview-design-clip { z-index: 2; object-fit: cover; pointer-events: none; }
 .program-canvas {
   position: absolute;

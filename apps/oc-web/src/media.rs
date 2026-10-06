@@ -1447,19 +1447,8 @@ fn mix_preview_css(
                 filter.into(),
             )
         }
-        oc_core::TransitionKind::Pixelize => {
-            let f = format!(
-                "{filter} contrast({:.2}) saturate({:.2})",
-                1.0 + mix,
-                1.0 - mix * 0.4
-            );
-            (
-                (opacity * (1.0 - mix * 0.5)).clamp(0.0, 1.0),
-                "none".into(),
-                "none".into(),
-                f,
-            )
-        }
+        // Pixelize is a mosaic on the painted frame. A contrast tweak here
+        // is a different picture from the export.
         _ => (
             (opacity * (1.0 - mix)).clamp(0.0, 1.0),
             "none".into(),
@@ -1486,6 +1475,26 @@ fn incoming_preview_css(kind: oc_core::TransitionKind, mix: f64) -> (f64, String
         }
         oc_core::TransitionKind::Cut => (0.0, "none".into()),
         _ => (mix.clamp(0.15, 1.0), "none".into()),
+    }
+}
+
+/// A line that already uses the video theme keeps its seat. Anything else takes that theme.
+fn caption_theme(
+    engine: &oc_core::Timeline,
+    cue: &oc_core::CaptionCue,
+) -> (
+    oc_core::CaptionPlace,
+    oc_core::CaptionFont,
+    oc_core::CaptionEffect,
+) {
+    let recipe = oc_core::caption_recipe_for(engine);
+    let open = oc_core::timeline::look_for("", 0, &recipe, false);
+    let seated = oc_core::timeline::look_for("", 0, &recipe, true);
+    if cue.font == open.1 && cue.effect == open.2 && (cue.place == open.0 || cue.place == seated.0)
+    {
+        (cue.place, cue.font, cue.effect)
+    } else {
+        seated
     }
 }
 
@@ -1526,7 +1535,6 @@ pub fn apply_monitor_look(
     let mut zoom = 1.0_f32;
     let mut pan_x = 0.0_f32;
     let mut pan_y = 0.0_f32;
-    let mut volume = 1.0_f64;
     let mut graphics: Vec<(String, String, Option<f32>, Option<f32>, String)> = Vec::new();
     let mut next_url = String::new();
     let mut next_src = 0.0_f64;
@@ -1597,10 +1605,7 @@ pub fn apply_monitor_look(
                         }
                     }
                 }
-                oc_core::ClipKind::Audio { volume: v, ducked } => {
-                    let duck = if *ducked { 0.3 } else { 1.0 };
-                    volume = fade * f64::from(*v) * duck;
-                }
+                oc_core::ClipKind::Audio { .. } => {}
                 oc_core::ClipKind::Graphic { graphic } => {
                     let cls = match graphic.kind {
                         oc_core::GraphicKind::Title => "title",
@@ -1623,14 +1628,15 @@ pub fn apply_monitor_look(
                         let span = (cue.end - cue.start).as_seconds().max(0.3);
                         let into = (local_t - cue.start).as_seconds().clamp(0.0, span);
                         let (line, local, local_span) = caption_visible(&cue.text, into, span);
-                        let shown = oc_core::caption_reveal(&line, cue.effect, local, local_span);
-                        let motion = oc_core::caption_motion(cue.effect, local, local_span);
+                        let (place, font, effect) = caption_theme(engine, cue);
+                        let shown = oc_core::caption_reveal(&line, effect, local, local_span);
+                        let motion = oc_core::caption_motion(effect, local, local_span);
                         graphics.push((
                             format!(
                                 "caption place-{} font-{} effect-{}",
-                                cue.place.as_str(),
-                                cue.font.as_str(),
-                                cue.effect.as_str()
+                                place.as_str(),
+                                font.as_str(),
+                                effect.as_str()
                             ),
                             shown,
                             None,
@@ -1690,7 +1696,6 @@ pub fn apply_monitor_look(
                 "filter:{extra_filter};opacity:{a:.3};transform:{transform};clip-path:{clip_path};{pip}"
             ),
         );
-        video.set_volume(volume.clamp(0.0, 1.0));
     }
 
     if let Some(b) = standby_video() {
@@ -1765,6 +1770,7 @@ pub fn apply_monitor_look(
     paint_monitor_matte(&doc, engine.letterbox);
     let _ = paint_grade_canvas();
     paint_program(engine, library, now);
+    sync_preview_sound(engine, library, now, playing);
 }
 
 /// Keep a label in the open side of the frame when the person window would cover it.
@@ -1953,7 +1959,7 @@ pub fn sync_monitor(
     now: f64,
     playing: bool,
 ) {
-    sync_preview_denoise(engine, now);
+    sync_preview_sound(engine, library, now, playing);
     let shot = clip_under(tracks, library, now);
     let next = following_shot(tracks, library, now);
     let video = preview_video();
@@ -2495,13 +2501,62 @@ thread_local! {
     static GESTURE: RefCell<Option<MaskGesture>> = const { RefCell::new(None) };
     static METER: RefCell<Option<web_sys::AnalyserNode>> = const { RefCell::new(None) };
     static METER_CTX: RefCell<Option<web_sys::AudioContext>> = const { RefCell::new(None) };
-    static CHAINS: RefCell<Vec<DenoiseChain>> = const { RefCell::new(Vec::new()) };
+    static CHAINS: RefCell<Vec<PreviewChain>> = const { RefCell::new(Vec::new()) };
 }
 
-struct DenoiseChain {
-    filter: web_sys::BiquadFilterNode,
+struct PreviewChain {
+    key: String,
+    highpass: web_sys::BiquadFilterNode,
+    low: web_sys::BiquadFilterNode,
+    mid: web_sys::BiquadFilterNode,
+    high: web_sys::BiquadFilterNode,
     compressor: web_sys::DynamicsCompressorNode,
-    on: bool,
+    gain: web_sys::GainNode,
+    pan: web_sys::StereoPannerNode,
+}
+
+struct Heard {
+    denoise: bool,
+    compressor: bool,
+    low: f32,
+    mid: f32,
+    high: f32,
+    gain: f32,
+    pan: f32,
+}
+
+impl Heard {
+    fn silent() -> Self {
+        Self {
+            denoise: false,
+            compressor: false,
+            low: 0.0,
+            mid: 0.0,
+            high: 0.0,
+            gain: 0.0,
+            pan: 0.0,
+        }
+    }
+
+    fn from_fx(fx: &oc_core::AudioFx, gain: f64, pan: f32) -> Self {
+        Self {
+            denoise: fx.denoise,
+            compressor: fx.compressor,
+            low: fx.low,
+            mid: fx.mid,
+            high: fx.high,
+            gain: gain.clamp(0.0, 4.0) as f32,
+            pan: pan.clamp(-1.0, 1.0),
+        }
+    }
+}
+
+struct BedCue {
+    media_id: String,
+    url: String,
+    source: f64,
+    rate: f64,
+    heard: Heard,
 }
 
 pub struct MonitorChrome {
@@ -3600,34 +3655,198 @@ pub fn resume_meter() {
     });
 }
 
-fn sync_preview_denoise(engine: &oc_core::Timeline, now: f64) {
+fn query_media(selector: &str) -> Option<web_sys::HtmlMediaElement> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(selector).ok().flatten())
+        .and_then(|el| el.dyn_into().ok())
+}
+
+/// Program voice plus up to two audio-track beds. Export mixes those same tracks.
+fn sync_preview_sound(engine: &oc_core::Timeline, library: &[MediaItem], now: f64, playing: bool) {
     ensure_meter();
     let t = oc_core::Time::from_seconds(now);
-    let mut best: Option<(f64, bool)> = None;
+    let master = f64::from(engine.master.linear());
+    let front = if front_is_b() {
+        ".preview-video-b"
+    } else {
+        ".preview-video"
+    };
+    let back = if front_is_b() {
+        ".preview-video"
+    } else {
+        ".preview-video-b"
+    };
+    apply_heard(front, &program_voice(engine, t, master));
+    apply_heard(back, &Heard::silent());
+    let beds = bed_cues(engine, library, t, master);
+    sync_bed(".preview-bed", beds.first(), playing);
+    sync_bed(".preview-bed-b", beds.get(1), playing);
+}
+
+fn program_voice(engine: &oc_core::Timeline, t: oc_core::Time, master: f64) -> Heard {
+    let mut best: Option<(f64, Heard)> = None;
     for track in &engine.tracks {
         if !program_track(track) {
             continue;
         }
         for clip in &track.clips {
-            if clip.disabled || !clip.contains(t) {
+            if clip.disabled || !clip.contains(t) || linked_voice(engine, clip) {
                 continue;
             }
+            let local = (t - clip.start).as_seconds();
+            let fade = clip.look.fade_gain(local, clip.duration.as_seconds());
+            let heard = Heard::from_fx(&clip.look.audio, fade * master, 0.0);
             let start = clip.start.as_seconds();
-            if best.is_none_or(|(at, _)| start + 1e-6 >= at) {
-                best = Some((start, clip.look.audio.denoise));
+            if best.as_ref().is_none_or(|(at, _)| start + 1e-6 >= *at) {
+                best = Some((start, heard));
             }
         }
     }
-    set_denoise(best.is_some_and(|(_, on)| on));
+    best.map(|(_, heard)| heard).unwrap_or_else(Heard::silent)
+}
+
+fn linked_voice(engine: &oc_core::Timeline, clip: &oc_core::Clip) -> bool {
+    let Some(link) = clip.link_id else {
+        return false;
+    };
+    engine
+        .tracks
+        .iter()
+        .flat_map(|track| track.clips.iter())
+        .any(|other| {
+            other.id != clip.id
+                && other.link_id == Some(link)
+                && !other.disabled
+                && matches!(other.kind, oc_core::ClipKind::Audio { volume, .. } if volume > 0.02)
+        })
+}
+
+fn bed_cues(
+    engine: &oc_core::Timeline,
+    library: &[MediaItem],
+    t: oc_core::Time,
+    master: f64,
+) -> Vec<BedCue> {
+    let solo = engine.tracks.iter().any(|track| {
+        track.kind == oc_core::TrackKind::Audio && track.mix.solo && !track.muted && !track.hidden
+    });
+    let mut beds = Vec::new();
+    for track in &engine.tracks {
+        if track.kind != oc_core::TrackKind::Audio || track.muted || track.hidden {
+            continue;
+        }
+        if solo && !track.mix.solo {
+            continue;
+        }
+        let Some(clip) = track
+            .clips
+            .iter()
+            .find(|clip| !clip.disabled && clip.contains(t))
+        else {
+            continue;
+        };
+        let oc_core::ClipKind::Audio { volume, .. } = &clip.kind else {
+            continue;
+        };
+        if *volume <= 0.02 && clip.look.generator.is_none() {
+            continue;
+        }
+        let Some(id) = clip.media_id else {
+            continue;
+        };
+        let key = id.to_string();
+        let Some(item) = library.iter().find(|item| item.id == key) else {
+            continue;
+        };
+        if item.url.is_empty() {
+            continue;
+        }
+        let local = (t - clip.start).as_seconds();
+        let fade = clip.look.fade_gain(local, clip.duration.as_seconds());
+        let gain = f64::from(*volume) * f64::from(track.mix.linear()) * fade * master;
+        let source = clip
+            .source_time_at(t)
+            .map(|time| time.as_seconds())
+            .unwrap_or_else(|| clip.source_in.as_seconds())
+            .max(0.0);
+        beds.push(BedCue {
+            media_id: key,
+            url: item.url.clone(),
+            source,
+            rate: f64::from(clip.speed_at(t)).clamp(0.25, 4.0),
+            heard: Heard::from_fx(&clip.look.audio, gain, track.mix.pan),
+        });
+        if beds.len() == 2 {
+            break;
+        }
+    }
+    beds
+}
+
+fn sync_bed(selector: &str, bed: Option<&BedCue>, playing: bool) {
+    let Some(media) = query_media(selector) else {
+        return;
+    };
+    let Some(bed) = bed else {
+        let _ = media.pause();
+        apply_heard(selector, &Heard::silent());
+        return;
+    };
+    if media.get_attribute("data-media").unwrap_or_default() != bed.media_id {
+        let _ = media.set_attribute("data-media", &bed.media_id);
+        media.set_src(&bed.url);
+    }
+    apply_heard(selector, &bed.heard);
+    media.set_playback_rate(bed.rate);
+    let ready = media.ready_state() >= 2;
+    let drift = (media.current_time() - bed.source).abs();
+    if !playing {
+        let _ = media.pause();
+        if ready && drift > 0.08 {
+            media.set_current_time(bed.source);
+        }
+        return;
+    }
+    if ready && drift > 0.45 {
+        media.set_current_time(bed.source);
+    }
+    if media.paused() && ready {
+        let _ = media.play();
+    }
+}
+
+fn apply_heard(selector: &str, heard: &Heard) {
+    let wired = CHAINS.with(|slot| {
+        let mut chains = slot.borrow_mut();
+        let Some(chain) = chains.iter_mut().find(|chain| chain.key == selector) else {
+            return false;
+        };
+        tune_chain(chain, heard);
+        true
+    });
+    if let Some(media) = query_media(selector) {
+        let level = if wired {
+            1.0
+        } else {
+            f64::from(heard.gain.clamp(0.0, 1.0))
+        };
+        media.set_volume(level);
+    }
 }
 
 pub fn ensure_meter() {
     let Some(ctx) = meter_context() else {
         return;
     };
-    for selector in [".preview-video", ".preview-video-b"] {
-        if let Some(video) = query_video(selector) {
-            wire_preview(&ctx, &video);
+    for selector in [
+        ".preview-video",
+        ".preview-video-b",
+        ".preview-bed",
+        ".preview-bed-b",
+    ] {
+        if let Some(media) = query_media(selector) {
+            wire_preview(&ctx, &media, selector);
         }
     }
 }
@@ -3650,21 +3869,20 @@ fn meter_context() -> Option<web_sys::AudioContext> {
     Some(ctx)
 }
 
-/// Capture each preview element once: source, high-pass, compressor, meter, speakers.
-fn wire_preview(ctx: &web_sys::AudioContext, video: &HtmlVideoElement) {
-    if video.get_attribute("data-meter").as_deref() == Some("on") {
+/// Capture each preview element once. EQ, denoise, gain, and pan sit in front of the meter.
+fn wire_preview(ctx: &web_sys::AudioContext, media: &web_sys::HtmlMediaElement, key: &str) {
+    if media.get_attribute("data-meter").as_deref() == Some("on") {
         return;
     }
-    let media: &web_sys::HtmlMediaElement = video.unchecked_ref();
     let Ok(source) = ctx.create_media_element_source(media) else {
-        let _ = video.set_attribute("data-meter", "on");
+        let _ = media.set_attribute("data-meter", "on");
         return;
     };
     let dest = ctx.destination();
     let dest_node: &web_sys::AudioNode = dest.unchecked_ref();
-    let Some(chain) = denoise_chain(ctx) else {
+    let Some(chain) = preview_chain(ctx, key) else {
         let _ = source.connect_with_audio_node(dest_node);
-        let _ = video.set_attribute("data-meter", "on");
+        let _ = media.set_attribute("data-meter", "on");
         return;
     };
     let linked = METER.with(|slot| {
@@ -3672,14 +3890,39 @@ fn wire_preview(ctx: &web_sys::AudioContext, video: &HtmlVideoElement) {
         let Some(analyser) = held.as_ref() else {
             return false;
         };
-        source.connect_with_audio_node(&chain.filter).is_ok()
+        source
+            .connect_with_audio_node(chain.highpass.unchecked_ref())
+            .is_ok()
             && chain
-                .filter
-                .connect_with_audio_node(&chain.compressor)
+                .highpass
+                .connect_with_audio_node(chain.low.unchecked_ref())
                 .is_ok()
-            && chain.compressor.connect_with_audio_node(analyser).is_ok()
+            && chain
+                .low
+                .connect_with_audio_node(chain.mid.unchecked_ref())
+                .is_ok()
+            && chain
+                .mid
+                .connect_with_audio_node(chain.high.unchecked_ref())
+                .is_ok()
+            && chain
+                .high
+                .connect_with_audio_node(chain.compressor.unchecked_ref())
+                .is_ok()
+            && chain
+                .compressor
+                .connect_with_audio_node(chain.gain.unchecked_ref())
+                .is_ok()
+            && chain
+                .gain
+                .connect_with_audio_node(chain.pan.unchecked_ref())
+                .is_ok()
+            && chain
+                .pan
+                .connect_with_audio_node(analyser.unchecked_ref())
+                .is_ok()
     });
-    let _ = video.set_attribute("data-meter", "on");
+    let _ = media.set_attribute("data-meter", "on");
     if !linked {
         let _ = source.connect_with_audio_node(dest_node);
         return;
@@ -3687,53 +3930,56 @@ fn wire_preview(ctx: &web_sys::AudioContext, video: &HtmlVideoElement) {
     CHAINS.with(|slot| slot.borrow_mut().push(chain));
 }
 
-fn denoise_chain(ctx: &web_sys::AudioContext) -> Option<DenoiseChain> {
-    let filter = ctx.create_biquad_filter().ok()?;
-    let compressor = ctx.create_dynamics_compressor().ok()?;
-    apply_denoise(&filter, &compressor, false);
-    Some(DenoiseChain {
-        filter,
-        compressor,
-        on: false,
-    })
+fn preview_chain(ctx: &web_sys::AudioContext, key: &str) -> Option<PreviewChain> {
+    let chain = PreviewChain {
+        key: key.to_string(),
+        highpass: ctx.create_biquad_filter().ok()?,
+        low: ctx.create_biquad_filter().ok()?,
+        mid: ctx.create_biquad_filter().ok()?,
+        high: ctx.create_biquad_filter().ok()?,
+        compressor: ctx.create_dynamics_compressor().ok()?,
+        gain: ctx.create_gain().ok()?,
+        pan: ctx.create_stereo_panner().ok()?,
+    };
+    tune_chain(&chain, &Heard::silent());
+    Some(chain)
 }
 
-fn set_denoise(on: bool) {
-    CHAINS.with(|slot| {
-        for chain in slot.borrow_mut().iter_mut() {
-            if chain.on == on {
-                continue;
-            }
-            apply_denoise(&chain.filter, &chain.compressor, on);
-            chain.on = on;
-        }
-    });
-}
-
-fn apply_denoise(
-    filter: &web_sys::BiquadFilterNode,
-    comp: &web_sys::DynamicsCompressorNode,
-    on: bool,
-) {
-    if on {
-        filter.set_type(web_sys::BiquadFilterType::Highpass);
-        filter.frequency().set_value(80.0);
-        filter.q().set_value(0.707);
-        comp.threshold().set_value(-46.0);
-        comp.knee().set_value(10.0);
-        comp.ratio().set_value(12.0);
-        comp.attack().set_value(0.004);
-        comp.release().set_value(0.22);
+fn tune_chain(chain: &PreviewChain, heard: &Heard) {
+    if heard.denoise {
+        chain.highpass.set_type(web_sys::BiquadFilterType::Highpass);
+        chain.highpass.frequency().set_value(80.0);
+        chain.highpass.q().set_value(0.707);
     } else {
-        filter.set_type(web_sys::BiquadFilterType::Allpass);
-        filter.frequency().set_value(80.0);
-        filter.q().set_value(0.707);
-        comp.threshold().set_value(0.0);
-        comp.knee().set_value(0.0);
-        comp.ratio().set_value(1.0);
-        comp.attack().set_value(0.003);
-        comp.release().set_value(0.25);
+        chain.highpass.set_type(web_sys::BiquadFilterType::Allpass);
+        chain.highpass.frequency().set_value(80.0);
+        chain.highpass.q().set_value(0.707);
     }
+    chain.low.set_type(web_sys::BiquadFilterType::Lowshelf);
+    chain.low.frequency().set_value(120.0);
+    chain.low.gain().set_value(heard.low.clamp(-12.0, 12.0));
+    chain.mid.set_type(web_sys::BiquadFilterType::Peaking);
+    chain.mid.frequency().set_value(1000.0);
+    chain.mid.q().set_value(1.0);
+    chain.mid.gain().set_value(heard.mid.clamp(-12.0, 12.0));
+    chain.high.set_type(web_sys::BiquadFilterType::Highshelf);
+    chain.high.frequency().set_value(8000.0);
+    chain.high.gain().set_value(heard.high.clamp(-12.0, 12.0));
+    if heard.compressor {
+        chain.compressor.threshold().set_value(-18.0);
+        chain.compressor.knee().set_value(6.0);
+        chain.compressor.ratio().set_value(3.0);
+        chain.compressor.attack().set_value(0.02);
+        chain.compressor.release().set_value(0.2);
+    } else {
+        chain.compressor.threshold().set_value(0.0);
+        chain.compressor.knee().set_value(0.0);
+        chain.compressor.ratio().set_value(1.0);
+        chain.compressor.attack().set_value(0.003);
+        chain.compressor.release().set_value(0.25);
+    }
+    chain.gain.gain().set_value(heard.gain.max(0.0));
+    chain.pan.pan().set_value(heard.pan.clamp(-1.0, 1.0));
 }
 
 pub fn meter_peak() -> f32 {
