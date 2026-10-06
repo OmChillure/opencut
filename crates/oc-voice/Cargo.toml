@@ -3,7 +3,7 @@ name = "oc-voice"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Speech: Groq Whisper, local Whisper fallback"
+description = "Speech: Groq Whisper"
 
 [dependencies]
 oc-time.workspace = true
@@ -12,5 +12,5 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "io-util", "process", "time"] }
+tokio = { workspace = true, features = ["process", "time"] }
 tracing.workspace = true

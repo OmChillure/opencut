@@ -22,14 +22,12 @@ async fn main() -> anyhow::Result<()> {
     oc_db::migrate(&db).await.ok();
     let r2 = R2::from_env().await.ok();
     if r2.is_none() {
-        tracing::info!("R2 not configured — understand runs on local files only");
+        tracing::warn!("R2 is not configured — understand and export cannot read source clips");
     }
     if oc_voice::groq_stt_configured() {
         tracing::info!("understand = ffmpeg look + Groq Whisper");
     } else {
-        tracing::info!(
-            "understand = ffmpeg look + local Whisper (set GROQ_API_KEY for Groq Whisper)"
-        );
+        tracing::info!("understand = ffmpeg look (set GROQ_API_KEY for Groq Whisper)");
     }
 
     tracing::info!("worker polling jobs");
@@ -113,45 +111,34 @@ struct OpenedMedia {
 }
 
 async fn open_media(r2: Option<&R2>, key: &str) -> anyhow::Result<OpenedMedia> {
-    if oc_db::is_r2_object_key(key) {
-        let r2 = r2.context("R2 required")?;
-        let bytes = r2.get_bytes(key).await?;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("oc-src-{stamp}"));
-        tokio::fs::create_dir_all(&dir).await?;
-        let name = key.rsplit('/').next().unwrap_or("media.bin");
-        let path = dir.join(name);
-        tokio::fs::write(&path, &bytes).await?;
-        return Ok(OpenedMedia {
-            path,
-            cleanup: Some(dir),
-        });
+    if !oc_db::is_r2_object_key(key) {
+        anyhow::bail!("media is not an R2 object: {key}");
     }
-    if let Some(path) = oc_db::local_media_path(key) {
-        if path.is_file() {
-            return Ok(OpenedMedia {
-                path,
-                cleanup: None,
-            });
-        }
-        anyhow::bail!("local media missing: {}", path.display());
-    }
-    let path = std::path::PathBuf::from(key);
-    if path.is_file() {
-        return Ok(OpenedMedia {
-            path,
-            cleanup: None,
-        });
-    }
-    anyhow::bail!("media not found: {key}");
+    let r2 = r2.context("R2 required")?;
+    let bytes = r2.get_bytes(key).await?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("oc-src-{stamp}"));
+    tokio::fs::create_dir_all(&dir).await?;
+    let name = key.rsplit('/').next().unwrap_or("media.bin");
+    let path = dir.join(name);
+    tokio::fs::write(&path, &bytes).await?;
+    Ok(OpenedMedia {
+        path,
+        cleanup: Some(dir),
+    })
 }
 
 async fn transcribe(db: &Db, r2: Option<&R2>, p: TranscribePayload) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
-    tracing::info!(media = %p.media_id, key = %p.r2_key, "transcribe start");
+    tracing::info!(
+        project = %p.project_id,
+        media = %p.media_id,
+        key = %p.r2_key,
+        "transcribe start"
+    );
     let opened = match open_media(r2, &p.r2_key).await {
         Ok(opened) => opened,
         Err(e) => {
@@ -440,18 +427,13 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
     let mut media = std::collections::HashMap::new();
     for row in &rows {
         let dest = work.join(&row.filename);
-        if oc_db::is_r2_object_key(&row.r2_key) {
-            let r2 = r2.context("R2 required to fetch source clips")?;
-            let bytes = r2.get_bytes(&row.r2_key).await?;
-            tokio::fs::write(&dest, bytes).await?;
-        } else if let Some(path) = oc_db::local_media_path(&row.r2_key) {
-            tokio::fs::copy(&path, &dest).await?;
-        } else if Path::new(&row.r2_key).is_file() {
-            tokio::fs::copy(&row.r2_key, &dest).await?;
-        } else {
-            tracing::warn!(media = %row.id, key = %row.r2_key, "skip missing source");
+        if !oc_db::is_r2_object_key(&row.r2_key) {
+            tracing::warn!(media = %row.id, key = %row.r2_key, "skip source that is not on R2");
             continue;
         }
+        let r2 = r2.context("R2 required to fetch source clips")?;
+        let bytes = r2.get_bytes(&row.r2_key).await?;
+        tokio::fs::write(&dest, bytes).await?;
         let has_video =
             row.content_type.starts_with("video/") || row.content_type.starts_with("image/");
         let has_audio =

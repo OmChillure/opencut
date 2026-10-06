@@ -113,6 +113,9 @@ mod tests {
 
     #[test]
     fn questions() {
-        assert_eq!(restore_punctuation("what happened next"), "What happened next?");
+        assert_eq!(
+            restore_punctuation("what happened next"),
+            "What happened next?"
+        );
     }
 }

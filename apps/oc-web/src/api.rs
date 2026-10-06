@@ -89,6 +89,18 @@ pub async fn register_media(
     Ok(())
 }
 
+/// Register the editor id, then put the bytes on R2. The stored key is the object key.
+pub async fn store_imported(
+    project_id: &str,
+    media_id: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    register_media(project_id, media_id, filename, content_type, 0.0).await?;
+    put_media_bytes(project_id, media_id, content_type, bytes).await
+}
+
 pub async fn put_media_bytes(
     project_id: &str,
     media_id: &str,
@@ -719,56 +731,6 @@ pub async fn create_project(name: &str) -> Result<ProjectSummary, String> {
         .await
         .map_err(|e| e.to_string())?;
     Ok(row.into_summary())
-}
-
-#[derive(Deserialize)]
-struct UploadResponse {
-    media_id: serde_json::Value,
-    upload_url: Option<String>,
-}
-
-pub async fn upload_media(
-    project_id: &str,
-    filename: &str,
-    content_type: &str,
-    bytes: Vec<u8>,
-) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let pending = authed(client.post(format!("{API}/v1/projects/{project_id}/media/upload")))
-        .json(&serde_json::json!({
-            "filename": filename,
-            "content_type": content_type,
-        }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !pending.status().is_success() {
-        let status = pending.status();
-        let body = pending.text().await.unwrap_or_default();
-        return Err(format!("upload {status} for project {project_id}: {body}"));
-    }
-    let res: UploadResponse = pending.json().await.map_err(|e| e.to_string())?;
-    let media_id = value_to_id(res.media_id);
-    if let Some(url) = res.upload_url {
-        if client
-            .put(&url)
-            .header("content-type", content_type)
-            .body(bytes.clone())
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .is_ok()
-        {
-            let _ = authed(client.post(format!(
-                "{API}/v1/projects/{project_id}/media/{media_id}/complete"
-            )))
-            .send()
-            .await;
-            return Ok(media_id);
-        }
-    }
-    put_media_bytes(project_id, &media_id, content_type, bytes).await?;
-    Ok(media_id)
 }
 
 pub fn media_file_url(project_id: &str, media_id: &str) -> String {

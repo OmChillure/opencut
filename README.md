@@ -12,11 +12,11 @@ crates/oc-compositor   frame planner (wgpu, CPU paint when WebGPU is missing)
 crates/oc-render       ffmpeg bake (xfade, titles, grade, mix, captions)
 crates/oc-media        probe / object-key helpers
 crates/oc-providers    AI providers (SpaceXAI / xAI)
-crates/oc-voice        Groq Whisper, local fallback
+crates/oc-voice        Groq Whisper
 crates/oc-core         re-exports the editor crates
 crates/oc-db           Postgres + object storage (R2)
 apps/oc-api            Axum
-apps/oc-worker         transcribe / proxy / export jobs
+apps/oc-worker         understand / export jobs
 apps/oc-web            Dioxus UI
 ```
 

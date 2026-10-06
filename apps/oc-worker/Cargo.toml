@@ -3,7 +3,7 @@ name = "oc-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Background jobs: transcribe, proxy, export"
+description = "Background jobs: understand, Groq Whisper, export"
 
 [dependencies]
 anyhow.workspace = true

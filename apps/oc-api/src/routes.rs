@@ -518,9 +518,7 @@ async fn run_chat(
                 if (speech.contains_key(&row.id) || looks.contains_key(&row.id)) && !stale_look {
                     continue;
                 }
-                let on_disk = oc_db::local_media_path(&row.r2_key).is_some_and(|p| p.is_file())
-                    || std::path::Path::new(&row.r2_key).is_file();
-                if !oc_db::is_r2_object_key(&row.r2_key) && !on_disk {
+                if !oc_db::is_r2_object_key(&row.r2_key) {
                     continue;
                 }
                 if let Ok(job) = oc_db::enqueue_job(
@@ -544,7 +542,7 @@ async fn run_chat(
                     &tx,
                     serde_json::json!({
                         "type": "status",
-                        "text": "No file on disk to watch yet. Re-import the clip."
+                        "text": "This clip is not on R2 yet. Import it again."
                     }),
                 )
                 .await;
@@ -983,7 +981,7 @@ pub async fn list_media(
     let rows = oc_db::list_media(&state.db, id).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let play_url = media_play_url(id, row.id, &row.r2_key).await;
+        let play_url = media_play_url(id, row.id, &row.r2_key);
         out.push(MediaOut {
             id: row.id,
             project_id: row.project_id,
@@ -997,21 +995,12 @@ pub async fn list_media(
     Ok(Json(out))
 }
 
-async fn media_play_url(project_id: Uuid, media_id: Uuid, key: &str) -> Option<String> {
-    if oc_db::is_r2_object_key(key)
-        || oc_db::is_local_media_key(key)
-        || oc_db::local_media_path(key).is_some_and(|p| p.is_file())
-    {
-        return Some(media_file_url(project_id, media_id));
+fn media_play_url(project_id: Uuid, media_id: Uuid, key: &str) -> Option<String> {
+    if oc_db::is_r2_object_key(key) {
+        Some(media_file_url(project_id, media_id))
+    } else {
+        None
     }
-    if key.starts_with("workspace/") {
-        let guessed =
-            oc_db::local_media_path(&oc_db::local_media_key(project_id, media_id, "media.bin"));
-        if guessed.is_some_and(|p| p.is_file()) {
-            return Some(media_file_url(project_id, media_id));
-        }
-    }
-    None
 }
 
 fn media_file_url(project_id: Uuid, media_id: Uuid) -> String {
@@ -1030,33 +1019,25 @@ async fn store_media_bytes(
     content_type: &str,
     bytes: Vec<u8>,
 ) -> Result<String, ApiError> {
-    if let Some(r2) = &state.r2 {
-        let key = if oc_db::is_r2_object_key(&media.r2_key) {
-            media.r2_key.clone()
-        } else {
-            object_key(
-                ObjectKind::Raw,
-                ProjectId::from_uuid(project_id),
-                MediaId::from_uuid(media_id),
-                &media.filename,
-            )
-        };
-        r2.put_bytes(&key, bytes, content_type)
-            .await
-            .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
-        return Ok(key);
-    }
-    let key = oc_db::local_media_key(project_id, media_id, &media.filename);
-    let path = oc_db::local_media_path(&key)
-        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "bad local key"))?;
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-    tokio::fs::write(&path, bytes)
+    let Some(r2) = &state.r2 else {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "R2 is not configured",
+        ));
+    };
+    let key = if oc_db::is_r2_object_key(&media.r2_key) {
+        media.r2_key.clone()
+    } else {
+        object_key(
+            ObjectKind::Raw,
+            ProjectId::from_uuid(project_id),
+            MediaId::from_uuid(media_id),
+            &media.filename,
+        )
+    };
+    r2.put_bytes(&key, bytes, content_type)
         .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
     Ok(key)
 }
 
@@ -1064,41 +1045,33 @@ pub async fn get_media_file(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
     SignedIn(email): SignedIn,
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
     owned(&state, id, &email).await?;
     let media = oc_db::get_media(&state.db, media_id).await?;
     if media.project_id != id {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
     }
-    if oc_db::is_local_media_key(&media.r2_key) {
-        if let Some(path) = oc_db::local_media_path(&media.r2_key) {
-            return serve_local_file(&path, &media.content_type, headers.get(header::RANGE)).await;
-        }
-    }
     if oc_db::is_r2_object_key(&media.r2_key) {
-        if let Some(r2) = &state.r2 {
-            let url = r2
-                .presign_get(&media.r2_key, Duration::from_secs(6 * 3600))
-                .await
-                .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
-            return Ok(Response::builder()
-                .status(StatusCode::TEMPORARY_REDIRECT)
-                .header(header::LOCATION, url)
-                .body(Body::empty())
-                .unwrap_or_else(|_| Response::new(Body::empty())));
-        }
-    }
-    // workspace/ rows: still try the local file we may have written
-    let fallback = oc_db::local_media_key(id, media_id, &media.filename);
-    if let Some(path) = oc_db::local_media_path(&fallback) {
-        if path.is_file() {
-            return serve_local_file(&path, &media.content_type, headers.get(header::RANGE)).await;
-        }
+        let Some(r2) = &state.r2 else {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "R2 is not configured",
+            ));
+        };
+        let url = r2
+            .presign_get(&media.r2_key, Duration::from_secs(6 * 3600))
+            .await
+            .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+        return Ok(Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(header::LOCATION, url)
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty())));
     }
     Err(ApiError::new(
         StatusCode::NOT_FOUND,
-        "media file is not stored — re-import the clip",
+        "media file is not on R2 — import the clip again",
     ))
 }
 

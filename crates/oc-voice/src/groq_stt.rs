@@ -1,8 +1,8 @@
 //! Groq Whisper — free tier, no credit card.
 //! ~8 hours of audio/day (`whisper-large-v3-turbo`).
 
-use crate::local::parse_openai_whisper;
 use crate::Transcript;
+use crate::parse::parse_openai_whisper;
 use reqwest::multipart::{Form, Part};
 use std::path::Path;
 use std::time::Instant;

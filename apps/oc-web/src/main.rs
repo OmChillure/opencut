@@ -339,7 +339,7 @@ fn Workspace(id: String) -> Element {
                 }
                 event.prevent_default();
                 event.set_return_value(
-                    "Imported files are only in this browser tab and will be removed.",
+                    "Imported files have not reached R2 and will be removed from this project.",
                 );
             },
         )
@@ -581,8 +581,6 @@ fn Header(name: Signal<String>) -> Element {
     let project_id = use_context::<CtxProject>().0;
     let save = use_context::<WorkspaceSave>();
     let held = use_context::<CtxHeld>().0;
-    let library = use_context::<Signal<Vec<MediaItem>>>();
-    let tracks = use_context::<Signal<Vec<EditorTrack>>>();
     let unsaved = !held.read().is_empty();
     rsx! {
         header { class: "header",
@@ -615,9 +613,9 @@ fn Header(name: Signal<String>) -> Element {
                 button {
                     class: if unsaved { "btn btn-primary" } else { "btn btn-ghost" },
                     disabled: !unsaved,
-                    title: "Store imported files so they survive leaving this project",
-                    onclick: move |_| save_held_imports(held, library, tracks, save),
-                    "Save progress"
+                    title: "Send imported files that have not reached R2",
+                    onclick: move |_| save_held_imports(held, save),
+                    "Retry upload"
                 }
                 button {
                     class: "btn btn-primary",
@@ -1090,11 +1088,30 @@ fn MediaPanel() -> Element {
                                     }
                                     library.write().push(item);
                                     held.write().push(HeldImport {
-                                        id,
-                                        name,
-                                        content_type: ctype,
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        content_type: ctype.clone(),
                                         bytes: bytes.to_vec(),
                                     });
+                                    let pid = save.project_id.peek().clone();
+                                    match crate::api::store_imported(
+                                        &pid,
+                                        &id,
+                                        &name,
+                                        &ctype,
+                                        bytes.to_vec(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            held.write().retain(|row| row.id != id);
+                                        }
+                                        Err(err) => {
+                                            show_toast().error(format!(
+                                                "{name} did not reach R2: {err}"
+                                            ));
+                                        }
+                                    }
                                 }
                             });
                         },
@@ -2128,19 +2145,14 @@ fn confirm_leave(held: Signal<Vec<HeldImport>>) -> bool {
     }
     let n = held.peek().len();
     let msg = format!(
-        "{n} imported file(s) are only in this browser tab. Leave without saving and they will be removed."
+        "{n} imported file(s) have not reached R2. Leave and they will be removed from this project."
     );
     web_sys::window()
         .and_then(|w| w.confirm_with_message(&msg).ok())
         .unwrap_or(false)
 }
 
-fn save_held_imports(
-    mut held: Signal<Vec<HeldImport>>,
-    mut library: Signal<Vec<MediaItem>>,
-    mut tracks: Signal<Vec<EditorTrack>>,
-    save: WorkspaceSave,
-) {
+fn save_held_imports(mut held: Signal<Vec<HeldImport>>, save: WorkspaceSave) {
     let batch = held.peek().clone();
     if batch.is_empty() {
         return;
@@ -2149,33 +2161,26 @@ fn save_held_imports(
     spawn(async move {
         let mut failed = 0usize;
         for file in batch {
-            match crate::api::upload_media(&pid, &file.name, &file.content_type, file.bytes).await {
-                Ok(server_id) => {
-                    if let Some(item) = library.write().iter_mut().find(|item| item.id == file.id) {
-                        item.id = server_id.clone();
-                    }
-                    let mut changed = false;
-                    for track in tracks.write().iter_mut() {
-                        for clip in track.clips.iter_mut() {
-                            if clip.media_id == file.id {
-                                clip.media_id = server_id.clone();
-                                changed = true;
-                            }
-                        }
-                    }
+            match crate::api::store_imported(
+                &pid,
+                &file.id,
+                &file.name,
+                &file.content_type,
+                file.bytes,
+            )
+            .await
+            {
+                Ok(()) => {
                     held.write().retain(|row| row.id != file.id);
-                    if changed {
-                        persist(save);
-                    }
                 }
                 Err(err) => {
                     failed += 1;
-                    show_toast().error(format!("Save failed for {}: {err}", file.name));
+                    show_toast().error(format!("{} did not reach R2: {err}", file.name));
                 }
             }
         }
         if failed == 0 {
-            show_toast().success("Progress saved. Imported files are stored.");
+            show_toast().success("Imported files are on R2.");
         }
     });
 }
@@ -3701,19 +3706,8 @@ fn send_prompt(
         .collect();
     let library = use_context::<Signal<Vec<MediaItem>>>();
     let active = use_context::<CtxActive>().0;
-    let bin: Vec<(String, String, String, f64, String)> = library
-        .peek()
-        .iter()
-        .map(|item| {
-            (
-                item.id.clone(),
-                item.name.clone(),
-                item.content_type.clone(),
-                item.duration,
-                item.url.clone(),
-            )
-        })
-        .collect();
+    let mut held = use_context::<CtxHeld>().0;
+    let batch = held.peek().clone();
     let opening = persistable(&messages.read());
     let mut bound = chat_id.peek().clone();
     spawn(async move {
@@ -3726,15 +3720,22 @@ fn send_prompt(
             }
             return;
         }
-        for (id, name, ctype, dur, url) in &bin {
+        for file in batch {
             if !api::chat_current(turn) {
                 break;
             }
-            let _ = api::register_media(&pid, id, name, ctype, *dur).await;
-            if url.starts_with("blob:") {
-                if let Ok(resp) = reqwest::Client::new().get(url).send().await {
-                    if let Ok(bytes) = resp.bytes().await {
-                        let _ = api::put_media_bytes(&pid, id, ctype, bytes.to_vec()).await;
+            match api::store_imported(&pid, &file.id, &file.name, &file.content_type, file.bytes)
+                .await
+            {
+                Ok(()) => {
+                    held.write().retain(|row| row.id != file.id);
+                }
+                Err(err) => {
+                    if api::chat_current(turn) {
+                        messages.write().push(ChatMsg::status(format!(
+                            "{} is not on R2 — {err}",
+                            file.name
+                        )));
                     }
                 }
             }

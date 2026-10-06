@@ -163,34 +163,15 @@ async fn generate_broll(
     let (bytes, seconds) = oc_providers::imagine_clip(prompt, requested, &aspect).await?;
     let media_id = Uuid::now_v7();
     let filename = format!("broll-{media_id}.mp4");
-    let local_key = oc_db::local_media_key(project_id, media_id, &filename);
-    let object_key = oc_media::object_key(
-        oc_media::ObjectKind::Raw,
-        oc_core::ProjectId::from_uuid(project_id),
-        MediaId::from_uuid(media_id),
+    store_r2_media(
+        db,
+        project_id,
+        media_id,
         &filename,
-    );
-    oc_db::insert_media(db, project_id, media_id, &local_key, &filename, "video/mp4")
-        .await
-        .map_err(|e| e.to_string())?;
-    let stored_key = match oc_db::R2::from_env().await {
-        Ok(r2) => match r2.put_bytes(&object_key, bytes.to_vec(), "video/mp4").await {
-            Ok(()) => object_key,
-            Err(err) => {
-                tracing::warn!("b-roll R2 put failed, keeping a local file: {err}");
-                write_local_media(&local_key, &bytes).await?;
-                local_key
-            }
-        },
-        Err(err) => {
-            tracing::info!("b-roll staying local: {err}");
-            write_local_media(&local_key, &bytes).await?;
-            local_key
-        }
-    };
-    oc_db::set_media_r2_key(db, media_id, &stored_key)
-        .await
-        .map_err(|e| e.to_string())?;
+        "video/mp4",
+        bytes.to_vec(),
+    )
+    .await?;
     let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
     oc_db::set_media_duration(db, media_id, ticks.max(1))
         .await
@@ -252,34 +233,15 @@ async fn add_design(
         oc_providers::imagine_clip(&design_prompt(prompt), requested, &aspect).await?;
     let media_id = Uuid::now_v7();
     let filename = format!("design-{media_id}.mp4");
-    let local_key = oc_db::local_media_key(project_id, media_id, &filename);
-    let object_key = oc_media::object_key(
-        oc_media::ObjectKind::Raw,
-        oc_core::ProjectId::from_uuid(project_id),
-        MediaId::from_uuid(media_id),
+    store_r2_media(
+        db,
+        project_id,
+        media_id,
         &filename,
-    );
-    oc_db::insert_media(db, project_id, media_id, &local_key, &filename, "video/mp4")
-        .await
-        .map_err(|e| e.to_string())?;
-    let stored_key = match oc_db::R2::from_env().await {
-        Ok(r2) => match r2.put_bytes(&object_key, bytes.to_vec(), "video/mp4").await {
-            Ok(()) => object_key,
-            Err(err) => {
-                tracing::warn!("design R2 put failed, keeping a local file: {err}");
-                write_local_media(&local_key, &bytes).await?;
-                local_key
-            }
-        },
-        Err(err) => {
-            tracing::info!("design staying local: {err}");
-            write_local_media(&local_key, &bytes).await?;
-            local_key
-        }
-    };
-    oc_db::set_media_r2_key(db, media_id, &stored_key)
-        .await
-        .map_err(|e| e.to_string())?;
+        "video/mp4",
+        bytes.to_vec(),
+    )
+    .await?;
     let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
     oc_db::set_media_duration(db, media_id, ticks.max(1))
         .await
@@ -402,41 +364,7 @@ async fn import_render(db: &Db, project_id: Uuid, arguments: &Value) -> Result<S
     };
     let media_id = Uuid::now_v7();
     let filename = format!("motion-{media_id}.{ext}");
-    let local_key = oc_db::local_media_key(project_id, media_id, &filename);
-    let object_key = oc_media::object_key(
-        oc_media::ObjectKind::Raw,
-        oc_core::ProjectId::from_uuid(project_id),
-        MediaId::from_uuid(media_id),
-        &filename,
-    );
-    oc_db::insert_media(
-        db,
-        project_id,
-        media_id,
-        &local_key,
-        &filename,
-        content_type,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let stored_key = match oc_db::R2::from_env().await {
-        Ok(r2) => match r2.put_bytes(&object_key, bytes.clone(), content_type).await {
-            Ok(()) => object_key,
-            Err(err) => {
-                tracing::warn!("motion render R2 put failed, keeping a local file: {err}");
-                write_local_media(&local_key, &bytes).await?;
-                local_key
-            }
-        },
-        Err(err) => {
-            tracing::info!("motion render staying local: {err}");
-            write_local_media(&local_key, &bytes).await?;
-            local_key
-        }
-    };
-    oc_db::set_media_r2_key(db, media_id, &stored_key)
-        .await
-        .map_err(|e| e.to_string())?;
+    store_r2_media(db, project_id, media_id, &filename, content_type, bytes).await?;
     let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
     oc_db::set_media_duration(db, media_id, ticks.max(1))
         .await
@@ -480,16 +408,34 @@ fn allowed_render(raw: &str) -> Result<std::path::PathBuf, String> {
     Err("render must be under this project, videos/, or the temp dir".into())
 }
 
-async fn write_local_media(key: &str, bytes: &[u8]) -> Result<(), String> {
-    let path = oc_db::local_media_path(key).ok_or_else(|| "bad local media key".to_string())?;
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    tokio::fs::write(path, bytes)
+/// Put generated bytes on R2 and store that object key. A failed put leaves no local file.
+async fn store_r2_media(
+    db: &Db,
+    project_id: Uuid,
+    media_id: Uuid,
+    filename: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    let key = oc_media::object_key(
+        oc_media::ObjectKind::Raw,
+        oc_core::ProjectId::from_uuid(project_id),
+        MediaId::from_uuid(media_id),
+        filename,
+    );
+    oc_db::insert_media(db, project_id, media_id, &key, filename, content_type)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let r2 = oc_db::R2::from_env()
+        .await
+        .map_err(|e| format!("R2 is required: {e}"))?;
+    r2.put_bytes(&key, bytes, content_type)
+        .await
+        .map_err(|e| e.to_string())?;
+    oc_db::set_media_r2_key(db, media_id, &key)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub(crate) async fn queue_export(
@@ -574,7 +520,7 @@ pub(crate) async fn place_captions(
             .map_err(|e| e.to_string())?;
         let mut queued = 0;
         for row in media {
-            if row.content_type.starts_with("image/") {
+            if row.content_type.starts_with("image/") || !oc_db::is_r2_object_key(&row.r2_key) {
                 continue;
             }
             oc_db::enqueue_job(
@@ -721,7 +667,7 @@ pub(crate) async fn see_frame(
     let mut temps = Vec::new();
     let path = open_for_frames(row, r2, &mut temps)
         .await
-        .ok_or_else(|| format!("media {media_id} is not on disk"))?;
+        .ok_or_else(|| format!("media {media_id} is not on R2"))?;
     let dest = std::env::temp_dir().join(format!(
         "oc-see-{}-{}.jpg",
         std::process::id(),
@@ -751,9 +697,6 @@ async fn open_for_frames(
     r2: Option<&oc_db::R2>,
     temps: &mut Vec<std::path::PathBuf>,
 ) -> Option<std::path::PathBuf> {
-    if let Some(path) = media_file(row) {
-        return Some(path);
-    }
     if !oc_db::is_r2_object_key(&row.r2_key) {
         return None;
     }
@@ -766,16 +709,6 @@ async fn open_for_frames(
     tokio::fs::write(&path, bytes).await.ok()?;
     temps.push(dir);
     Some(path)
-}
-
-fn media_file(row: &oc_db::MediaRow) -> Option<std::path::PathBuf> {
-    if let Some(path) = oc_db::local_media_path(&row.r2_key) {
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let path = std::path::PathBuf::from(&row.r2_key);
-    if path.is_file() { Some(path) } else { None }
 }
 
 pub(crate) fn run_inspect(
