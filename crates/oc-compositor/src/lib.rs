@@ -97,7 +97,9 @@ pub fn plan_frame(timeline: &Timeline, time: Time) -> FramePlan {
             needs_paint = true;
         }
         let mix = mix_at(timeline, clip, time);
-        if mix.progress > 0.0 && clip.look.transition == TransitionKind::Pixelize {
+        // A join is the compositor's mix, including the pixelize mosaic.
+        // The video element only crossfades; it cannot draw that mosaic.
+        if mix.progress > 0.0 && clip.look.transition != TransitionKind::Cut {
             needs_paint = true;
         }
         push_plate(&mut layers, clip, name, time, mix.progress, false, 0.0);
@@ -223,7 +225,8 @@ fn plate_needs_paint(clip: &Clip, track_name: &str) -> bool {
         || clip.look.overlay
         || !clip.look.curves.is_identity()
         || clip.look.fx.blur > 0.02
-        || clip.look.grade.cube.is_some()
+        || clip.look.fx.vignette > 0.02
+        || !clip.look.grade.is_identity()
         || clip.look.stabilize
 }
 
@@ -455,6 +458,84 @@ mod tests {
             _ => panic!("expected video layer"),
         }
         assert!(!plan.needs_paint);
+    }
+
+    #[test]
+    fn a_grade_asks_for_a_painted_frame() {
+        let mut tl = Timeline::default();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let mut look = ClipLook::default();
+        look.grade.contrast = 0.2;
+        look.grade.lut = oc_timeline::Lut::Warm;
+        tl.add_clip(
+            track,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Transform::default(),
+                },
+                start: Time::ZERO,
+                duration: Duration::from_seconds(2.0),
+                source_in: Time::ZERO,
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look,
+            },
+        )
+        .unwrap();
+        let plan = plan_frame(&tl, Time::from_seconds(0.4));
+        assert!(plan.needs_paint);
+    }
+
+    #[test]
+    fn pixelize_paints_only_during_the_join() {
+        let mut tl = Timeline::default();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let mut outgoing = ClipLook::default();
+        outgoing.transition = TransitionKind::Pixelize;
+        tl.add_clip(
+            track,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Transform::default(),
+                },
+                start: Time::ZERO,
+                duration: Duration::from_seconds(2.0),
+                source_in: Time::ZERO,
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: outgoing,
+            },
+        )
+        .unwrap();
+        tl.add_clip(
+            track,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Transform::default(),
+                },
+                start: Time::from_seconds(2.0),
+                duration: Duration::from_seconds(2.0),
+                source_in: Time::ZERO,
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look: ClipLook::default(),
+            },
+        )
+        .unwrap();
+        assert!(!plan_frame(&tl, Time::from_seconds(0.4)).needs_paint);
+        assert!(plan_frame(&tl, Time::from_seconds(1.5)).needs_paint);
     }
 
     #[test]
