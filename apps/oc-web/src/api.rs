@@ -25,8 +25,7 @@ struct ProvidersResp {
 }
 
 pub async fn list_ai_providers() -> Result<Vec<AiProvider>, String> {
-    let resp: ProvidersResp = reqwest::Client::new()
-        .get(format!("{API}/v1/ai/providers"))
+    let resp: ProvidersResp = authed(reqwest::Client::new().get(format!("{API}/v1/ai/providers")))
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -75,8 +74,7 @@ pub async fn register_media(
     content_type: &str,
     duration: f64,
 ) -> Result<(), String> {
-    reqwest::Client::new()
-        .post(format!("{API}/v1/projects/{project_id}/media"))
+    authed(reqwest::Client::new().post(format!("{API}/v1/projects/{project_id}/media")))
         .json(&serde_json::json!({
             "id": media_id,
             "filename": filename,
@@ -97,15 +95,14 @@ pub async fn put_media_bytes(
     content_type: &str,
     bytes: Vec<u8>,
 ) -> Result<(), String> {
-    let res = reqwest::Client::new()
-        .put(format!(
-            "{API}/v1/projects/{project_id}/media/{media_id}/bytes"
-        ))
-        .header("content-type", content_type)
-        .body(bytes)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let res = authed(reqwest::Client::new().put(format!(
+        "{API}/v1/projects/{project_id}/media/{media_id}/bytes"
+    )))
+    .header("content-type", content_type)
+    .body(bytes)
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
@@ -291,6 +288,47 @@ fn user_query(user: &str) -> String {
     out
 }
 
+fn signed_email() -> Option<String> {
+    crate::auth::current_email().filter(|email| !email.is_empty())
+}
+
+fn authed(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match signed_email() {
+        Some(email) => builder.header("x-opencut-user", email),
+        None => builder,
+    }
+}
+
+/// A video element cannot send a header. File and export URLs carry `?user=`.
+fn with_user(url: &str) -> String {
+    if url.is_empty() || url.starts_with("blob:") || url.contains("user=") {
+        return url.to_string();
+    }
+    let ours = url.contains("/v1/projects/")
+        && ((url.contains("/media/") && url.contains("/file")) || url.contains("/export"));
+    if !ours {
+        return url.to_string();
+    }
+    let Some(email) = signed_email() else {
+        return url.to_string();
+    };
+    let join = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{join}user={}", user_query(&email))
+}
+
+pub fn export_file_url(project_id: &str) -> String {
+    with_user(&format!("{API}/v1/projects/{project_id}/export"))
+}
+
+pub async fn export_is_ready(project_id: &str) -> bool {
+    let file = export_file_url(project_id);
+    authed(reqwest::Client::new().head(file))
+        .send()
+        .await
+        .ok()
+        .is_some_and(|response| response.status().is_success())
+}
+
 pub async fn list_chats(project_id: &str, user: &str) -> Result<Vec<ChatSummary>, String> {
     let url = format!(
         "{API}/v1/projects/{project_id}/chats?user={}",
@@ -300,8 +338,7 @@ pub async fn list_chats(project_id: &str, user: &str) -> Result<Vec<ChatSummary>
 }
 
 pub async fn create_chat(project_id: &str, user: &str) -> Result<ChatSummary, String> {
-    reqwest::Client::new()
-        .post(format!("{API}/v1/projects/{project_id}/chats"))
+    authed(reqwest::Client::new().post(format!("{API}/v1/projects/{project_id}/chats")))
         .json(&serde_json::json!({ "user": user }))
         .send()
         .await
@@ -327,19 +364,18 @@ pub async fn save_chat(
     user: &str,
     messages: &[StoredMsg],
 ) -> Result<ChatSummary, String> {
-    reqwest::Client::new()
-        .put(format!(
-            "{API}/v1/projects/{project_id}/chats/{chat_id}/messages"
-        ))
-        .json(&serde_json::json!({ "user": user, "messages": messages }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+    authed(reqwest::Client::new().put(format!(
+        "{API}/v1/projects/{project_id}/chats/{chat_id}/messages"
+    )))
+    .json(&serde_json::json!({ "user": user, "messages": messages }))
+    .send()
+    .await
+    .map_err(|e| e.to_string())?
+    .error_for_status()
+    .map_err(|e| e.to_string())?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn read_ndjson(
@@ -358,18 +394,20 @@ async fn read_ndjson(
         if !chat_current(turn) {
             return Err("stopped".into());
         }
-        let raw = reqwest::Client::new()
-            .post(url)
-            .header("content-type", "application/json")
-            .body(json_body.to_string())
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?
-            .text()
-            .await
-            .map_err(|e| e.to_string())?;
+        let raw = authed(
+            reqwest::Client::new()
+                .post(url)
+                .header("content-type", "application/json"),
+        )
+        .body(json_body.to_string())
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
         for line in raw.lines() {
             let line = line.trim();
             if !line.is_empty() {
@@ -407,6 +445,12 @@ async fn wasm_read_ndjson(
         .headers()
         .set("content-type", "application/json")
         .map_err(js_err)?;
+    if let Some(email) = signed_email() {
+        request
+            .headers()
+            .set("x-opencut-user", &email)
+            .map_err(js_err)?;
+    }
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
     let resp = match JsFuture::from(window.fetch_with_request(&request)).await {
         Ok(resp) => resp,
@@ -515,8 +559,7 @@ fn value_to_id(value: serde_json::Value) -> String {
 }
 
 pub async fn list_projects() -> Result<Vec<ProjectSummary>, String> {
-    let rows: Vec<ApiProject> = reqwest::Client::new()
-        .get(format!("{API}/v1/projects"))
+    let rows: Vec<ApiProject> = authed(reqwest::Client::new().get(format!("{API}/v1/projects")))
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -533,8 +576,7 @@ pub async fn get_project(id: &str) -> Result<Project, String> {
 }
 
 pub async fn rename_project(id: &str, name: &str) -> Result<(), String> {
-    let _project: Project = reqwest::Client::new()
-        .patch(format!("{API}/v1/projects/{id}"))
+    let _project: Project = authed(reqwest::Client::new().patch(format!("{API}/v1/projects/{id}")))
         .json(&serde_json::json!({ "name": name }))
         .send()
         .await
@@ -556,8 +598,7 @@ pub async fn apply_ops(id: &str, ops: Vec<Op>) -> Result<Timeline, String> {
     struct Resp {
         timeline: Timeline,
     }
-    let resp: Resp = reqwest::Client::new()
-        .post(format!("{API}/v1/projects/{id}/ops"))
+    let resp: Resp = authed(reqwest::Client::new().post(format!("{API}/v1/projects/{id}/ops")))
         .json(&Body { ops })
         .send()
         .await
@@ -576,16 +617,16 @@ pub async fn generate_captions(id: &str) -> Result<(Timeline, String), String> {
         timeline: Timeline,
         note: String,
     }
-    let resp: Resp = reqwest::Client::new()
-        .post(format!("{API}/v1/projects/{id}/captions"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp: Resp =
+        authed(reqwest::Client::new().post(format!("{API}/v1/projects/{id}/captions")))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
     Ok((resp.timeline, resp.note))
 }
 
@@ -598,14 +639,15 @@ pub async fn patch_media_duration(
     media_id: &str,
     seconds: f64,
 ) -> Result<(), String> {
-    reqwest::Client::new()
-        .patch(format!("{API}/v1/projects/{project_id}/media/{media_id}"))
-        .json(&serde_json::json!({ "duration_seconds": seconds }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
+    authed(
+        reqwest::Client::new().patch(format!("{API}/v1/projects/{project_id}/media/{media_id}")),
+    )
+    .json(&serde_json::json!({ "duration_seconds": seconds }))
+    .send()
+    .await
+    .map_err(|e| e.to_string())?
+    .error_for_status()
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -625,10 +667,11 @@ pub async fn list_media(project_id: &str) -> Result<Vec<MediaItem>, String> {
         .into_iter()
         .map(|row| {
             let id = value_to_id(row.id);
-            let play = row
-                .play_url
-                .filter(|u| !u.is_empty() && !u.starts_with("blob:"))
-                .unwrap_or_else(|| media_file_url(project_id, &id));
+            let play = with_user(
+                &row.play_url
+                    .filter(|u| !u.is_empty() && !u.starts_with("blob:"))
+                    .unwrap_or_else(|| media_file_url(project_id, &id)),
+            );
             bind::media_from_api(
                 &id,
                 row.filename,
@@ -641,8 +684,7 @@ pub async fn list_media(project_id: &str) -> Result<Vec<MediaItem>, String> {
 }
 
 async fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, String> {
-    reqwest::Client::new()
-        .get(url)
+    authed(reqwest::Client::new().get(url))
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -654,8 +696,7 @@ async fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, String> 
 }
 
 pub async fn delete_project(id: &str) -> Result<(), String> {
-    let res = reqwest::Client::new()
-        .delete(format!("{API}/v1/projects/{id}"))
+    let res = authed(reqwest::Client::new().delete(format!("{API}/v1/projects/{id}")))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -667,8 +708,7 @@ pub async fn delete_project(id: &str) -> Result<(), String> {
 }
 
 pub async fn create_project(name: &str) -> Result<ProjectSummary, String> {
-    let row: ApiProject = reqwest::Client::new()
-        .post(format!("{API}/v1/projects"))
+    let row: ApiProject = authed(reqwest::Client::new().post(format!("{API}/v1/projects")))
         .json(&serde_json::json!({ "name": name }))
         .send()
         .await
@@ -694,8 +734,7 @@ pub async fn upload_media(
     bytes: Vec<u8>,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
-    let pending = client
-        .post(format!("{API}/v1/projects/{project_id}/media/upload"))
+    let pending = authed(client.post(format!("{API}/v1/projects/{project_id}/media/upload")))
         .json(&serde_json::json!({
             "filename": filename,
             "content_type": content_type,
@@ -720,12 +759,11 @@ pub async fn upload_media(
             .and_then(|r| r.error_for_status())
             .is_ok()
         {
-            let _ = client
-                .post(format!(
-                    "{API}/v1/projects/{project_id}/media/{media_id}/complete"
-                ))
-                .send()
-                .await;
+            let _ = authed(client.post(format!(
+                "{API}/v1/projects/{project_id}/media/{media_id}/complete"
+            )))
+            .send()
+            .await;
             return Ok(media_id);
         }
     }
@@ -734,7 +772,9 @@ pub async fn upload_media(
 }
 
 pub fn media_file_url(project_id: &str, media_id: &str) -> String {
-    format!("{API}/v1/projects/{project_id}/media/{media_id}/file")
+    with_user(&format!(
+        "{API}/v1/projects/{project_id}/media/{media_id}/file"
+    ))
 }
 
 #[cfg(test)]

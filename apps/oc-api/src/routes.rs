@@ -2,7 +2,8 @@ use crate::edit::{self, hydrate_op, look_by_media, speech_by_media};
 use crate::state::AppState;
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use futures_util::StreamExt;
@@ -51,6 +52,73 @@ impl axum::response::IntoResponse for ApiError {
     }
 }
 
+/// The signed-in email. Fetch sends `x-opencut-user`. A media or export URL may use `?user=`.
+pub struct SignedIn(pub String);
+
+impl<S> FromRequestParts<S> for SignedIn
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let header = parts
+            .headers
+            .get("x-opencut-user")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let from_query = query_param(parts.uri.query().unwrap_or(""), "user");
+        let raw = if header.is_empty() {
+            from_query.as_str()
+        } else {
+            header
+        };
+        let email = oc_db::normalize_user_email(raw)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "sign in with an email"))?;
+        Ok(SignedIn(email))
+    }
+}
+
+fn query_param(query: &str, key: &str) -> String {
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name == key {
+            return percent_decode(value);
+        }
+    }
+    String::new()
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[index] == b'+' {
+            b' '
+        } else {
+            bytes[index]
+        });
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+async fn owned(state: &AppState, id: Uuid, email: &str) -> Result<(), ApiError> {
+    oc_db::require_project_owner(&state.db, id, email).await?;
+    Ok(())
+}
+
 pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
@@ -62,22 +130,26 @@ pub struct CreateProjectBody {
 
 pub async fn create_project(
     State(state): State<AppState>,
+    SignedIn(email): SignedIn,
     Json(body): Json<CreateProjectBody>,
 ) -> ApiResult<Json<Project>> {
     let name = body.name.unwrap_or_else(|| "Untitled".into());
-    Ok(Json(oc_db::create_project(&state.db, &name).await?))
+    Ok(Json(oc_db::create_project(&state.db, &name, &email).await?))
 }
 
 pub async fn list_projects(
     State(state): State<AppState>,
+    SignedIn(email): SignedIn,
 ) -> ApiResult<Json<Vec<oc_db::ProjectRow>>> {
-    Ok(Json(oc_db::list_projects(&state.db).await?))
+    Ok(Json(oc_db::list_projects(&state.db, &email).await?))
 }
 
 pub async fn get_project(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
 ) -> ApiResult<Json<Project>> {
+    owned(&state, id, &email).await?;
     Ok(Json(oc_db::get_project(&state.db, id).await?))
 }
 
@@ -89,8 +161,10 @@ pub struct UpdateProjectBody {
 pub async fn update_project(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
     Json(body): Json<UpdateProjectBody>,
 ) -> ApiResult<Json<Project>> {
+    owned(&state, id, &email).await?;
     let name = body.name.trim();
     if name.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "name required"));
@@ -107,7 +181,9 @@ pub struct DeleteProjectResponse {
 pub async fn delete_project(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
 ) -> ApiResult<Json<DeleteProjectResponse>> {
+    owned(&state, id, &email).await?;
     let keys = oc_db::delete_project(&state.db, id).await?;
     let mut r2_deleted = 0u32;
     if let Some(r2) = &state.r2 {
@@ -150,8 +226,10 @@ pub struct ApplyOpsResponse {
 pub async fn apply_ops(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
     Json(body): Json<ApplyOpsBody>,
 ) -> ApiResult<Json<ApplyOpsResponse>> {
+    owned(&state, id, &email).await?;
     let mut project = oc_db::get_project(&state.db, id).await?;
     let media = oc_db::list_media(&state.db, id).await?;
     let transcripts = oc_db::list_transcripts_for_project(&state.db, id).await?;
@@ -202,8 +280,10 @@ pub struct ChatBody {
 pub async fn chat(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
     Json(body): Json<ChatBody>,
 ) -> Result<Response, ApiError> {
+    owned(&state, id, &email).await?;
     tracing::info!(
         project = %id,
         provider = %body.provider,
@@ -794,9 +874,11 @@ pub struct RegisterMediaBody {
 pub async fn put_media_bytes(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
+    owned(&state, id, &email).await?;
     let media = oc_db::get_media(&state.db, media_id).await?;
     if media.project_id != id {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
@@ -827,9 +909,10 @@ pub async fn put_media_bytes(
 pub async fn register_media(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
     Json(body): Json<RegisterMediaBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _ = oc_db::get_project(&state.db, id).await?;
+    owned(&state, id, &email).await?;
     let media_id = body.id.unwrap_or_else(Uuid::now_v7);
     let ctype = body
         .content_type
@@ -845,9 +928,10 @@ pub async fn register_media(
 pub async fn request_upload(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
     Json(body): Json<UploadBody>,
 ) -> ApiResult<Json<UploadResponse>> {
-    let _ = oc_db::get_project(&state.db, id).await?;
+    owned(&state, id, &email).await?;
     let media_id = MediaId::new();
     let project_id = ProjectId::from_uuid(id);
     let content_type = body
@@ -893,7 +977,9 @@ pub struct MediaOut {
 pub async fn list_media(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
 ) -> ApiResult<Json<Vec<MediaOut>>> {
+    owned(&state, id, &email).await?;
     let rows = oc_db::list_media(&state.db, id).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -977,8 +1063,10 @@ async fn store_media_bytes(
 pub async fn get_media_file(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
+    owned(&state, id, &email).await?;
     let media = oc_db::get_media(&state.db, media_id).await?;
     if media.project_id != id {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
@@ -1041,7 +1129,12 @@ fn latest_export(id: Uuid) -> Result<std::path::PathBuf, ApiError> {
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))
 }
 
-pub async fn head_export(Path(id): Path<Uuid>) -> ApiResult<Response> {
+pub async fn head_export(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
+) -> ApiResult<Response> {
+    owned(&state, id, &email).await?;
     let path = latest_export(id)?;
     let len = std::fs::metadata(&path)
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?
@@ -1057,9 +1150,12 @@ pub async fn head_export(Path(id): Path<Uuid>) -> ApiResult<Response> {
 }
 
 pub async fn get_export(
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
+    owned(&state, id, &email).await?;
     let path = latest_export(id)?;
     serve_local_file(&path, "video/mp4", headers.get(header::RANGE))
         .await
@@ -1183,8 +1279,10 @@ pub struct PatchMediaBody {
 pub async fn patch_media(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
     Json(body): Json<PatchMediaBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    owned(&state, id, &email).await?;
     let media = oc_db::get_media(&state.db, media_id).await?;
     if media.project_id != id {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
@@ -1201,7 +1299,9 @@ pub async fn patch_media(
 pub async fn complete_upload(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
 ) -> ApiResult<Json<serde_json::Value>> {
+    owned(&state, id, &email).await?;
     let media = oc_db::get_media(&state.db, media_id).await?;
     oc_db::set_media_status(&state.db, media_id, "ready").await?;
     if !media.content_type.starts_with("image/") {
@@ -1223,8 +1323,9 @@ pub async fn complete_upload(
 pub async fn generate_captions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _ = oc_db::get_project(&state.db, id).await?;
+    owned(&state, id, &email).await?;
     let (timeline, note) = edit::place_captions(&state.db, id)
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e))?;
@@ -1237,7 +1338,9 @@ pub async fn generate_captions(
 pub async fn transcribe_media(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
 ) -> ApiResult<Json<serde_json::Value>> {
+    owned(&state, id, &email).await?;
     let media = oc_db::get_media(&state.db, media_id).await?;
     if media.project_id != id {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
@@ -1284,16 +1387,20 @@ pub(crate) struct ChatDetail {
 pub async fn list_chats(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
     Query(query): Query<UserQuery>,
 ) -> ApiResult<Json<Vec<oc_db::ChatRow>>> {
+    owned(&state, id, &email).await?;
     Ok(Json(oc_db::list_chats(&state.db, id, &query.user).await?))
 }
 
 pub async fn create_chat(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    SignedIn(email): SignedIn,
     Json(body): Json<CreateChatBody>,
 ) -> ApiResult<Json<oc_db::ChatRow>> {
+    owned(&state, id, &email).await?;
     let chat = oc_db::create_chat(&state.db, id, &body.user, body.title.as_deref()).await?;
     tracing::info!(project = %id, chat = %chat.id, "chat created");
     Ok(Json(chat))
@@ -1302,8 +1409,10 @@ pub async fn create_chat(
 pub async fn get_chat(
     State(state): State<AppState>,
     Path((id, chat_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
     Query(query): Query<UserQuery>,
 ) -> ApiResult<Json<ChatDetail>> {
+    owned(&state, id, &email).await?;
     let (chat, messages) = oc_db::get_chat(&state.db, id, chat_id, &query.user).await?;
     Ok(Json(ChatDetail { chat, messages }))
 }
@@ -1311,8 +1420,10 @@ pub async fn get_chat(
 pub async fn save_chat_messages(
     State(state): State<AppState>,
     Path((id, chat_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
     Json(body): Json<SaveChatBody>,
 ) -> ApiResult<Json<oc_db::ChatRow>> {
+    owned(&state, id, &email).await?;
     let chat =
         oc_db::save_chat_messages(&state.db, id, chat_id, &body.user, &body.messages).await?;
     tracing::info!(project = %id, chat = %chat_id, n = body.messages.len(), "chat saved");

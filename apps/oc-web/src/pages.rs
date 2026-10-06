@@ -300,10 +300,11 @@ pub fn Export(id: String) -> Element {
                                 }
                                 for _ in 0..300 {
                                     gloo_timers::future::TimeoutFuture::new(2000).await;
-                                    let file = format!("http://127.0.0.1:8787/v1/projects/{pid}/export");
-                                    if reqwest::Client::new().head(&file).send().await.ok().is_some_and(|r| r.status().is_success()) {
+                                    if api::export_is_ready(&pid).await {
                                         let stamp = js_sys::Date::now() as u64;
-                                        url.set(format!("{file}?v={stamp}"));
+                                        let file = api::export_file_url(&pid);
+                                        let join = if file.contains('?') { '&' } else { '?' };
+                                        url.set(format!("{file}{join}v={stamp}"));
                                         note.set("Ready to play.".into());
                                         busy.set(false);
                                         return;

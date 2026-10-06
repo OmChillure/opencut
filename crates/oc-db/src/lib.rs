@@ -5,8 +5,8 @@ pub use storage::{R2, R2Config, StorageError};
 use chrono::{DateTime, Utc};
 use oc_timeline::{Project, ProjectId, Timeline};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 use std::time::Duration;
 use uuid::Uuid;
@@ -93,7 +93,9 @@ fn prefer_session_pooler(url: &str) -> String {
     if url.contains("pooler.supabase.com:6543") || url.contains("pooler.supabase.com:5432") {
         let next = url.replace(":6543", ":5432");
         if next != url {
-            tracing::warn!("DATABASE_URL used port 6543 (transaction pooler); using 5432 (session) so sqlx binds work");
+            tracing::warn!(
+                "DATABASE_URL used port 6543 (transaction pooler); using 5432 (session) so sqlx binds work"
+            );
         }
         return next;
     }
@@ -115,6 +117,9 @@ pub async fn migrate(pool: &Db) -> Result<(), DbError> {
         .execute(pool)
         .await?;
     sqlx::raw_sql(include_str!("../migrations/0003_chats.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!("../migrations/0004_projects_owner.sql"))
         .execute(pool)
         .await?;
     Ok(())
@@ -142,6 +147,7 @@ pub struct ProjectRow {
     pub timeline: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub owner_email: Option<String>,
 }
 
 impl ProjectRow {
@@ -178,24 +184,31 @@ pub struct JobRow {
     pub error: Option<String>,
 }
 
-pub async fn create_project(pool: &Db, name: &str) -> Result<Project, DbError> {
+pub async fn create_project(pool: &Db, name: &str, owner: &str) -> Result<Project, DbError> {
+    let email = normalize_user_email(owner)?;
     let project = Project::new(name);
     let timeline = serde_json::to_value(&project.timeline)?;
-    query(
-        "insert into projects (id, name, timeline) values ($1, $2, $3)",
-    )
-    .bind(project.id.as_uuid())
-    .bind(&project.name)
-    .bind(&timeline)
-    .execute(pool)
-    .await?;
+    query("insert into projects (id, name, timeline, owner_email) values ($1, $2, $3, $4)")
+        .bind(project.id.as_uuid())
+        .bind(&project.name)
+        .bind(&timeline)
+        .bind(&email)
+        .execute(pool)
+        .await?;
     Ok(project)
 }
 
-pub async fn list_projects(pool: &Db) -> Result<Vec<ProjectRow>, DbError> {
+/// Projects with no owner yet belong to the first signed-in email that lists them.
+pub async fn list_projects(pool: &Db, owner: &str) -> Result<Vec<ProjectRow>, DbError> {
+    let email = normalize_user_email(owner)?;
+    query("update projects set owner_email = $1 where owner_email is null")
+        .bind(&email)
+        .execute(pool)
+        .await?;
     let rows = query_as::<ProjectRow>(
-        "select id, name, timeline, created_at, updated_at from projects order by updated_at desc",
+        "select id, name, timeline, created_at, updated_at, owner_email from projects where owner_email = $1 order by updated_at desc",
     )
+    .bind(&email)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -203,13 +216,30 @@ pub async fn list_projects(pool: &Db) -> Result<Vec<ProjectRow>, DbError> {
 
 pub async fn get_project(pool: &Db, id: Uuid) -> Result<Project, DbError> {
     let row = query_as::<ProjectRow>(
-        "select id, name, timeline, created_at, updated_at from projects where id = $1",
+        "select id, name, timeline, created_at, updated_at, owner_email from projects where id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
     .await?
     .ok_or(DbError::NotFound)?;
     row.into_project()
+}
+
+/// Claim a project that has no owner, then refuse a different email.
+pub async fn require_project_owner(pool: &Db, id: Uuid, owner: &str) -> Result<(), DbError> {
+    let email = normalize_user_email(owner)?;
+    query("update projects set owner_email = $2 where id = $1 and owner_email is null")
+        .bind(id)
+        .bind(&email)
+        .execute(pool)
+        .await?;
+    let found: Option<(Uuid,)> =
+        query_as("select id from projects where id = $1 and owner_email = $2")
+            .bind(id)
+            .bind(&email)
+            .fetch_optional(pool)
+            .await?;
+    found.map(|_| ()).ok_or(DbError::NotFound)
 }
 
 pub async fn rename_project(pool: &Db, id: Uuid, name: &str) -> Result<Project, DbError> {
@@ -250,13 +280,11 @@ pub async fn delete_project(pool: &Db, id: Uuid) -> Result<Vec<String>, DbError>
 
 pub async fn save_timeline(pool: &Db, id: Uuid, timeline: &Timeline) -> Result<(), DbError> {
     let value = serde_json::to_value(timeline)?;
-    let res = query(
-        "update projects set timeline = $2, updated_at = now() where id = $1",
-    )
-    .bind(id)
-    .bind(&value)
-    .execute(pool)
-    .await?;
+    let res = query("update projects set timeline = $2, updated_at = now() where id = $1")
+        .bind(id)
+        .bind(&value)
+        .execute(pool)
+        .await?;
     if res.rows_affected() == 0 {
         return Err(DbError::NotFound);
     }
@@ -431,13 +459,14 @@ pub async fn claim_job(pool: &Db) -> Result<Option<JobRow>, DbError> {
 }
 
 pub async fn job_finished(pool: &Db, id: Uuid) -> Result<bool, DbError> {
-    let row = query_as::<(String,)>(
-        "select status from jobs where id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some("done" | "failed") | None))
+    let row = query_as::<(String,)>("select status from jobs where id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(matches!(
+        row.as_ref().map(|r| r.0.as_str()),
+        Some("done" | "failed") | None
+    ))
 }
 
 pub async fn finish_job(pool: &Db, id: Uuid, error: Option<&str>) -> Result<(), DbError> {
@@ -452,12 +481,10 @@ pub async fn finish_job(pool: &Db, id: Uuid, error: Option<&str>) -> Result<(), 
 }
 
 pub async fn has_transcript(pool: &Db, media_id: Uuid) -> Result<bool, DbError> {
-    let row = query_as::<(Uuid,)>(
-        "select id from transcripts where media_id = $1 limit 1",
-    )
-    .bind(media_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = query_as::<(Uuid,)>("select id from transcripts where media_id = $1 limit 1")
+        .bind(media_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.is_some())
 }
 
@@ -641,7 +668,10 @@ pub fn chat_title(current: &str, first_user_text: Option<&str>) -> String {
     if !current.is_empty() && current != "New chat" {
         return current.to_string();
     }
-    let Some(text) = first_user_text.map(str::trim).filter(|text| !text.is_empty()) else {
+    let Some(text) = first_user_text
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
         return "New chat".into();
     };
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
