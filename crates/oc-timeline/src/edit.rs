@@ -176,7 +176,8 @@ impl Timeline {
             .ok_or(TimelineError::ClipNotFound(clip_id))?;
         let source = clip.source_duration();
         clip.speed = speed;
-        clip.duration = Duration::from_ticks((source.as_ticks() as f64 / f64::from(speed)).round() as i64);
+        clip.duration =
+            Duration::from_ticks((source.as_ticks() as f64 / f64::from(speed)).round() as i64);
         if clip.duration.as_ticks() <= 0 {
             return Err(TimelineError::EmptyTrim);
         }
@@ -215,9 +216,7 @@ impl Timeline {
             .iter()
             .filter(|t| t.kind == TrackKind::Video)
             .flat_map(|t| t.clips.iter())
-            .find(|c| {
-                !c.disabled && c.contains(at) && matches!(c.kind, ClipKind::Video { .. })
-            })
+            .find(|c| !c.disabled && c.contains(at) && matches!(c.kind, ClipKind::Video { .. }))
             .map(|c| {
                 let into = (at - c.start).as_seconds().max(0.0);
                 let speed = f64::from(c.speed.max(0.01));
@@ -237,7 +236,10 @@ impl Timeline {
         }
         if let Some(reference) = reference {
             if let Some(track) = self.track_mut(track_id) {
-                if let Some(clip) = track.clips.iter_mut().find(|c| !c.disabled && c.contains(at))
+                if let Some(clip) = track
+                    .clips
+                    .iter_mut()
+                    .find(|c| !c.disabled && c.contains(at))
                 {
                     let into = (at - clip.start).as_seconds().max(0.0);
                     let speed = f64::from(clip.speed.max(0.01));
@@ -250,7 +252,12 @@ impl Timeline {
         Ok(())
     }
 
-    pub fn insert_space(&mut self, track_id: Option<TrackId>, at: Time, amount: Duration) -> Result<()> {
+    pub fn insert_space(
+        &mut self,
+        track_id: Option<TrackId>,
+        at: Time,
+        amount: Duration,
+    ) -> Result<()> {
         let at = at.snap_to_frame(self.frame_rate);
         if amount.as_ticks() <= 0 {
             return Err(TimelineError::EmptyTrim);
@@ -387,9 +394,7 @@ impl Timeline {
         }
         let group = GroupId::new();
         for id in ids {
-            let clip = self
-                .clip_mut(*id)
-                .ok_or(TimelineError::ClipNotFound(*id))?;
+            let clip = self.clip_mut(*id).ok_or(TimelineError::ClipNotFound(*id))?;
             clip.group_id = Some(group);
         }
         Ok(group)
@@ -416,9 +421,7 @@ impl Timeline {
         }
         let link = LinkId::new();
         for id in ids {
-            let clip = self
-                .clip_mut(*id)
-                .ok_or(TimelineError::ClipNotFound(*id))?;
+            let clip = self.clip_mut(*id).ok_or(TimelineError::ClipNotFound(*id))?;
             clip.link_id = Some(link);
         }
         Ok(link)
@@ -538,16 +541,19 @@ impl Timeline {
 
     fn linked_audio_id(&self, video_id: ClipId, link: Option<LinkId>) -> Option<ClipId> {
         let link = link?;
-        self.tracks.iter().flat_map(|track| track.clips.iter()).find_map(|clip| {
-            if clip.id != video_id
-                && clip.link_id == Some(link)
-                && matches!(clip.kind, ClipKind::Audio { .. })
-            {
-                Some(clip.id)
-            } else {
-                None
-            }
-        })
+        self.tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find_map(|clip| {
+                if clip.id != video_id
+                    && clip.link_id == Some(link)
+                    && matches!(clip.kind, ClipKind::Audio { .. })
+                {
+                    Some(clip.id)
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn add_marker(&mut self, time: Time, name: impl Into<String>, color: u8) -> MarkerId {
@@ -604,9 +610,10 @@ fn overlapping(
     let track = timeline.track(track_id)?;
     let mut cursor = start;
     loop {
-        let hit = track.clips.iter().find(|c| {
-            except != Some(c.id) && c.start < end && c.end() > cursor
-        });
+        let hit = track
+            .clips
+            .iter()
+            .find(|c| except != Some(c.id) && c.start < end && c.end() > cursor);
         let Some(blocker) = hit else {
             return if cursor == start { None } else { Some(cursor) };
         };
@@ -654,8 +661,8 @@ fn clamp_time(value: Time, min: Time, max: Time) -> Time {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ClipKind, Transform};
     use crate::MediaId;
+    use crate::model::{ClipKind, Transform};
 
     fn video(start: f64, dur: f64) -> Clip {
         Clip {
@@ -768,12 +775,13 @@ mod tests {
         let into = (Time::from_seconds(4.0) - angle.start).as_seconds();
         let src = angle.source_in.as_seconds() + into;
         assert!((src - 14.0).abs() < 1e-3, "shared clock {src}");
-        assert!(tl
-            .track(v1)
-            .unwrap()
-            .clips
-            .iter()
-            .any(|c| c.start >= Time::from_seconds(4.0) && c.disabled));
+        assert!(
+            tl.track(v1)
+                .unwrap()
+                .clips
+                .iter()
+                .any(|c| c.start >= Time::from_seconds(4.0) && c.disabled)
+        );
     }
 
     #[test]
@@ -802,8 +810,10 @@ mod tests {
         tl.split(picture, Time::from_seconds(1.5)).unwrap();
         let audio = tl.first_track(TrackKind::Audio).unwrap();
         assert_eq!(audio.clips.len(), 2);
-        assert!((audio.clips[0].duration.as_seconds() - 1.5).abs() < 1e-6
-            || (audio.clips[1].duration.as_seconds() - 1.5).abs() < 1e-6);
+        assert!(
+            (audio.clips[0].duration.as_seconds() - 1.5).abs() < 1e-6
+                || (audio.clips[1].duration.as_seconds() - 1.5).abs() < 1e-6
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation};
-use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::{
+    Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+};
+use aws_sdk_s3::presigning::PresigningConfig;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -68,16 +70,10 @@ fn env(key: &'static str) -> Result<String, StorageError> {
 
 impl R2 {
     pub async fn connect(cfg: R2Config) -> Result<Self, StorageError> {
-        let endpoint = cfg.endpoint.unwrap_or_else(|| {
-            format!("https://{}.r2.cloudflarestorage.com", cfg.account_id)
-        });
-        let creds = Credentials::new(
-            cfg.access_key_id,
-            cfg.secret_access_key,
-            None,
-            None,
-            "r2",
-        );
+        let endpoint = cfg
+            .endpoint
+            .unwrap_or_else(|| format!("https://{}.r2.cloudflarestorage.com", cfg.account_id));
+        let creds = Credentials::new(cfg.access_key_id, cfg.secret_access_key, None, None, "r2");
         let shared = aws_config::defaults(BehaviorVersion::latest())
             .credentials_provider(creds)
             .region(Region::new("auto"))

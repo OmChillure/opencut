@@ -153,8 +153,7 @@ fn title_of(line: &str) -> String {
 
 fn parse_channel(raw: Option<&str>) -> Result<f32, String> {
     let raw = raw.ok_or_else(|| "sample needs three numbers".to_string())?;
-    raw.parse::<f32>()
-        .map_err(|_| format!("bad sample {raw}"))
+    raw.parse::<f32>().map_err(|_| format!("bad sample {raw}"))
 }
 
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
