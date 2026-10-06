@@ -1150,11 +1150,13 @@ mod tests {
             })
             .expect("captions");
         assert_eq!(cues.len(), 2, "{cues:?}");
-        assert_eq!(cues[0].place, oc_timeline::CaptionPlace::Middle);
+        assert_eq!(cues[0].place, oc_timeline::CaptionPlace::Lower);
         assert_eq!(cues[0].font, oc_timeline::CaptionFont::Display);
-        assert_eq!(cues[0].effect, oc_timeline::CaptionEffect::Typewriter);
+        assert_eq!(cues[0].effect, oc_timeline::CaptionEffect::Pop);
         assert_eq!(cues[1].place, oc_timeline::CaptionPlace::Lower);
-        assert_eq!(cues[1].font, oc_timeline::CaptionFont::Display);
+        assert_eq!(cues[1].font, cues[0].font);
+        assert_eq!(cues[1].effect, cues[0].effect);
+        assert_ne!(cues[1].place, oc_timeline::CaptionPlace::Middle);
     }
 
     #[test]
@@ -1268,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn one_caption_key_leaves_the_other_lines_to_the_shot() {
+    fn one_caption_look_styles_every_line() {
         let picture = MediaId::new();
         let mut timeline = Timeline::default();
         let plan = EditPlan {
@@ -1315,10 +1317,9 @@ mod tests {
         assert_eq!(cues[0].place, oc_timeline::CaptionPlace::Top);
         assert_eq!(cues[0].font, oc_timeline::CaptionFont::Display);
         assert_eq!(cues[0].effect, oc_timeline::CaptionEffect::Typewriter);
-        assert_eq!(cues[1].place, oc_timeline::CaptionPlace::Lower);
-        assert_eq!(cues[1].font, oc_timeline::CaptionFont::Serif);
-        assert_eq!(cues[1].effect, oc_timeline::CaptionEffect::Fade);
-        assert_ne!(cues[0].place, cues[1].place);
+        assert_eq!(cues[1].place, cues[0].place);
+        assert_eq!(cues[1].font, cues[0].font);
+        assert_eq!(cues[1].effect, cues[0].effect);
     }
 
     #[test]

@@ -253,11 +253,14 @@ fn wants_vertical(request: &str) -> bool {
         || t.contains("9:16")
 }
 
-/// Captions saved before a look was chosen are still the default bottom bar.
-/// Dress those. A line that already has a place, a font, or an effect stays.
+/// Give every caption the video's one theme.
+/// A clip that already shares that font, effect, and a place from the theme stays.
+/// Lines that were styled one by one, and the old default bottom bar, are dressed again.
 #[must_use]
 pub fn redress_unset_captions(timeline: &mut Timeline) -> bool {
     let recipe = recipe_for_timeline(timeline);
+    let open = oc_timeline::look_for("", 0, &recipe, false);
+    let seated = oc_timeline::look_for("", 0, &recipe, true);
     let mut changed = false;
     for track in &mut timeline.tracks {
         if track.kind != TrackKind::Caption || track.muted || track.hidden {
@@ -270,7 +273,7 @@ pub fn redress_unset_captions(timeline: &mut Timeline) -> bool {
             let ClipKind::Caption { cues, .. } = &mut clip.kind else {
                 continue;
             };
-            if cues.is_empty() || !cues.iter().all(cue_is_unset) {
+            if cues.is_empty() || cues_share_theme(cues, open, seated) {
                 continue;
             }
             let faces = vec![true; cues.len()];
@@ -281,10 +284,20 @@ pub fn redress_unset_captions(timeline: &mut Timeline) -> bool {
     changed
 }
 
-fn cue_is_unset(cue: &CaptionCue) -> bool {
-    cue.place == CaptionPlace::Bottom
-        && cue.font == CaptionFont::Sans
-        && cue.effect == CaptionEffect::None
+fn cues_share_theme(
+    cues: &[CaptionCue],
+    open: (CaptionPlace, CaptionFont, CaptionEffect),
+    seated: (CaptionPlace, CaptionFont, CaptionEffect),
+) -> bool {
+    cues.iter().all(|cue| {
+        cue.font == open.1 && cue.effect == open.2 && (cue.place == open.0 || cue.place == seated.0)
+    })
+}
+
+/// The theme saved on this timeline. A vertical frame with no theme is kinetic.
+#[must_use]
+pub fn caption_recipe_for(timeline: &Timeline) -> CaptionRecipe {
+    recipe_for_timeline(timeline)
 }
 
 fn recipe_for_timeline(timeline: &Timeline) -> CaptionRecipe {
@@ -507,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn unset_vertical_captions_take_different_places() {
+    fn unset_vertical_captions_share_one_theme() {
         let mut timeline = Timeline::new(oc_timeline::FrameRate::FPS_30, 1080, 1920);
         let track = timeline
             .first_track(TrackKind::Caption)
@@ -540,10 +553,12 @@ mod tests {
         assert!(redress_unset_captions(&mut timeline));
         let cues = caption_cues(&timeline);
         assert_eq!(cues.len(), 2);
-        assert_ne!(cues[0].place, cues[1].place);
-        assert_ne!(cues[0].font, cues[1].font);
-        assert_ne!(cues[0].effect, CaptionEffect::None);
-        assert_ne!(cues[1].effect, CaptionEffect::None);
+        assert_eq!(cues[0].place, CaptionPlace::Lower);
+        assert_eq!(cues[0].font, CaptionFont::Display);
+        assert_eq!(cues[0].effect, CaptionEffect::Pop);
+        assert_eq!(cues[1].place, cues[0].place);
+        assert_eq!(cues[1].font, cues[0].font);
+        assert_eq!(cues[1].effect, cues[0].effect);
         assert!(!redress_unset_captions(&mut timeline));
     }
 

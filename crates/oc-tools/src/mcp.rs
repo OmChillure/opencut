@@ -384,8 +384,9 @@ pub fn mcp_tools() -> Vec<McpTool> {
                  A slot grade you set after see replaces it. Shots still ungraded are shown to \
                  the model, which grades each frame. The piece grade covers only a shot the model \
                  could not see. Omit transition for a cut, and set a dissolve, wipe, or slide only \
-                 on the slot that needs it. Leave caption_look out; Rust styles each caption line \
-                 from the words and the shot. Slots must sit on a real shot or spoken line. \
+                 on the slot that needs it. Set caption_mood or one caption_look for the whole \
+                 video. Rust uses that same face and effect on every line and only moves a line \
+                 to stay off a close mouth. Slots must sit on a real shot or spoken line. \
                  A clean review queues the export."
                 .into(),
             input_schema: object(&[
@@ -398,14 +399,14 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 (
                     "caption_mood",
                     str_prop(
-                        "Omit. Shortcut only: clean, kinetic, or bold. Rust already styles each line.",
+                        "One theme for every line: clean, kinetic, or bold. Default clean.",
                     ),
                     false,
                 ),
                 (
                     "caption_look",
                     str_prop(
-                        "Omit this. Set one key only when that kind of line should differ. JSON string. Keys: hook, punch, explain, question, number, on_face. Example: {\"hook\":\"top display typewriter\"}. Any other key is chosen from the words and the shot.",
+                        "One look for the whole video, such as bottom sans fade or lower display pop. Do not give each kind of line its own look.",
                     ),
                     false,
                 ),
@@ -493,18 +494,18 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "add_captions".into(),
-            description: "Replace caption cues. Omit caption_look and Rust styles each line from the words and the shot. Set caption_look only to override one kind of line. Set place, font, or effect on a cue only to lock that line.".into(),
+            description: "Replace caption cues. Set caption_mood or one caption_look for the whole video. Rust uses that same face and effect on every line and only moves a line to stay off a close mouth. Do not set place, font, or effect on each cue.".into(),
             input_schema: object(&[
                 (
                     "caption_look",
                     str_prop(
-                        "Omit. One key only, same as submit_edit caption_look. Wins over caption_mood.",
+                        "One look for the whole video, same as submit_edit caption_look.",
                     ),
                     false,
                 ),
                 (
                     "caption_mood",
-                    str_prop("Shortcut when caption_look is omitted: clean, kinetic, or bold. Default clean."),
+                    str_prop("One theme for every line: clean, kinetic, or bold. Default clean."),
                     false,
                 ),
                 (
@@ -517,10 +518,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                                 "properties": {
                                     "start": { "type": "number" },
                                     "end": { "type": "number" },
-                                    "text": { "type": "string" },
-                                    "place": { "type": "string", "description": "bottom, lower, middle, top" },
-                                    "font": { "type": "string", "description": "sans, display, serif, mono" },
-                                    "effect": { "type": "string", "description": "pop, typewriter, fade, none" }
+                                    "text": { "type": "string" }
                                 },
                                 "required": ["start", "end", "text"]
                             }
@@ -988,7 +986,6 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 .unwrap_or_default();
             let recipe = caption_recipe(&call.arguments);
             let mut cues = Vec::new();
-            let mut locked = Vec::new();
             for cue in &raw {
                 let Some(start) = cue.get("start").and_then(Value::as_f64) else {
                     continue;
@@ -999,11 +996,6 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 let Some(text) = cue.get("text").and_then(Value::as_str) else {
                     continue;
                 };
-                locked.push(
-                    cue.get("place").is_some()
-                        || cue.get("font").is_some()
-                        || cue.get("effect").is_some(),
-                );
                 cues.push(oc_timeline::CaptionCue {
                     start: Time::from_seconds(start),
                     end: Time::from_seconds(end),
@@ -1012,37 +1004,13 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                         .get("speaker")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    place: cue
-                        .get("place")
-                        .and_then(Value::as_str)
-                        .map(oc_timeline::CaptionPlace::parse)
-                        .unwrap_or_default(),
-                    font: cue
-                        .get("font")
-                        .and_then(Value::as_str)
-                        .map(oc_timeline::CaptionFont::parse)
-                        .unwrap_or_default(),
-                    effect: cue
-                        .get("effect")
-                        .and_then(Value::as_str)
-                        .map(oc_timeline::CaptionEffect::parse)
-                        .unwrap_or_default(),
+                    place: oc_timeline::CaptionPlace::default(),
+                    font: oc_timeline::CaptionFont::default(),
+                    effect: oc_timeline::CaptionEffect::default(),
                 });
             }
-            let fresh_at: Vec<usize> = locked
-                .iter()
-                .enumerate()
-                .filter(|(_, lock)| !**lock)
-                .map(|(index, _)| index)
-                .collect();
-            if !fresh_at.is_empty() {
-                let mut fresh: Vec<_> = fresh_at.iter().map(|index| cues[*index].clone()).collect();
-                let faces = vec![true; fresh.len()];
-                oc_timeline::dress_cues(&mut fresh, &recipe, &faces);
-                for (cue, index) in fresh.into_iter().zip(fresh_at) {
-                    cues[index] = cue;
-                }
-            }
+            let faces = vec![true; cues.len()];
+            oc_timeline::dress_cues(&mut cues, &recipe, &faces);
             Ok(Op::AddCaptions {
                 style: oc_timeline::CaptionStyle::default(),
                 cues,

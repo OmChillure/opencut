@@ -9,8 +9,9 @@ mod registry;
 mod review;
 
 pub use finish::{
-    CoverShot, SpokenLine, already_finished, finish_reel, has_burnable_captions, mapped_cues,
-    program_clips, redress_unset_captions, wants_picture_finish,
+    CoverShot, SpokenLine, already_finished, caption_recipe_for, finish_reel,
+    has_burnable_captions, mapped_cues, program_clips, redress_unset_captions,
+    wants_picture_finish,
 };
 pub use intent::{Intent, asks_for_whole_piece, is_director_request, parse_intent};
 pub use mcp::{Inspect, McpCall, McpTool, inspect_from_mcp, mcp_tools, op_from_mcp};

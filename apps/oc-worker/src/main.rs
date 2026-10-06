@@ -379,11 +379,7 @@ async fn save_transcript(
 }
 
 fn dress_safe(cues: &mut [oc_core::CaptionCue], timeline: &oc_core::Timeline) {
-    let recipe = if timeline.height > timeline.width {
-        oc_core::CaptionMood::Kinetic.recipe()
-    } else {
-        oc_core::CaptionMood::Clean.recipe()
-    };
+    let recipe = oc_core::caption_recipe_for(timeline);
     let faces = vec![true; cues.len()];
     oc_core::dress_cues(cues, &recipe, &faces);
 }
@@ -396,7 +392,7 @@ async fn lay_captions(
     if oc_tools::has_burnable_captions(timeline) {
         if oc_tools::redress_unset_captions(timeline) {
             oc_db::save_timeline(db, project_id, timeline).await?;
-            tracing::info!(project = %project_id, "restyled captions that were still one bottom bar");
+            tracing::info!(project = %project_id, "restyled captions onto one theme");
         }
         return Ok(());
     }

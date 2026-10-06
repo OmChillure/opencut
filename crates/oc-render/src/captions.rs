@@ -231,7 +231,8 @@ fn font_override(font: CaptionFont, short: u32) -> String {
             format!("\\fnDejaVu Sans\\fs{size}\\b1")
         }
         CaptionFont::Display => {
-            let size = (short / 12).clamp(64, 120);
+            // A band of type, not a title that covers the picture.
+            let size = (short / 28).clamp(32, 52);
             format!("\\fnDejaVu Sans\\fs{size}\\b1\\c&H006AE5FF&")
         }
         CaptionFont::Serif => {
@@ -355,7 +356,8 @@ mod tests {
             false,
         );
         assert!(pop.contains("\\an5\\pos(540,883)"), "{pop}");
-        assert!(pop.contains("\\fs90"), "{pop}");
+        assert!(pop.contains("\\fs38"), "{pop}");
+        assert!(!pop.contains("\\fs90"), "{pop}");
         assert!(pop.contains("\\fscx62\\fscy62"), "{pop}");
         assert!(pop.contains("GO"), "{pop}");
         let typed = to_ass(

@@ -879,7 +879,7 @@ pub struct EditPlan {
     /// Write transcript captions onto the new timeline.
     #[serde(default)]
     pub captions: bool,
-    /// Shortcut when the plan does not compose its own mix. Prefer `caption_look`.
+    /// One theme for every caption in this video. `caption_look` is that same theme.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption_mood: Option<CaptionMood>,
     /// This video's caption mix. Any place, font, and effect per kind of line.
@@ -1022,17 +1022,16 @@ impl CaptionEffect {
     }
 }
 
-/// Shortcut filler when a plan does not compose `caption_look`.
+/// One theme for the whole video. Every line uses it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptionMood {
-    /// Interview, vlog, explanation. Words stay low. A punch pops. A long line fades.
+    /// A small line along the bottom.
     #[default]
     Clean,
-    /// Reel or promo. Lines move between the top, the lower third, and the bottom.
-    /// A close face does not take the middle.
+    /// One lower-third display line. A close face stays under the mouth.
     Kinetic,
-    /// Ad. Big type, center when the frame is open.
+    /// One heavier line along the bottom.
     Bold,
 }
 
@@ -1056,15 +1055,10 @@ impl CaptionMood {
         }
     }
 
-    /// Filler for roles the plan left empty.
-    /// Clean holds a face at the bottom. Kinetic and bold leave the top free.
+    /// The theme, with no per-line overrides.
     #[must_use]
     pub fn recipe(self) -> CaptionRecipe {
         CaptionRecipe {
-            on_face: match self {
-                Self::Clean => Some(CaptionPlace::Bottom),
-                Self::Kinetic | Self::Bold => None,
-            },
             base: Some(self),
             ..CaptionRecipe::default()
         }

@@ -1,4 +1,5 @@
-//! Per-line caption treatment. The model sends a mix. Rust fills what it left out.
+//! One caption theme for the whole video. The model picks it. Rust only moves a line
+//! so it stays off a close mouth and inside the frame.
 
 use crate::{
     CaptionCue, CaptionEffect, CaptionFont, CaptionMood, CaptionPlace, CaptionRecipe, LineLook,
@@ -45,43 +46,8 @@ fn token(look: &str, words: &[&str]) -> bool {
         .any(|part| words.contains(&part))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LineKind {
-    Punch,
-    Question,
-    Number,
-    Explain,
-}
-
-fn word_count(text: &str) -> usize {
-    text.split_whitespace().filter(|w| !w.is_empty()).count()
-}
-
-fn line_kind(text: &str) -> LineKind {
-    let trimmed = text.trim();
-    let n = word_count(trimmed);
-    let lower = trimmed.to_ascii_lowercase();
-    if trimmed.ends_with('?')
-        || lower.starts_with("why ")
-        || lower.starts_with("how ")
-        || lower.starts_with("what ")
-        || lower.starts_with("who ")
-        || lower.starts_with("when ")
-        || lower.starts_with("where ")
-    {
-        return LineKind::Question;
-    }
-    if trimmed.chars().any(|c| c.is_ascii_digit()) && n > 0 && n <= 8 {
-        return LineKind::Number;
-    }
-    if n > 0 && (n <= 3 || trimmed.ends_with('!')) {
-        return LineKind::Punch;
-    }
-    LineKind::Explain
-}
-
 /// Place, font, and effect for one line.
-/// The recipe overlays only the fields it sets. `on_face` moves a close person off the mouth.
+/// Font and effect come from the video's one theme. Place moves only to stay off a mouth.
 #[must_use]
 pub fn look_for(
     text: &str,
@@ -89,26 +55,15 @@ pub fn look_for(
     recipe: &CaptionRecipe,
     face: bool,
 ) -> (CaptionPlace, CaptionFont, CaptionEffect) {
+    let _ = (text, index);
+    let (place, font, effect) = theme_of(recipe);
+    (seat(place, face, recipe.on_face), font, effect)
+}
+
+fn theme_of(recipe: &CaptionRecipe) -> (CaptionPlace, CaptionFont, CaptionEffect) {
     let mood = recipe.base.unwrap_or(CaptionMood::Clean);
-    let kind = line_kind(text);
-    let n = word_count(text);
-    let (mut place, mut font, mut effect) =
-        if index == 0 && !face && mood != CaptionMood::Clean && n > 0 && n <= 6 {
-            (
-                CaptionPlace::Middle,
-                CaptionFont::Display,
-                CaptionEffect::Typewriter,
-            )
-        } else {
-            fallback(mood, kind, face, n, index)
-        };
-    let spec = if index == 0 {
-        recipe.hook.as_ref().or_else(|| role_look(recipe, kind))
-    } else {
-        role_look(recipe, kind)
-    };
-    let explicit_place = spec.and_then(|look| look.place);
-    if let Some(look) = spec {
+    let (mut place, mut font, mut effect) = mood_theme(mood);
+    if let Some(look) = explicit_look(recipe) {
         if let Some(value) = look.place {
             place = value;
         }
@@ -119,151 +74,46 @@ pub fn look_for(
             effect = value;
         }
     }
-    if face {
-        if let Some(forced) = recipe.on_face {
-            if explicit_place.is_some() || matches!(place, CaptionPlace::Middle | CaptionPlace::Top)
-            {
-                place = forced;
-            }
-        } else if explicit_place.is_none() && matches!(place, CaptionPlace::Middle) {
-            // The top stays clear of the mouth. Only the middle would cover it.
-            place = CaptionPlace::Lower;
-        }
-    }
     (place, font, effect)
 }
 
-fn role_look(recipe: &CaptionRecipe, kind: LineKind) -> Option<&LineLook> {
-    match kind {
-        LineKind::Punch => recipe.punch.as_ref(),
-        LineKind::Question => recipe.question.as_ref(),
-        LineKind::Number => recipe.number.as_ref(),
-        LineKind::Explain => recipe.explain.as_ref(),
+/// The first look the model set is the theme for every line.
+fn explicit_look(recipe: &CaptionRecipe) -> Option<&LineLook> {
+    recipe
+        .hook
+        .as_ref()
+        .or(recipe.punch.as_ref())
+        .or(recipe.explain.as_ref())
+        .or(recipe.question.as_ref())
+        .or(recipe.number.as_ref())
+}
+
+fn mood_theme(mood: CaptionMood) -> (CaptionPlace, CaptionFont, CaptionEffect) {
+    match mood {
+        CaptionMood::Clean => (CaptionPlace::Bottom, CaptionFont::Sans, CaptionEffect::Fade),
+        CaptionMood::Kinetic => (
+            CaptionPlace::Lower,
+            CaptionFont::Display,
+            CaptionEffect::Pop,
+        ),
+        CaptionMood::Bold => (
+            CaptionPlace::Bottom,
+            CaptionFont::Display,
+            CaptionEffect::Pop,
+        ),
     }
 }
 
-fn fallback(
-    mood: CaptionMood,
-    kind: LineKind,
-    face: bool,
-    n: usize,
-    index: usize,
-) -> (CaptionPlace, CaptionFont, CaptionEffect) {
-    match (mood, kind, face) {
-        (CaptionMood::Clean, LineKind::Punch, _) => (
-            CaptionPlace::Bottom,
-            CaptionFont::Display,
-            CaptionEffect::Pop,
-        ),
-        (CaptionMood::Clean, LineKind::Question, _) => (
-            CaptionPlace::Bottom,
-            CaptionFont::Serif,
-            CaptionEffect::Fade,
-        ),
-        (CaptionMood::Clean, LineKind::Number, _) => (
-            CaptionPlace::Bottom,
-            CaptionFont::Mono,
-            CaptionEffect::Typewriter,
-        ),
-        (CaptionMood::Clean, LineKind::Explain, _) => {
-            (CaptionPlace::Bottom, CaptionFont::Sans, CaptionEffect::Fade)
-        }
-        (CaptionMood::Kinetic | CaptionMood::Bold, LineKind::Question, on_face) => {
-            let place = match (on_face, index % 2 == 0) {
-                (true, true) => CaptionPlace::Bottom,
-                (false, true) => CaptionPlace::Middle,
-                _ => CaptionPlace::Top,
-            };
-            (place, CaptionFont::Serif, CaptionEffect::Fade)
-        }
-        (CaptionMood::Kinetic, LineKind::Punch, false) if n == 1 && index % 4 == 3 => {
-            (CaptionPlace::Top, CaptionFont::Display, CaptionEffect::Pop)
-        }
-        (CaptionMood::Kinetic, LineKind::Punch, false) => (
-            CaptionPlace::Middle,
-            CaptionFont::Display,
-            if index % 2 == 0 {
-                CaptionEffect::Typewriter
-            } else {
-                CaptionEffect::Pop
-            },
-        ),
-        (CaptionMood::Kinetic, LineKind::Punch, true) => (
-            CaptionPlace::Lower,
-            CaptionFont::Display,
-            CaptionEffect::Pop,
-        ),
-        (CaptionMood::Kinetic, LineKind::Number, false) => (
-            CaptionPlace::Middle,
-            CaptionFont::Mono,
-            CaptionEffect::Typewriter,
-        ),
-        (CaptionMood::Kinetic, LineKind::Number, true) => (
-            if index % 2 == 0 {
-                CaptionPlace::Lower
-            } else {
-                CaptionPlace::Top
-            },
-            CaptionFont::Mono,
-            CaptionEffect::Typewriter,
-        ),
-        (CaptionMood::Kinetic, LineKind::Explain, false) if n <= 4 && index % 2 == 1 => {
-            (CaptionPlace::Lower, CaptionFont::Sans, CaptionEffect::Fade)
-        }
-        (CaptionMood::Kinetic, LineKind::Explain, _) => explain_look(index),
-        (CaptionMood::Bold, LineKind::Punch, false) => (
-            CaptionPlace::Middle,
-            CaptionFont::Display,
-            CaptionEffect::Pop,
-        ),
-        (CaptionMood::Bold, LineKind::Punch, true) => (
-            CaptionPlace::Lower,
-            CaptionFont::Display,
-            CaptionEffect::Pop,
-        ),
-        (CaptionMood::Bold, LineKind::Number, false) => (
-            CaptionPlace::Middle,
-            CaptionFont::Display,
-            CaptionEffect::Typewriter,
-        ),
-        (CaptionMood::Bold, LineKind::Number, true) => (
-            CaptionPlace::Lower,
-            CaptionFont::Display,
-            CaptionEffect::Typewriter,
-        ),
-        (CaptionMood::Bold, LineKind::Explain, false) if n <= 5 => (
-            CaptionPlace::Lower,
-            CaptionFont::Display,
-            CaptionEffect::Pop,
-        ),
-        (CaptionMood::Bold, LineKind::Explain, _) => explain_look(index),
+/// A close face does not take the middle. That band covers the mouth.
+fn seat(place: CaptionPlace, face: bool, on_face: Option<CaptionPlace>) -> CaptionPlace {
+    if !face {
+        return place;
     }
-}
-
-/// A long line changes place, face, and effect from one cue to the next.
-/// Index 2 stays a low sans vanish, so a face does not lift a line that was already low.
-fn explain_look(index: usize) -> (CaptionPlace, CaptionFont, CaptionEffect) {
-    match index % 4 {
-        0 => (
-            CaptionPlace::Top,
-            CaptionFont::Display,
-            CaptionEffect::Typewriter,
-        ),
-        1 => (
-            CaptionPlace::Lower,
-            CaptionFont::Serif,
-            CaptionEffect::Fade,
-        ),
-        2 => (
-            CaptionPlace::Bottom,
-            CaptionFont::Sans,
-            CaptionEffect::Fade,
-        ),
-        _ => (
-            CaptionPlace::Middle,
-            CaptionFont::Display,
-            CaptionEffect::Pop,
-        ),
+    let chosen = on_face.unwrap_or(place);
+    if chosen == CaptionPlace::Middle {
+        CaptionPlace::Lower
+    } else {
+        chosen
     }
 }
 
@@ -332,54 +182,39 @@ mod tests {
     }
 
     #[test]
-    fn kinetic_punch_on_an_open_shot_lands_in_the_middle() {
-        let recipe = CaptionMood::Kinetic.recipe();
-        let (place, font, effect) = look_for("Go now", 1, &recipe, false);
-        assert_eq!(place, CaptionPlace::Middle);
-        assert_eq!(font, CaptionFont::Display);
-        assert!(matches!(
-            effect,
-            CaptionEffect::Pop | CaptionEffect::Typewriter
-        ));
-    }
-
-    #[test]
-    fn kinetic_punch_on_a_face_stays_under_it() {
-        let recipe = CaptionMood::Kinetic.recipe();
-        let (place, font, _) = look_for("Go now", 1, &recipe, true);
-        assert_eq!(place, CaptionPlace::Lower);
-        assert_eq!(font, CaptionFont::Display);
-        assert_ne!(place, CaptionPlace::Middle);
-    }
-
-    #[test]
-    fn a_question_fades_and_a_number_types_on() {
-        let clean = CaptionMood::Clean.recipe();
-        let (_, _, question) = look_for("why this street?", 2, &clean, true);
-        assert_eq!(question, CaptionEffect::Fade);
+    fn one_theme_is_the_same_on_every_line() {
         let kinetic = CaptionMood::Kinetic.recipe();
-        let (place, font, effect) = look_for("3 steps", 2, &kinetic, false);
-        assert_eq!(place, CaptionPlace::Middle);
-        assert_eq!(font, CaptionFont::Mono);
-        assert_eq!(effect, CaptionEffect::Typewriter);
-    }
-
-    #[test]
-    fn a_clean_explanation_stays_low_and_vanishes() {
-        let recipe = CaptionMood::Clean.recipe();
-        let (place, font, effect) = look_for("the city opens up", 0, &recipe, false);
+        let lines = ["Go now", "why this street?", "3 steps", "the city opens up"];
+        let first = look_for(lines[0], 0, &kinetic, false);
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(look_for(line, index, &kinetic, false), first);
+        }
+        assert_eq!(first.0, CaptionPlace::Lower);
+        assert_eq!(first.1, CaptionFont::Display);
+        assert_eq!(first.2, CaptionEffect::Pop);
+        let clean = CaptionMood::Clean.recipe();
+        let (place, font, effect) = look_for("why this street?", 2, &clean, false);
+        assert_eq!(
+            (place, font, effect),
+            look_for("the city opens up", 0, &clean, true)
+        );
         assert_eq!(place, CaptionPlace::Bottom);
         assert_eq!(font, CaptionFont::Sans);
         assert_eq!(effect, CaptionEffect::Fade);
     }
 
     #[test]
-    fn the_hook_on_an_open_kinetic_shot_types_on_in_the_middle() {
-        let recipe = CaptionMood::Kinetic.recipe();
-        let (place, font, effect) = look_for("wait for this", 0, &recipe, false);
-        assert_eq!(place, CaptionPlace::Middle);
-        assert_eq!(font, CaptionFont::Display);
-        assert_eq!(effect, CaptionEffect::Typewriter);
+    fn a_face_keeps_the_theme_and_moves_off_the_mouth() {
+        let mut recipe = CaptionMood::Bold.recipe();
+        recipe.punch = Some(LineLook::parse("middle display pop"));
+        let open = look_for("Go now", 1, &recipe, false);
+        let face = look_for("the city opens up from here", 4, &recipe, true);
+        assert_eq!(open.0, CaptionPlace::Middle);
+        assert_eq!(face.0, CaptionPlace::Lower);
+        assert_eq!(open.1, face.1);
+        assert_eq!(open.2, face.2);
+        assert_eq!(face.1, CaptionFont::Display);
+        assert_eq!(face.2, CaptionEffect::Pop);
     }
 
     #[test]
@@ -421,24 +256,31 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_middle_stays_on_a_face_when_on_face_is_omitted() {
+    fn a_middle_theme_on_a_face_drops_under_the_mouth() {
         let mut recipe = CaptionRecipe {
             base: Some(CaptionMood::Clean),
             ..CaptionRecipe::default()
         };
         recipe.punch = Some(LineLook::parse("middle display typewriter"));
         let (place, font, effect) = look_for("Go now", 1, &recipe, true);
-        assert_eq!(place, CaptionPlace::Middle);
+        assert_eq!(place, CaptionPlace::Lower);
         assert_eq!(font, CaptionFont::Display);
         assert_eq!(effect, CaptionEffect::Typewriter);
+        let (open, _, _) = look_for("the long explanation stays", 3, &recipe, false);
+        assert_eq!(open, CaptionPlace::Middle);
+        assert_eq!(
+            look_for("why now?", 2, &recipe, false).1,
+            CaptionFont::Display
+        );
     }
 
     #[test]
-    fn on_face_does_not_lift_a_line_that_was_already_low() {
+    fn a_low_theme_stays_low_on_a_face() {
         let recipe = CaptionMood::Kinetic.recipe();
-        let (place, _, effect) = look_for("the city opens up from here", 2, &recipe, true);
-        assert_eq!(place, CaptionPlace::Bottom);
-        assert_eq!(effect, CaptionEffect::Fade);
+        let (place, font, effect) = look_for("the city opens up from here", 2, &recipe, true);
+        assert_eq!(place, CaptionPlace::Lower);
+        assert_eq!(font, CaptionFont::Display);
+        assert_eq!(effect, CaptionEffect::Pop);
     }
 
     #[test]
@@ -489,26 +331,18 @@ mod tests {
     }
 
     #[test]
-    fn a_kinetic_explanation_changes_place_and_a_face_can_take_the_top() {
+    fn a_kinetic_explanation_keeps_one_theme() {
         let recipe = CaptionMood::Kinetic.recipe();
         assert!(recipe.on_face.is_none());
         let line = "the city opens up from here";
-        let (top, top_font, top_effect) = look_for(line, 0, &recipe, true);
-        assert_eq!(top, CaptionPlace::Top);
-        assert_eq!(top_font, CaptionFont::Display);
-        assert_eq!(top_effect, CaptionEffect::Typewriter);
-        let (lower, lower_font, lower_effect) = look_for(line, 1, &recipe, true);
-        assert_eq!(lower, CaptionPlace::Lower);
-        assert_eq!(lower_font, CaptionFont::Serif);
-        assert_eq!(lower_effect, CaptionEffect::Fade);
-        let (low, _, low_effect) = look_for(line, 2, &recipe, true);
-        assert_eq!(low, CaptionPlace::Bottom);
-        assert_eq!(low_effect, CaptionEffect::Fade);
-        let (under, under_font, under_effect) = look_for(line, 3, &recipe, true);
-        assert_eq!(under, CaptionPlace::Lower);
-        assert_eq!(under_font, CaptionFont::Display);
-        assert_eq!(under_effect, CaptionEffect::Pop);
-        assert_ne!(top, lower);
-        assert_ne!(lower_font, top_font);
+        let first = look_for(line, 0, &recipe, true);
+        for index in 1..4 {
+            assert_eq!(look_for(line, index, &recipe, true), first);
+        }
+        assert_eq!(first.0, CaptionPlace::Lower);
+        assert_eq!(first.1, CaptionFont::Display);
+        assert_eq!(first.2, CaptionEffect::Pop);
+        assert_ne!(first.0, CaptionPlace::Middle);
+        assert_ne!(first.0, CaptionPlace::Top);
     }
 }

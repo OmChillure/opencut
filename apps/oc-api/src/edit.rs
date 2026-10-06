@@ -486,11 +486,7 @@ pub(crate) async fn place_captions(
         .map_err(|e| e.to_string())?;
     let looks = look_by_media(&analysis);
     let windows = source_windows(&media, &speech, &looks);
-    let recipe = if project.timeline.height > project.timeline.width {
-        oc_core::CaptionMood::Kinetic.recipe()
-    } else {
-        oc_core::CaptionMood::Clean.recipe()
-    };
+    let recipe = oc_core::caption_recipe_for(&project.timeline);
     let faces = oc_core::cue_faces(&clips, &windows, &cues);
     oc_core::dress_cues(&mut cues, &recipe, &faces);
     let mut undo = UndoStack::new();

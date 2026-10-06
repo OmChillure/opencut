@@ -17,8 +17,8 @@ pub use oc_tools::{
     AppliedOp, AssembleItem, AssembleStyle, CoverShot, CutReview, DesignLayout, Excerpt,
     ExportPreset, Inspect, Intent, McpCall, McpTool, Op, PiecePick, ReviewFacts, ShotNote,
     SourceBeat, SourceSpan, SourceWindow, Spoken, SpokenLine, TimelineEditMode, already_finished,
-    apply, asks_for_judgment, build_plan, choose_piece, cue_faces, excerpts_for_request,
-    finish_reel, inspect_from_mcp, is_director_request, mapped_cues, mcp_tools, op_from_mcp,
-    parse_intent, pick_reel_excerpts, plan_from_value, program_clips, review_cut, review_with,
-    revise_plan, revises_existing_cut, wants_picture_finish,
+    apply, asks_for_judgment, build_plan, caption_recipe_for, choose_piece, cue_faces,
+    excerpts_for_request, finish_reel, inspect_from_mcp, is_director_request, mapped_cues,
+    mcp_tools, op_from_mcp, parse_intent, pick_reel_excerpts, plan_from_value, program_clips,
+    review_cut, review_with, revise_plan, revises_existing_cut, wants_picture_finish,
 };
