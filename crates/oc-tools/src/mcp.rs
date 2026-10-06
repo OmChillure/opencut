@@ -829,6 +829,27 @@ pub fn mcp_tools() -> Vec<McpTool> {
             ]),
         },
         McpTool {
+            name: "load_motion_skill".into(),
+            description: "Load the built-in motion-graphics skill. Call this when you decide a spoken line needs kinetic type, a count-up, a chart, a lower third, a logo sting, or a map. Omit file the first time. Pass file for a page it names, such as categories/charts/module.md. Then render, import_render, and place_clip. A camera move is not a reason to call this.".into(),
+            input_schema: object(&[(
+                "file",
+                str_prop("Path inside the skill folder. Omit to load the skill itself."),
+                false,
+            )]),
+        },
+        McpTool {
+            name: "import_render".into(),
+            description: "Put a rendered motion-graphic file into the bin. \
+                 path is a local mp4, webm, or mov under this project, videos/, or the temp dir. \
+                 duration is seconds. Returns a media id. Then place_clip that id. \
+                 This does not place the clip."
+                .into(),
+            input_schema: object(&[
+                ("path", str_prop("Absolute path of the rendered file"), true),
+                ("duration", num_prop("Length of the render in seconds"), true),
+            ]),
+        },
+        McpTool {
             name: "generate_broll".into(),
             description: "Generate a short silent cutaway with grok-imagine-video, save it in the bin, and cover the speaker with it so the original voice continues. prompt describes the picture. at is the timeline time. duration is seconds (about 1–8). aspect is 16:9, 9:16, 1:1, or 4:3; omit it to follow the timeline.".into(),
             input_schema: object(&[
@@ -1351,6 +1372,8 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
         }
         "generate_broll" => Err("generate_broll is handled by the host".into()),
         "add_design" => Err("add_design is handled by the host".into()),
+        "import_render" => Err("import_render is handled by the host".into()),
+        "load_motion_skill" => Err("load_motion_skill is handled by the host".into()),
         other => Err(format!("unknown tool {other}")),
     }
 }
@@ -1792,6 +1815,26 @@ mod parse_tests {
             .is_err()
         );
         assert!(mcp_tools().iter().any(|tool| tool.name == "import_cube"));
+        assert!(mcp_tools().iter().any(|tool| tool.name == "import_render"));
+        assert!(
+            mcp_tools()
+                .iter()
+                .any(|tool| tool.name == "load_motion_skill")
+        );
+        assert!(
+            op_from_mcp(&McpCall {
+                name: "load_motion_skill".into(),
+                arguments: json!({}),
+            })
+            .is_err()
+        );
+        assert!(
+            op_from_mcp(&McpCall {
+                name: "import_render".into(),
+                arguments: json!({ "path": "/tmp/graphic.mp4", "duration": 4.0 }),
+            })
+            .is_err()
+        );
     }
 }
 

@@ -14,7 +14,9 @@ The shot list already has `motion`: `l2r`, `r2l`, `toward`, `away`, or `none`. R
 
 ## The graphic
 
-`add_design` is one idea crossing the frame, for the length of that spoken line.
+You decide. If a spoken line needs kinetic type, a count-up, a chart from the numbers they say, a lower third or callout, a logo sting, or a map because the line is about a place, call `load_motion_skill` before you build it. Follow what it returns. Call it again with `file` set to the category or agent page it names. Render that graphic, then `import_render` and `place_clip`. Do not use `add_design` for that line. A camera move is not a reason to load the skill.
+
+`add_design` is the simple drawing: one idea crossing the frame, for the length of that spoken line.
 
 - `prompt` names one subject and one path: where the form sits in the first moment, and where it sits at the end. The change of place has to be obvious. A form that pulses in the center is a failed graphic.
 - A chart pattern is that diagram drawing itself in one continuous stroke. A house rises until it fills the frame. Those are one action, not a sequence of scenes, and not a real object that happens to share the name.

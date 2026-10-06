@@ -72,6 +72,13 @@ pub(crate) async fn call_tool(
     if name == "add_design" {
         return add_design(db, project_id, &mut project.timeline, &call.arguments).await;
     }
+    if name == "import_render" {
+        return import_render(db, project_id, &call.arguments).await;
+    }
+    if name == "load_motion_skill" {
+        let file = call.arguments.get("file").and_then(Value::as_str);
+        return oc_providers::load_motion_skill(file);
+    }
     if name == "snap_cuts_to_beats" {
         let raw = call
             .arguments
@@ -334,6 +341,15 @@ mod design_prompt_tests {
         assert!(prompt.contains("continuous stroke"), "{prompt}");
         assert!(prompt.contains("bullish flag"), "{prompt}");
     }
+
+    #[test]
+    fn a_render_outside_the_project_is_refused() {
+        let err = super::allowed_render("/etc/passwd").unwrap_err();
+        assert!(
+            err.contains("mp4") || err.contains("not found") || err.contains("project"),
+            "{err}"
+        );
+    }
 }
 
 fn broll_aspect(timeline: &Timeline, requested: Option<&str>) -> String {
@@ -353,6 +369,115 @@ fn broll_aspect(timeline: &Timeline, requested: Option<&str>) -> String {
     } else {
         "16:9".into()
     }
+}
+
+/// A rendered motion graphic on disk, copied into the bin. Does not place it.
+async fn import_render(db: &Db, project_id: Uuid, arguments: &Value) -> Result<String, String> {
+    let raw = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "import_render needs a path".to_string())?;
+    let seconds = arguments
+        .get("duration")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "import_render needs duration".to_string())?
+        .clamp(0.2, 60.0);
+    let path = allowed_render(raw)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("read render: {e}"))?;
+    const MAX: usize = 200 * 1024 * 1024;
+    if bytes.is_empty() || bytes.len() > MAX {
+        return Err("render is empty or over 200 MB".into());
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4")
+        .to_ascii_lowercase();
+    let content_type = match ext.as_str() {
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        _ => "video/mp4",
+    };
+    let media_id = Uuid::now_v7();
+    let filename = format!("motion-{media_id}.{ext}");
+    let local_key = oc_db::local_media_key(project_id, media_id, &filename);
+    let object_key = oc_media::object_key(
+        oc_media::ObjectKind::Raw,
+        oc_core::ProjectId::from_uuid(project_id),
+        MediaId::from_uuid(media_id),
+        &filename,
+    );
+    oc_db::insert_media(
+        db,
+        project_id,
+        media_id,
+        &local_key,
+        &filename,
+        content_type,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let stored_key = match oc_db::R2::from_env().await {
+        Ok(r2) => match r2.put_bytes(&object_key, bytes.clone(), content_type).await {
+            Ok(()) => object_key,
+            Err(err) => {
+                tracing::warn!("motion render R2 put failed, keeping a local file: {err}");
+                write_local_media(&local_key, &bytes).await?;
+                local_key
+            }
+        },
+        Err(err) => {
+            tracing::info!("motion render staying local: {err}");
+            write_local_media(&local_key, &bytes).await?;
+            local_key
+        }
+    };
+    oc_db::set_media_r2_key(db, media_id, &stored_key)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
+    oc_db::set_media_duration(db, media_id, ticks.max(1))
+        .await
+        .map_err(|e| e.to_string())?;
+    oc_db::set_media_status(db, media_id, "ready")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "media {media_id} ({seconds:.1}s) is in the bin. place_clip it on the spoken line."
+    ))
+}
+
+fn allowed_render(raw: &str) -> Result<std::path::PathBuf, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("import_render needs a path".into());
+    }
+    let canon = std::path::Path::new(raw)
+        .canonicalize()
+        .map_err(|_| format!("render not found: {raw}"))?;
+    if !canon.is_file() {
+        return Err("render is not a file".into());
+    }
+    let ext = canon
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "mp4" | "webm" | "mov") {
+        return Err("import_render accepts mp4, webm, or mov".into());
+    }
+    let temp = std::env::temp_dir();
+    let under_temp = canon.starts_with(&temp);
+    let under_cwd = std::env::current_dir()
+        .ok()
+        .is_some_and(|root| canon.starts_with(&root));
+    let in_videos = canon.components().any(|part| part.as_os_str() == "videos");
+    if under_temp || under_cwd || in_videos {
+        return Ok(canon);
+    }
+    Err("render must be under this project, videos/, or the temp dir".into())
 }
 
 async fn write_local_media(key: &str, bytes: &[u8]) -> Result<(), String> {
