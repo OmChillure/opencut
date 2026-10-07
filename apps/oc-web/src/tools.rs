@@ -30,6 +30,14 @@ fn undo_key(project: &str) -> String {
     format!("opencut-undo-{project}")
 }
 
+pub(crate) fn undo_payload(stack: &UndoStack) -> Option<String> {
+    serde_json::to_string(stack).ok()
+}
+
+pub(crate) fn undo_from_payload(json: &str) -> UndoStack {
+    serde_json::from_str(json).unwrap_or_else(|_| UndoStack::new())
+}
+
 pub fn store_undo(project: &str, stack: &UndoStack) {
     if project.is_empty() {
         return;
@@ -40,7 +48,7 @@ pub fn store_undo(project: &str, stack: &UndoStack) {
     let Ok(Some(storage)) = win.local_storage() else {
         return;
     };
-    if let Ok(json) = serde_json::to_string(stack) {
+    if let Some(json) = undo_payload(stack) {
         let _ = storage.set_item(&undo_key(project), &json);
     }
 }
@@ -56,7 +64,7 @@ pub fn load_undo(project: &str) -> UndoStack {
         .get_item(&undo_key(project))
         .ok()
         .flatten()
-        .and_then(|json| serde_json::from_str(&json).ok())
+        .map(|json| undo_from_payload(&json))
         .unwrap_or_else(UndoStack::new)
 }
 
@@ -160,6 +168,9 @@ pub fn merge_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<Stri
 }
 
 pub fn lift_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<String>, String> {
+    if save.engine.peek().mark_range().is_some() {
+        return run_ops(save, vec![Op::LiftMarked]);
+    }
     let clip_id = clip_at(save, track_id, at)?;
     run_ops(save, vec![Op::RemoveClip { clip_id }])
 }
@@ -233,6 +244,9 @@ fn clip_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<ClipId, Strin
 }
 
 pub fn delete_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<String>, String> {
+    if save.engine.peek().mark_range().is_some() {
+        return run_ops(save, vec![Op::ExtractMarked]);
+    }
     let at = Time::from_seconds(at);
     let tl = save.engine.peek();
     let clip_id = match parse_track_id(track_id).and_then(|id| tl.clip_at(id, at)) {
@@ -674,4 +688,29 @@ fn parse_track_id(raw: &str) -> Option<TrackId> {
 
 fn parse_clip_id(raw: &str) -> Option<ClipId> {
     Uuid::parse_str(raw.trim()).ok().map(ClipId::from_uuid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_parse_only_real_uuids() {
+        let raw = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(parse_track_id(raw).unwrap().to_string(), raw);
+        assert!(parse_track_id("  ").is_none());
+        assert!(parse_clip_id("not-a-uuid").is_none());
+    }
+
+    #[test]
+    fn undo_payload_round_trips_and_bad_json_is_empty() {
+        let mut stack = UndoStack::new();
+        stack.checkpoint_named(oc_core::Timeline::default(), "Cut");
+        let json = undo_payload(&stack).expect("stack serializes");
+        let back = undo_from_payload(&json);
+        assert_eq!(back.depth(), 1);
+        assert_eq!(back.labels(), vec!["Cut".to_string()]);
+        assert_eq!(undo_from_payload("{").depth(), 0);
+        assert_eq!(undo_key("proj"), "opencut-undo-proj");
+    }
 }

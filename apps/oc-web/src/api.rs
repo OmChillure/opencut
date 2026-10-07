@@ -300,20 +300,20 @@ fn user_query(user: &str) -> String {
     out
 }
 
-fn signed_email() -> Option<String> {
-    crate::auth::current_email().filter(|email| !email.is_empty())
+fn signed_token() -> Option<String> {
+    crate::auth::current_token().filter(|token| !token.is_empty())
 }
 
 fn authed(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    match signed_email() {
-        Some(email) => builder.header("x-opencut-user", email),
+    match signed_token() {
+        Some(token) => builder.header("x-opencut-token", token),
         None => builder,
     }
 }
 
-/// A video element cannot send a header. File and export URLs carry `?user=`.
-fn with_user(url: &str) -> String {
-    if url.is_empty() || url.starts_with("blob:") || url.contains("user=") {
+/// A video element cannot send a header. File and export URLs carry `?token=`.
+pub(crate) fn token_query(url: &str, token: Option<&str>) -> String {
+    if url.is_empty() || url.starts_with("blob:") || url.contains("token=") {
         return url.to_string();
     }
     let ours = url.contains("/v1/projects/")
@@ -321,19 +321,27 @@ fn with_user(url: &str) -> String {
     if !ours {
         return url.to_string();
     }
-    let Some(email) = signed_email() else {
+    let Some(token) = token.filter(|token| !token.is_empty()) else {
         return url.to_string();
     };
     let join = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{join}user={}", user_query(&email))
+    format!("{url}{join}token={}", user_query(token))
 }
 
-pub fn export_file_url(project_id: &str) -> String {
-    with_user(&format!("{API}/v1/projects/{project_id}/export"))
+fn with_token(url: &str) -> String {
+    token_query(url, signed_token().as_deref())
 }
 
-pub async fn export_is_ready(project_id: &str) -> bool {
-    let file = export_file_url(project_id);
+pub fn export_file_url(project_id: &str, preset: &str) -> String {
+    with_token(&format!("{API}{}", export_query(project_id, preset)))
+}
+
+fn export_query(project_id: &str, preset: &str) -> String {
+    format!("/v1/projects/{project_id}/export?preset={preset}")
+}
+
+pub async fn export_is_ready(project_id: &str, preset: &str) -> bool {
+    let file = export_file_url(project_id, preset);
     authed(reqwest::Client::new().head(file))
         .send()
         .await
@@ -341,17 +349,50 @@ pub async fn export_is_ready(project_id: &str) -> bool {
         .is_some_and(|response| response.status().is_success())
 }
 
-pub async fn list_chats(project_id: &str, user: &str) -> Result<Vec<ChatSummary>, String> {
-    let url = format!(
-        "{API}/v1/projects/{project_id}/chats?user={}",
-        user_query(user)
-    );
-    get_json(&url).await
+pub async fn open_session(email: &str, password: &str) -> Result<(String, String), String> {
+    #[derive(Deserialize)]
+    struct SessionResp {
+        email: String,
+        token: String,
+    }
+    #[derive(Deserialize)]
+    struct ApiErr {
+        error: String,
+    }
+    let res = reqwest::Client::new()
+        .post(format!("{API}/v1/session"))
+        .json(&serde_json::json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let msg = serde_json::from_str::<ApiErr>(&text)
+            .map(|body| body.error)
+            .unwrap_or_else(|_| {
+                if text.trim().is_empty() {
+                    format!("HTTP {}", status.as_u16())
+                } else {
+                    text
+                }
+            });
+        return Err(msg);
+    }
+    let body: SessionResp = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if body.token.is_empty() {
+        return Err("sign in failed".into());
+    }
+    Ok((body.email, body.token))
 }
 
-pub async fn create_chat(project_id: &str, user: &str) -> Result<ChatSummary, String> {
+pub async fn list_chats(project_id: &str) -> Result<Vec<ChatSummary>, String> {
+    get_json(&format!("{API}/v1/projects/{project_id}/chats")).await
+}
+
+pub async fn create_chat(project_id: &str) -> Result<ChatSummary, String> {
     authed(reqwest::Client::new().post(format!("{API}/v1/projects/{project_id}/chats")))
-        .json(&serde_json::json!({ "user": user }))
+        .json(&serde_json::json!({}))
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -362,24 +403,19 @@ pub async fn create_chat(project_id: &str, user: &str) -> Result<ChatSummary, St
         .map_err(|e| e.to_string())
 }
 
-pub async fn get_chat(project_id: &str, chat_id: &str, user: &str) -> Result<ChatDetail, String> {
-    let url = format!(
-        "{API}/v1/projects/{project_id}/chats/{chat_id}?user={}",
-        user_query(user)
-    );
-    get_json(&url).await
+pub async fn get_chat(project_id: &str, chat_id: &str) -> Result<ChatDetail, String> {
+    get_json(&format!("{API}/v1/projects/{project_id}/chats/{chat_id}")).await
 }
 
 pub async fn save_chat(
     project_id: &str,
     chat_id: &str,
-    user: &str,
     messages: &[StoredMsg],
 ) -> Result<ChatSummary, String> {
     authed(reqwest::Client::new().put(format!(
         "{API}/v1/projects/{project_id}/chats/{chat_id}/messages"
     )))
-    .json(&serde_json::json!({ "user": user, "messages": messages }))
+    .json(&serde_json::json!({ "messages": messages }))
     .send()
     .await
     .map_err(|e| e.to_string())?
@@ -457,10 +493,10 @@ async fn wasm_read_ndjson(
         .headers()
         .set("content-type", "application/json")
         .map_err(js_err)?;
-    if let Some(email) = signed_email() {
+    if let Some(token) = signed_token() {
         request
             .headers()
-            .set("x-opencut-user", &email)
+            .set("x-opencut-token", &token)
             .map_err(js_err)?;
     }
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
@@ -679,7 +715,7 @@ pub async fn list_media(project_id: &str) -> Result<Vec<MediaItem>, String> {
         .into_iter()
         .map(|row| {
             let id = value_to_id(row.id);
-            let play = with_user(
+            let play = with_token(
                 &row.play_url
                     .filter(|u| !u.is_empty() && !u.starts_with("blob:"))
                     .unwrap_or_else(|| media_file_url(project_id, &id)),
@@ -734,7 +770,7 @@ pub async fn create_project(name: &str) -> Result<ProjectSummary, String> {
 }
 
 pub fn media_file_url(project_id: &str, media_id: &str) -> String {
-    with_user(&format!(
+    with_token(&format!(
         "{API}/v1/projects/{project_id}/media/{media_id}/file"
     ))
 }
@@ -755,5 +791,40 @@ mod tests {
         assert!(chat_current(second));
         assert!(!chat_current(first));
         assert!(!chat_stopped());
+    }
+
+    #[test]
+    fn export_url_names_the_preset() {
+        assert_eq!(
+            export_query("abc", "vertical-1080"),
+            "/v1/projects/abc/export?preset=vertical-1080"
+        );
+        assert_ne!(
+            export_query("abc", "youtube-1080"),
+            export_query("abc", "square-1080")
+        );
+    }
+
+    #[test]
+    fn file_urls_carry_the_token_not_the_email() {
+        let file = "http://127.0.0.1:8787/v1/projects/p/media/m/file";
+        assert_eq!(
+            token_query(file, Some("abc")),
+            "http://127.0.0.1:8787/v1/projects/p/media/m/file?token=abc"
+        );
+        let export = "http://127.0.0.1:8787/v1/projects/p/export?preset=youtube-1080";
+        let with = token_query(export, Some("tok en"));
+        assert!(with.contains("token=tok%20en"));
+        assert!(!with.contains("user="));
+        assert_eq!(token_query(file, None), file);
+        assert_eq!(token_query("blob:http://x", Some("abc")), "blob:http://x");
+        assert_eq!(
+            token_query("http://127.0.0.1:8787/v1/projects", Some("abc")),
+            "http://127.0.0.1:8787/v1/projects"
+        );
+        assert_eq!(
+            token_query(&format!("{file}?token=kept"), Some("abc")),
+            format!("{file}?token=kept")
+        );
     }
 }

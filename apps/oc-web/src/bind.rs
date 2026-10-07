@@ -213,3 +213,60 @@ fn parse_link(raw: &str) -> Option<LinkId> {
 fn parse_uuid(raw: &str) -> Uuid {
     Uuid::parse_str(raw).unwrap_or_else(|_| Uuid::now_v7())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oc_core::{Clip, ClipKind, ClipLook, TrackKind};
+
+    #[test]
+    fn a_clip_keeps_its_place_on_the_way_back() {
+        let mut timeline = Timeline::default();
+        let track = timeline.first_track(TrackKind::Video).unwrap().id;
+        let clip = Clip {
+            id: ClipId::new(),
+            media_id: Some(MediaId::new()),
+            kind: ClipKind::Video {
+                transform: Default::default(),
+            },
+            start: Time::from_seconds(1.0),
+            duration: Duration::from_seconds(2.0),
+            source_in: Time::from_seconds(3.0),
+            speed: 1.5,
+            group_id: None,
+            link_id: None,
+            disabled: false,
+            look: ClipLook::default(),
+        };
+        let id = clip.id;
+        timeline.add_clip(track, clip).unwrap();
+        let tracks = tracks_from_timeline(&timeline);
+        let back = timeline_from_tracks(&tracks, &timeline, 1280, 720);
+        let (_, restored) = back.find_clip(id).unwrap();
+        assert_eq!(back.width, 1280);
+        assert_eq!(back.height, 720);
+        assert!((restored.start.as_seconds() - 1.0).abs() < 1e-6);
+        assert!((restored.duration.as_seconds() - 2.0).abs() < 1e-6);
+        assert!((restored.source_in.as_seconds() - 3.0).abs() < 1e-6);
+        assert!((restored.speed - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn media_from_api_reads_type_and_ticks() {
+        let audio = media_from_api("a", "talk.wav".into(), "audio/wav", Some(120_000), None);
+        assert!(matches!(audio.kind, MediaKind::Audio));
+        assert!((audio.duration - 1.0).abs() < 1e-9);
+        let image = media_from_api(
+            "b",
+            "still.png".into(),
+            "image/png",
+            None,
+            Some("blob:1".into()),
+        );
+        assert!(matches!(image.kind, MediaKind::Image));
+        assert_eq!(image.url, "blob:1");
+        assert_eq!(image.duration, 0.0);
+        let video = media_from_api("c", "clip.mp4".into(), "", None, None);
+        assert!(matches!(video.kind, MediaKind::Video));
+    }
+}

@@ -10,12 +10,12 @@ mod tools;
 use dioxus::prelude::*;
 use media::{
     Clock, DragSession, DragSource, EditMode, EditTool, EditorTrack, MediaItem, MediaKind,
-    TimelineClip, TrackKindUi, advance_playhead, apply_monitor_look, capture_pointer, clamp_pps,
-    clip_duration, clip_name, commit_drag, display_tracks, film_tiles, fit_scale, format_clock,
-    format_tc_short, item_from_bytes_id, lane_height, max_timeline_h, next_track_name, paint_clock,
-    paint_playhead, place_clip, playhead_now, preview_video, program_end, reset_tick_clock,
-    ruler_marks_nle, scroll_left, seek_by, set_media_duration, set_playhead, sync_monitor,
-    timeline_end, timeline_viewport_h, timeline_viewport_w, update_drag, uses_wall_clock,
+    TrackKindUi, advance_playhead, apply_monitor_look, capture_pointer, clamp_pps, clip_duration,
+    clip_name, commit_drag, display_tracks, film_tiles, fit_scale, format_clock, format_tc_short,
+    item_from_bytes_id, lane_height, max_timeline_h, next_track_name, paint_clock, paint_playhead,
+    place_clip, playhead_now, preview_video, program_end, reset_tick_clock, ruler_marks_nle,
+    scroll_left, seek_by, set_media_duration, set_playhead, sync_monitor, timeline_end,
+    timeline_viewport_h, timeline_viewport_w, update_drag, uses_wall_clock,
     video_duration_from_src,
 };
 use oc_core::TimelineEditMode;
@@ -149,7 +149,12 @@ fn begin_upload(mut uploading: Signal<Vec<String>>, id: &str) {
     }
 }
 
-fn note_upload(mut uploading: Signal<Vec<String>>, id: &str, name: &str, result: Result<(), String>) {
+fn note_upload(
+    mut uploading: Signal<Vec<String>>,
+    id: &str,
+    name: &str,
+    result: Result<(), String>,
+) {
     uploading.write().retain(|row| row != id);
     match result {
         Ok(()) => show_toast().success(format!("{name} uploaded")),
@@ -1179,6 +1184,7 @@ fn MediaPanel() -> Element {
                                                 *clock.current.peek(),
                                                 Some(target_track.peek().as_str()),
                                                 *edit_mode.peek(),
+                                                save.engine.peek().mark_range(),
                                             );
                                             let end = timeline_end(&tracks.read());
                                             if end > *clock.duration.peek() {
@@ -1436,7 +1442,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                         muted: true,
                     }
                     audio { class: "preview-bed", preload: "auto" }
-                    audio { class: "preview-bed-b", preload: "auto" }
+                    audio { class: "preview-bed", preload: "auto" }
                     img { class: "preview-image off", alt: "" }
                     img { class: "preview-design off", alt: "" }
                     video {
@@ -2341,10 +2347,10 @@ fn AiSidebar(
     let project_for_chats = save.project_id;
     use_future(move || async move {
         let pid = project_for_chats.peek().clone();
-        let Some(user) = auth::current_email() else {
+        if !auth::is_signed_in() {
             return;
-        };
-        let Ok(remote) = api::list_chats(&pid, &user).await else {
+        }
+        let Ok(remote) = api::list_chats(&pid).await else {
             return;
         };
         let current = chat_id.peek().clone();
@@ -2358,7 +2364,7 @@ fn AiSidebar(
             return;
         };
         chat_id.set(Some(first.id.clone()));
-        if let Ok(detail) = api::get_chat(&pid, &first.id, &user).await {
+        if let Ok(detail) = api::get_chat(&pid, &first.id).await {
             if chat_id.peek().as_deref() != Some(first.id.as_str()) {
                 return;
             }
@@ -3589,11 +3595,13 @@ async fn store_snap(
     mut chats: Signal<Vec<api::ChatSummary>>,
     snap: Vec<api::StoredMsg>,
 ) -> Result<String, String> {
-    let user = auth::current_email().ok_or_else(|| "Sign in to keep chats.".to_string())?;
+    if !auth::is_signed_in() {
+        return Err("Sign in to keep chats.".into());
+    }
     let id = if let Some(id) = bound.clone() {
         id
     } else {
-        let chat = api::create_chat(project_id, &user).await?;
+        let chat = api::create_chat(project_id).await?;
         let id = chat.id.clone();
         *bound = Some(id.clone());
         if chat_id.peek().is_none() {
@@ -3602,7 +3610,7 @@ async fn store_snap(
         remember_summary(&mut chats, chat);
         id
     };
-    let chat = api::save_chat(project_id, &id, &user, &snap).await?;
+    let chat = api::save_chat(project_id, &id, &snap).await?;
     remember_summary(&mut chats, chat);
     Ok(id)
 }
@@ -3620,14 +3628,14 @@ fn start_new_chat(
         return;
     }
     chat_menu.set(false);
-    let Some(user) = auth::current_email() else {
+    if !auth::is_signed_in() {
         messages
             .write()
             .push(ChatMsg::status("Sign in to keep chats."));
         return;
-    };
+    }
     spawn(async move {
-        match api::create_chat(&project_id, &user).await {
+        match api::create_chat(&project_id).await {
             Ok(chat) => {
                 chat_id.set(Some(chat.id.clone()));
                 remember_summary(&mut chats, chat);
@@ -3658,16 +3666,16 @@ fn open_saved_chat(
     if *busy.peek() {
         return;
     }
-    let Some(user) = auth::current_email() else {
+    if !auth::is_signed_in() {
         return;
-    };
+    }
     let ticket = open_gen.peek().wrapping_add(1);
     open_gen.set(ticket);
     chat_id.set(Some(id.clone()));
     chat_menu.set(false);
     draft.set(String::new());
     spawn(async move {
-        match api::get_chat(&project_id, &id, &user).await {
+        match api::get_chat(&project_id, &id).await {
             Ok(detail) => {
                 if *open_gen.peek() != ticket {
                     return;
@@ -3764,14 +3772,9 @@ fn send_prompt(
                 break;
             }
             begin_upload(uploading, &file.id);
-            let result = api::store_imported(
-                &pid,
-                &file.id,
-                &file.name,
-                &file.content_type,
-                file.bytes,
-            )
-            .await;
+            let result =
+                api::store_imported(&pid, &file.id, &file.name, &file.content_type, file.bytes)
+                    .await;
             if result.is_ok() {
                 held.write().retain(|row| row.id != file.id);
             } else if api::chat_current(turn) {
@@ -4129,6 +4132,7 @@ fn tracing_tool_status(err: String) {
     }
 }
 
+#[allow(non_snake_case)]
 pub(crate) fn IconScissors() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4138,6 +4142,7 @@ pub(crate) fn IconScissors() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconFilm() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4147,6 +4152,7 @@ fn IconFilm() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconType() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4155,6 +4161,7 @@ fn IconType() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconCaptions() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4164,6 +4171,7 @@ fn IconCaptions() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconWave() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4172,6 +4180,7 @@ fn IconWave() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconShapes() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4182,6 +4191,7 @@ fn IconShapes() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconTransition() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4192,6 +4202,7 @@ fn IconTransition() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconSliders() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4200,6 +4211,7 @@ fn IconSliders() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconGear() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4209,6 +4221,7 @@ fn IconGear() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconPlay() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "currentColor",
@@ -4217,6 +4230,7 @@ fn IconPlay() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconPause() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "currentColor",
@@ -4226,6 +4240,7 @@ fn IconPause() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconSkipBack() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "currentColor",
@@ -4234,6 +4249,7 @@ fn IconSkipBack() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconSkipFwd() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "currentColor",
@@ -4242,6 +4258,7 @@ fn IconSkipFwd() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconSpark() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4250,6 +4267,7 @@ fn IconSpark() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconChevRight() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",
@@ -4258,6 +4276,7 @@ fn IconChevRight() -> Element {
     }
 }
 
+#[allow(non_snake_case)]
 fn IconSend() -> Element {
     rsx! {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "1.8",

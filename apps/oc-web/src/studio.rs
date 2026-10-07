@@ -948,3 +948,70 @@ async fn decode_peaks(url: &str, bars: usize) -> Option<Vec<u8>> {
     }
     Some(peaks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{curve_ends, nearest_point, remap_speeds, shape_name};
+    use oc_core::{Clip, ClipId, ClipKind, ClipLook, Duration, MaskShape, SpeedKey, Time};
+
+    fn clip(speed: f32, speed_to: Option<f32>) -> Clip {
+        let mut look = ClipLook::default();
+        look.speed_to = speed_to;
+        Clip {
+            id: ClipId::new(),
+            media_id: None,
+            kind: ClipKind::Video {
+                transform: Default::default(),
+            },
+            start: Time::ZERO,
+            duration: Duration::from_seconds(4.0),
+            source_in: Time::ZERO,
+            speed,
+            group_id: None,
+            link_id: None,
+            disabled: false,
+            look,
+        }
+    }
+
+    #[test]
+    fn remap_reads_keys_and_otherwise_averages_the_ends() {
+        let mut keyed = clip(1.0, None);
+        keyed.look.speed_keys = vec![
+            SpeedKey {
+                at: 0.0,
+                speed: 0.5,
+            },
+            SpeedKey {
+                at: 0.5,
+                speed: 2.0,
+            },
+            SpeedKey {
+                at: 1.0,
+                speed: 1.0,
+            },
+        ];
+        assert_eq!(remap_speeds(&keyed), (0.5, 2.0, 1.0));
+        let (start, mid, end) = remap_speeds(&clip(1.0, Some(3.0)));
+        assert_eq!((start, end), (1.0, 3.0));
+        assert!((mid - 2.0).abs() < 1e-4);
+        assert_eq!(remap_speeds(&clip(f32::NAN, None)).0, 1.0);
+    }
+
+    #[test]
+    fn nearest_curve_point_ignores_a_far_click() {
+        let points = curve_ends();
+        assert_eq!(points.len(), 2);
+        assert_eq!(nearest_point(&points, 0.0, 0.0), Some(0));
+        assert_eq!(nearest_point(&points, 1.0, 1.0), Some(1));
+        assert_eq!(nearest_point(&points, 0.5, 0.5), None);
+    }
+
+    #[test]
+    fn every_mask_has_a_name() {
+        assert_eq!(shape_name(MaskShape::Rectangle), "Rectangle");
+        assert_eq!(shape_name(MaskShape::Ellipse), "Ellipse");
+        assert_eq!(shape_name(MaskShape::Triangle), "Triangle");
+        assert_eq!(shape_name(MaskShape::Diamond), "Diamond");
+    }
+}

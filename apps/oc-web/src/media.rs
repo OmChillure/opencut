@@ -581,17 +581,27 @@ pub fn place_clip(
     playhead: f64,
     target_id: Option<&str>,
     mode: EditMode,
+    marks: Option<(oc_core::Time, oc_core::Time)>,
 ) {
     let kind = match item.kind {
         MediaKind::Audio => TrackKindUi::Audio,
         MediaKind::Video | MediaKind::Image => TrackKindUi::Video,
     };
-    let duration = if item.duration > 0.05 {
+    let mut duration = if item.duration > 0.05 {
         item.duration
     } else {
         5.0
     };
-    let start = playhead.max(0.0);
+    let mut start = playhead.max(0.0);
+    if matches!(mode, EditMode::Insert | EditMode::Overwrite) {
+        let (at, span) = oc_core::marked_place(
+            oc_core::Time::from_seconds(start),
+            oc_core::Duration::from_seconds(duration),
+            marks,
+        );
+        start = at.as_seconds();
+        duration = span.as_seconds().max(0.05);
+    }
     if mode == EditMode::Normal {
         if let Some(id) = target_id
             && drop_on_track(tracks, item, id, start)
@@ -1447,8 +1457,13 @@ fn mix_preview_css(
                 filter.into(),
             )
         }
-        // Pixelize is a mosaic on the painted frame. A contrast tweak here
-        // is a different picture from the export.
+        // Same cell count as the painted mosaic. The canvas covers this when it can paint.
+        oc_core::TransitionKind::Pixelize => (
+            opacity,
+            "none".into(),
+            "none".into(),
+            format!("{filter} url(#preview-pixelate)"),
+        ),
         _ => (
             (opacity * (1.0 - mix)).clamp(0.0, 1.0),
             "none".into(),
@@ -1476,6 +1491,98 @@ fn incoming_preview_css(kind: oc_core::TransitionKind, mix: f64) -> (f64, String
         oc_core::TransitionKind::Cut => (0.0, "none".into()),
         _ => (mix.clamp(0.15, 1.0), "none".into()),
     }
+}
+
+fn tune_pixelate(doc: &web_sys::Document, mix: f64, width: u32, height: u32) {
+    let Some(filter) = ensure_pixelate(doc) else {
+        return;
+    };
+    let _ = filter;
+    let (cell_w, cell_h) =
+        oc_core::compositor::mosaic_cell(mix as f32, width.max(1), height.max(1));
+    let radius = (cell_w.min(cell_h) / 2).max(1).to_string();
+    if let Some(flood) = doc.get_element_by_id("pixelate-flood") {
+        let _ = flood.set_attribute("width", &cell_w.to_string());
+        let _ = flood.set_attribute("height", &cell_h.to_string());
+    }
+    if let Some(tile) = doc.get_element_by_id("pixelate-tile") {
+        let _ = tile.set_attribute("width", &cell_w.to_string());
+        let _ = tile.set_attribute("height", &cell_h.to_string());
+    }
+    if let Some(morph) = doc.get_element_by_id("pixelate-morph") {
+        let _ = morph.set_attribute("radius", &radius);
+    }
+}
+
+fn ensure_pixelate(doc: &web_sys::Document) -> Option<web_sys::Element> {
+    if let Some(filter) = doc.get_element_by_id("preview-pixelate") {
+        return Some(filter);
+    }
+    let svg = doc
+        .create_element_ns(Some("http://www.w3.org/2000/svg"), "svg")
+        .ok()?;
+    let _ = svg.set_attribute("class", "pixelate-def");
+    let _ = svg.set_attribute("width", "0");
+    let _ = svg.set_attribute("height", "0");
+    let filter = doc
+        .create_element_ns(Some("http://www.w3.org/2000/svg"), "filter")
+        .ok()?;
+    let _ = filter.set_attribute("id", "preview-pixelate");
+    let _ = filter.set_attribute("x", "0%");
+    let _ = filter.set_attribute("y", "0%");
+    let _ = filter.set_attribute("width", "100%");
+    let _ = filter.set_attribute("height", "100%");
+    svg_child(
+        doc,
+        &filter,
+        "feFlood",
+        "pixelate-flood",
+        &[("width", "8"), ("height", "8")],
+    );
+    svg_child(
+        doc,
+        &filter,
+        "feComposite",
+        "pixelate-tile",
+        &[("width", "8"), ("height", "8")],
+    );
+    svg_child(doc, &filter, "feTile", "", &[("result", "a")]);
+    svg_child(
+        doc,
+        &filter,
+        "feComposite",
+        "",
+        &[("in", "SourceGraphic"), ("in2", "a"), ("operator", "in")],
+    );
+    svg_child(
+        doc,
+        &filter,
+        "feMorphology",
+        "pixelate-morph",
+        &[("operator", "dilate"), ("radius", "4")],
+    );
+    let _ = svg.append_child(filter.as_ref());
+    doc.body()?.append_child(svg.as_ref()).ok()?;
+    Some(filter)
+}
+
+fn svg_child(
+    doc: &web_sys::Document,
+    parent: &web_sys::Element,
+    name: &str,
+    id: &str,
+    attrs: &[(&str, &str)],
+) {
+    let Ok(node) = doc.create_element_ns(Some("http://www.w3.org/2000/svg"), name) else {
+        return;
+    };
+    if !id.is_empty() {
+        let _ = node.set_attribute("id", id);
+    }
+    for (key, value) in attrs {
+        let _ = node.set_attribute(key, value);
+    }
+    let _ = parent.append_child(node.as_ref());
 }
 
 /// A line that already uses the video theme keeps its seat. Anything else takes that theme.
@@ -1666,6 +1773,11 @@ pub fn apply_monitor_look(
 
     let person = frame_card(engine, now, "Front");
     if let Some(video) = preview_video() {
+        if kind == oc_core::TransitionKind::Pixelize && mix > 0.0 {
+            let width = video.client_width().max(1) as u32;
+            let height = video.client_height().max(1) as u32;
+            tune_pixelate(&doc, mix, width, height);
+        }
         let (a, mix_tf, clip_path, extra_filter) = mix_preview_css(kind, mix, opacity, &filter);
         let transform = if person.is_some() {
             "none".to_string()
@@ -1733,8 +1845,13 @@ pub fn apply_monitor_look(
         set_class_off(".preview-vignette", vignette < 0.02);
     }
     if let Some(el) = doc.query_selector(".preview-grain").ok().flatten() {
-        let _ = el.set_attribute("style", &format!("opacity:{:.2}", grain));
-        set_class_off(".preview-grain", grain < 0.02);
+        let overlay = oc_core::Fx {
+            grain,
+            ..oc_core::Fx::default()
+        }
+        .grain_overlay();
+        let _ = el.set_attribute("style", &format!("opacity:{overlay:.3}"));
+        set_class_off(".preview-grain", overlay <= 0.0);
     }
     if let Some(layer) = doc.query_selector(".preview-gfx").ok().flatten() {
         let gfx_class = if engine.letterbox {
@@ -2441,6 +2558,22 @@ mod tests {
         let edge = &out.rgba[(23 * 4)..(24 * 4)];
         assert_eq!(edge, &[0, 0, 0, 255]);
     }
+
+    #[test]
+    fn pixelize_fallback_is_the_mosaic_not_a_fade() {
+        let (opacity, _shift, clip, filter) = mix_preview_css(
+            oc_core::TransitionKind::Pixelize,
+            0.5,
+            1.0,
+            "brightness(1.000)",
+        );
+        assert!((opacity - 1.0).abs() < 1e-6);
+        assert_eq!(clip, "none");
+        assert!(filter.contains("url(#preview-pixelate)"));
+        let (cell_w, cell_h) = oc_core::compositor::mosaic_cell(0.5, 1280, 720);
+        assert!(cell_w > 1 && cell_h > 1);
+        assert!(cell_w < 1280 / 6);
+    }
 }
 
 pub fn format_clock(secs: f64) -> String {
@@ -2506,6 +2639,7 @@ thread_local! {
 
 struct PreviewChain {
     key: String,
+    shaper: web_sys::WaveShaperNode,
     highpass: web_sys::BiquadFilterNode,
     low: web_sys::BiquadFilterNode,
     mid: web_sys::BiquadFilterNode,
@@ -2513,6 +2647,7 @@ struct PreviewChain {
     compressor: web_sys::DynamicsCompressorNode,
     gain: web_sys::GainNode,
     pan: web_sys::StereoPannerNode,
+    denoise_on: Cell<Option<bool>>,
 }
 
 struct Heard {
@@ -3662,7 +3797,7 @@ fn query_media(selector: &str) -> Option<web_sys::HtmlMediaElement> {
         .and_then(|el| el.dyn_into().ok())
 }
 
-/// Program voice plus up to two audio-track beds. Export mixes those same tracks.
+/// Program voice plus every audible audio-track bed. Export mixes those same tracks.
 fn sync_preview_sound(engine: &oc_core::Timeline, library: &[MediaItem], now: f64, playing: bool) {
     ensure_meter();
     let t = oc_core::Time::from_seconds(now);
@@ -3680,8 +3815,62 @@ fn sync_preview_sound(engine: &oc_core::Timeline, library: &[MediaItem], now: f6
     apply_heard(front, &program_voice(engine, t, master));
     apply_heard(back, &Heard::silent());
     let beds = bed_cues(engine, library, t, master);
-    sync_bed(".preview-bed", beds.first(), playing);
-    sync_bed(".preview-bed-b", beds.get(1), playing);
+    let Some(doc) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    ensure_beds(&doc, beds.len());
+    ensure_meter();
+    for (index, media) in bed_nodes(&doc).iter().enumerate() {
+        sync_bed_el(media, &format!("bed-{index}"), beds.get(index), playing);
+    }
+}
+
+fn bed_nodes(doc: &web_sys::Document) -> Vec<web_sys::HtmlMediaElement> {
+    let Ok(list) = doc.query_selector_all("audio.preview-bed") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for index in 0..list.length() {
+        let Some(node) = list.get(index) else {
+            continue;
+        };
+        let Some(media) = node.dyn_ref::<web_sys::HtmlMediaElement>() else {
+            continue;
+        };
+        out.push(media.clone());
+    }
+    out
+}
+
+fn ensure_beds(doc: &web_sys::Document, count: usize) {
+    let mut have = bed_nodes(doc);
+    if have.len() >= count {
+        return;
+    }
+    let Some(parent) = have
+        .first()
+        .and_then(|media| {
+            let node: &web_sys::Node = media.as_ref();
+            node.parent_element()
+        })
+        .or_else(|| doc.query_selector(".monitor").ok().flatten())
+    else {
+        return;
+    };
+    while have.len() < count {
+        let Ok(el) = doc.create_element("audio") else {
+            break;
+        };
+        let _ = el.set_attribute("class", "preview-bed");
+        let _ = el.set_attribute("preload", "auto");
+        if parent.append_child(el.as_ref()).is_err() {
+            break;
+        }
+        let Some(media) = el.dyn_ref::<web_sys::HtmlMediaElement>() else {
+            break;
+        };
+        have.push(media.clone());
+    }
 }
 
 fn program_voice(engine: &oc_core::Timeline, t: oc_core::Time, master: f64) -> Heard {
@@ -3777,27 +3966,21 @@ fn bed_cues(
             rate: f64::from(clip.speed_at(t)).clamp(0.25, 4.0),
             heard: Heard::from_fx(&clip.look.audio, gain, track.mix.pan),
         });
-        if beds.len() == 2 {
-            break;
-        }
     }
     beds
 }
 
-fn sync_bed(selector: &str, bed: Option<&BedCue>, playing: bool) {
-    let Some(media) = query_media(selector) else {
-        return;
-    };
+fn sync_bed_el(media: &web_sys::HtmlMediaElement, key: &str, bed: Option<&BedCue>, playing: bool) {
     let Some(bed) = bed else {
         let _ = media.pause();
-        apply_heard(selector, &Heard::silent());
+        apply_heard(key, &Heard::silent());
         return;
     };
     if media.get_attribute("data-media").unwrap_or_default() != bed.media_id {
         let _ = media.set_attribute("data-media", &bed.media_id);
         media.set_src(&bed.url);
     }
-    apply_heard(selector, &bed.heard);
+    apply_heard(key, &bed.heard);
     media.set_playback_rate(bed.rate);
     let ready = media.ready_state() >= 2;
     let drift = (media.current_time() - bed.source).abs();
@@ -3839,14 +4022,16 @@ pub fn ensure_meter() {
     let Some(ctx) = meter_context() else {
         return;
     };
-    for selector in [
-        ".preview-video",
-        ".preview-video-b",
-        ".preview-bed",
-        ".preview-bed-b",
-    ] {
+    for selector in [".preview-video", ".preview-video-b"] {
         if let Some(media) = query_media(selector) {
             wire_preview(&ctx, &media, selector);
+        }
+    }
+    if let Some(doc) = web_sys::window().and_then(|window| window.document()) {
+        for (index, media) in bed_nodes(&doc).iter().enumerate() {
+            let key = format!("bed-{index}");
+            let _ = media.set_attribute("data-slot", &index.to_string());
+            wire_preview(&ctx, media, &key);
         }
     }
 }
@@ -3891,8 +4076,12 @@ fn wire_preview(ctx: &web_sys::AudioContext, media: &web_sys::HtmlMediaElement, 
             return false;
         };
         source
-            .connect_with_audio_node(chain.highpass.unchecked_ref())
+            .connect_with_audio_node(chain.shaper.unchecked_ref())
             .is_ok()
+            && chain
+                .shaper
+                .connect_with_audio_node(chain.highpass.unchecked_ref())
+                .is_ok()
             && chain
                 .highpass
                 .connect_with_audio_node(chain.low.unchecked_ref())
@@ -3933,6 +4122,7 @@ fn wire_preview(ctx: &web_sys::AudioContext, media: &web_sys::HtmlMediaElement, 
 fn preview_chain(ctx: &web_sys::AudioContext, key: &str) -> Option<PreviewChain> {
     let chain = PreviewChain {
         key: key.to_string(),
+        shaper: ctx.create_wave_shaper().ok()?,
         highpass: ctx.create_biquad_filter().ok()?,
         low: ctx.create_biquad_filter().ok()?,
         mid: ctx.create_biquad_filter().ok()?,
@@ -3940,21 +4130,17 @@ fn preview_chain(ctx: &web_sys::AudioContext, key: &str) -> Option<PreviewChain>
         compressor: ctx.create_dynamics_compressor().ok()?,
         gain: ctx.create_gain().ok()?,
         pan: ctx.create_stereo_panner().ok()?,
+        denoise_on: Cell::new(None),
     };
     tune_chain(&chain, &Heard::silent());
     Some(chain)
 }
 
 fn tune_chain(chain: &PreviewChain, heard: &Heard) {
-    if heard.denoise {
-        chain.highpass.set_type(web_sys::BiquadFilterType::Highpass);
-        chain.highpass.frequency().set_value(80.0);
-        chain.highpass.q().set_value(0.707);
-    } else {
-        chain.highpass.set_type(web_sys::BiquadFilterType::Allpass);
-        chain.highpass.frequency().set_value(80.0);
-        chain.highpass.q().set_value(0.707);
-    }
+    tune_denoise(&chain.shaper, &chain.denoise_on, heard.denoise);
+    chain.highpass.set_type(web_sys::BiquadFilterType::Allpass);
+    chain.highpass.frequency().set_value(80.0);
+    chain.highpass.q().set_value(0.707);
     chain.low.set_type(web_sys::BiquadFilterType::Lowshelf);
     chain.low.frequency().set_value(120.0);
     chain.low.gain().set_value(heard.low.clamp(-12.0, 12.0));
@@ -3980,6 +4166,23 @@ fn tune_chain(chain: &PreviewChain, heard: &Heard) {
     }
     chain.gain.gain().set_value(heard.gain.max(0.0));
     chain.pan.pan().set_value(heard.pan.clamp(-1.0, 1.0));
+}
+
+fn tune_denoise(shaper: &web_sys::WaveShaperNode, flag: &Cell<Option<bool>>, on: bool) {
+    if flag.get() == Some(on) {
+        return;
+    }
+    flag.set(Some(on));
+    if !on {
+        shaper.set_curve_opt_f32_array(None);
+        return;
+    }
+    let samples = oc_core::denoise_curve(2048);
+    let array = js_sys::Float32Array::new_with_length(samples.len() as u32);
+    for (index, sample) in samples.iter().enumerate() {
+        array.set_index(index as u32, *sample);
+    }
+    shaper.set_curve_opt_f32_array(Some(&array));
 }
 
 pub fn meter_peak() -> f32 {

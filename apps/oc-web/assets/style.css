@@ -425,7 +425,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   z-index: 0;
 }
 .preview-video-b { z-index: 1; }
-.preview-bed, .preview-bed-b { display: none; }
+.preview-bed { display: none; }
 .preview-design, .preview-design-clip { z-index: 2; object-fit: cover; pointer-events: none; }
 .program-canvas {
   position: absolute;
@@ -466,8 +466,20 @@ button:disabled { opacity: 0.45; cursor: default; }
 }
 .preview-vignette.off, .preview-grain.off { display: none; }
 .preview-grain {
-  background-image: repeating-radial-gradient(circle at 20% 20%, rgba(255,255,255,0.07) 0 1px, transparent 1px 3px);
+  background-image:
+    repeating-radial-gradient(circle at 12% 18%, rgba(255,255,255,0.55) 0 0.4px, transparent 0.5px 2px),
+    repeating-radial-gradient(circle at 72% 64%, rgba(0,0,0,0.45) 0 0.4px, transparent 0.5px 3px);
+  background-size: 47px 53px, 61px 59px;
   mix-blend-mode: overlay;
+  animation: grain-shift 0.18s steps(4) infinite;
+}
+.pixelate-def { position: absolute; width: 0; height: 0; overflow: hidden; }
+@keyframes grain-shift {
+  0% { background-position: 0 0, 0 0; }
+  25% { background-position: -11px 7px, 9px -13px; }
+  50% { background-position: 6px -9px, -8px 5px; }
+  75% { background-position: -4px 12px, 13px -6px; }
+  100% { background-position: 0 0, 0 0; }
 }
 .preview-gfx { display: grid; place-items: center; overflow: hidden; }
 .gfx {

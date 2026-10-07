@@ -4,10 +4,14 @@ use crate::auth;
 use dioxus::prelude::*;
 use oc_core::{ExportPreset, Op};
 
-pub fn confirm_delete(name: &str) -> bool {
-    let msg = format!(
+pub fn delete_confirm_message(name: &str) -> String {
+    format!(
         "Delete “{name}”? This permanently removes the project, timeline, and all media from storage."
-    );
+    )
+}
+
+pub fn confirm_delete(name: &str) -> bool {
+    let msg = delete_confirm_message(name);
     web_sys::window()
         .and_then(|w| w.confirm_with_message(&msg).ok())
         .unwrap_or(false)
@@ -16,16 +20,20 @@ pub fn confirm_delete(name: &str) -> bool {
 fn try_login(email: Signal<String>, password: Signal<String>, mut error: Signal<Option<String>>) {
     let mail = email.read().trim().to_string();
     let pass = password.read().clone();
-    if mail.is_empty() || !mail.contains('@') {
-        error.set(Some("Enter a valid email".into()));
+    if let Some(msg) = auth::login_form_error(&mail, &pass) {
+        error.set(Some(msg.into()));
         return;
     }
-    if pass.len() < 4 {
-        error.set(Some("Password must be at least 4 characters".into()));
-        return;
-    }
-    auth::sign_in(&mail);
-    navigator().replace(Route::Projects {});
+    let nav = navigator();
+    spawn(async move {
+        match api::open_session(&mail, &pass).await {
+            Ok((signed, token)) => {
+                auth::sign_in(&signed, &token);
+                nav.replace(Route::Projects {});
+            }
+            Err(err) => error.set(Some(err)),
+        }
+    });
 }
 
 #[component]
@@ -33,7 +41,7 @@ pub fn Login() -> Element {
     let nav = navigator();
     let mut email = use_signal(String::new);
     let mut password = use_signal(String::new);
-    let mut error = use_signal(|| None::<String>);
+    let error = use_signal(|| None::<String>);
 
     use_effect(move || {
         if auth::is_signed_in() {
@@ -79,7 +87,7 @@ pub fn Login() -> Element {
                     onclick: move |_| try_login(email, password, error),
                     "Continue"
                 }
-                p { class: "hint", "Local sign-in for now. Any email + password works." }
+                p { class: "hint", "Sign in with the password you set for this email. The first sign-in claims it." }
             }
         }
     }
@@ -298,11 +306,12 @@ pub fn Export(id: String) -> Element {
                                     busy.set(false);
                                     return;
                                 }
+                                let preset_name = kind.label();
                                 for _ in 0..300 {
                                     gloo_timers::future::TimeoutFuture::new(2000).await;
-                                    if api::export_is_ready(&pid).await {
+                                    if api::export_is_ready(&pid, preset_name).await {
                                         let stamp = js_sys::Date::now() as u64;
-                                        let file = api::export_file_url(&pid);
+                                        let file = api::export_file_url(&pid, preset_name);
                                         let join = if file.contains('?') { '&' } else { '?' };
                                         url.set(format!("{file}{join}v={stamp}"));
                                         note.set("Ready to play.".into());
@@ -394,5 +403,17 @@ pub fn NewProject() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delete_confirm_message;
+
+    #[test]
+    fn delete_names_the_project() {
+        let msg = delete_confirm_message("Reel");
+        assert!(msg.contains("Reel"));
+        assert!(msg.contains("permanently"));
     }
 }
