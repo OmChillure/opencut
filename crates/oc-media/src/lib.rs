@@ -73,6 +73,42 @@ pub fn object_key(kind: ObjectKind, project: ProjectId, media: MediaId, filename
     format!("{}/{project}/{media}/{safe}", kind.prefix())
 }
 
+/// The export object the worker uploads: `exports/{project}/{project}/{file}`.
+#[must_use]
+pub fn export_object_key(project: ProjectId, filename: &str) -> String {
+    object_key(
+        ObjectKind::Export,
+        project,
+        MediaId::from_uuid(project.as_uuid()),
+        filename,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_key_uses_the_kind_prefix_and_strips_unsafe_characters() {
+        let project = ProjectId::new();
+        let media = MediaId::new();
+        let key = object_key(ObjectKind::Raw, project, media, "my clip (1).mp4");
+        assert_eq!(key, format!("raw/{project}/{media}/my_clip__1_.mp4"));
+        assert!(object_key(ObjectKind::Export, project, media, "out.mp4").starts_with("exports/"));
+        assert!(object_key(ObjectKind::Audio, project, media, "a.wav").ends_with("/a.wav"));
+        let export = export_object_key(
+            project,
+            "00000000-0000-0000-0000-000000000000-youtube-1080.mp4",
+        );
+        assert_eq!(
+            export,
+            format!(
+                "exports/{project}/{project}/00000000-0000-0000-0000-000000000000-youtube-1080.mp4"
+            )
+        );
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
     #[error("ffprobe failed: {0}")]
