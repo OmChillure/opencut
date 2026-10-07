@@ -16,4 +16,4 @@ pub use orchestrate::{
     DirectorSession, PromptImage, ask_with_stills, complete, complete_stream, followup_prompt,
     opening_prompt, subscription_ready,
 };
-pub use prompts::{load_motion_skill, shared_prompts, style_guide, with_shared_prompts};
+pub use prompts::{shared_prompts, style_guide, with_shared_prompts};

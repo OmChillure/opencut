@@ -312,6 +312,7 @@ fn explanation_drawing_dissolves_under_the_person() {
             duration: Duration::from_seconds(3.0),
             layout: oc_core::DesignLayout::Behind,
             text: "Head and shoulders".into(),
+            label: oc_core::GraphicKind::LowerThird,
         },
     )
     .unwrap();
@@ -384,6 +385,7 @@ fn bakes_explanation_drawing_with_ffmpeg() {
             duration: Duration::from_seconds(1.2),
             layout: oc_core::DesignLayout::Behind,
             text: "Head and shoulders".into(),
+            label: oc_core::GraphicKind::LowerThird,
         },
     )
     .unwrap();

@@ -804,49 +804,27 @@ pub fn mcp_tools() -> Vec<McpTool> {
             ]),
         },
         McpTool {
-            name: "add_design".into(),
-            description: "Animate what the person is explaining, one move, for the whole spoken line. \
-                 A bullish flag is that chart pattern drawing itself in one stroke, not a flag on a pole. \
-                 A house rises until it fills the frame. \
-                 prompt is where the form starts and where it ends. It crosses the frame. No letters and no numbers. \
-                 text is the short label, the real words, drawn by the editor. Omit text to show the animation alone. \
-                 at is the timeline start. duration is the length of that spoken line, up to 15 seconds. \
-                 layout: cutaway (animation fills the frame, voice continues), \
-                 beside (animation on the empty side, person stays large), \
-                 behind (animation and words fill the frame, person stays in a corner in front of the words). \
-                 Call see at the start, middle, and end of the line first, then pick the layout from those frames."
+            name: "add_motion".into(),
+            description: "The only graphic. Return one design page, render that design, and place the clip. \
+                 One call finishes it. A chart, a diagram, a title, a number, a name, a logo, or a place. \
+                 Pass design. kind is only a shortcut: kinetic, stat, chart, lower, logo, or map. \
+                 design is one of: kinetic-slam, kinetic-typewriter, kinetic-words, kinetic-wave, kinetic-bounce, kinetic-punch, kinetic-blur, kinetic-glitch, kinetic-editorial, kinetic-burst, stat-count, stat-ring, stat-bars, chart-bars, chart-line, chart-pie, chart-race, lower-bar, lower-callout, lower-quote, lower-split, logo-draw, logo-lockup, map-highlight, map-route. \
+                 text is the words or the number, exactly as spoken. The picture already draws them. \
+                 prompt is the series, the place, or the mark when the design needs it. \
+                 style is bold, editorial, swiss, terminal, spotlight, clean, or neon. \
+                 at is the timeline start. duration is the spoken line, from 2 to 8 seconds. \
+                 layout is cutaway, beside, or behind. \
+                 See the line first. Call this after the last revise_edit. A camera move is not a reason to call this. Do not render a file."
                 .into(),
             input_schema: object(&[
-                ("prompt", str_prop("How the subject builds across the clip until it fills the frame, with no words in the picture"), true),
+                ("design", str_prop("The design id. The tool description lists them"), false),
+                ("kind", str_prop("Shortcut when design is omitted: kinetic, stat, chart, lower, logo, or map"), false),
+                ("text", str_prop("The words or the number, exactly as spoken"), true),
                 ("at", num_prop("Timeline start in seconds"), true),
-                ("duration", num_prop("Length of the spoken line in seconds, up to 15"), false),
-                ("text", str_prop("Short label, the words they actually said"), false),
-                (
-                    "layout",
-                    str_prop("cutaway, beside, or behind"),
-                    false,
-                ),
-            ]),
-        },
-        McpTool {
-            name: "load_motion_skill".into(),
-            description: "Load the built-in motion-graphics skill. Call this when you decide a spoken line needs kinetic type, a count-up, a chart, a lower third, a logo sting, or a map. Omit file the first time. Pass file for a page it names, such as categories/charts/module.md. Then render, import_render, and place_clip. A camera move is not a reason to call this.".into(),
-            input_schema: object(&[(
-                "file",
-                str_prop("Path inside the skill folder. Omit to load the skill itself."),
-                false,
-            )]),
-        },
-        McpTool {
-            name: "import_render".into(),
-            description: "Put a rendered motion-graphic file into the bin. \
-                 path is a local mp4, webm, or mov under this project, videos/, or the temp dir. \
-                 duration is seconds. Returns a media id. Then place_clip that id. \
-                 This does not place the clip."
-                .into(),
-            input_schema: object(&[
-                ("path", str_prop("Absolute path of the rendered file"), true),
-                ("duration", num_prop("Length of the render in seconds"), true),
+                ("duration", num_prop("Length of the spoken line in seconds, from 2 to 8"), false),
+                ("prompt", str_prop("The series, the place, or the mark"), false),
+                ("style", str_prop("bold, editorial, swiss, terminal, spotlight, clean, or neon"), false),
+                ("layout", str_prop("cutaway, beside, or behind"), false),
             ]),
         },
         McpTool {
@@ -1371,9 +1349,7 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
             })
         }
         "generate_broll" => Err("generate_broll is handled by the host".into()),
-        "add_design" => Err("add_design is handled by the host".into()),
-        "import_render" => Err("import_render is handled by the host".into()),
-        "load_motion_skill" => Err("load_motion_skill is handled by the host".into()),
+        "add_motion" => Err("add_motion is handled by the host".into()),
         other => Err(format!("unknown tool {other}")),
     }
 }
@@ -1806,7 +1782,7 @@ mod parse_tests {
             matches!(rate, Op::SetFrameRate { frame_rate } if frame_rate == oc_time::FrameRate::FPS_24)
         );
         assert!(mcp_tools().iter().any(|tool| tool.name == "generate_broll"));
-        assert!(mcp_tools().iter().any(|tool| tool.name == "add_design"));
+        assert!(!mcp_tools().iter().any(|tool| tool.name == "add_design"));
         assert!(
             op_from_mcp(&McpCall {
                 name: "add_design".into(),
@@ -1815,23 +1791,26 @@ mod parse_tests {
             .is_err()
         );
         assert!(mcp_tools().iter().any(|tool| tool.name == "import_cube"));
-        assert!(mcp_tools().iter().any(|tool| tool.name == "import_render"));
+        let motion = mcp_tools()
+            .into_iter()
+            .find(|tool| tool.name == "add_motion")
+            .expect("add_motion");
+        assert!(motion.description.contains("kinetic-slam"), "{}", motion.description);
+        assert!(motion.description.contains("chart-bars"), "{}", motion.description);
+        assert!(motion.description.contains("design page"), "{}", motion.description);
         assert!(
-            mcp_tools()
+            !mcp_tools()
                 .iter()
-                .any(|tool| tool.name == "load_motion_skill")
+                .any(|tool| tool.name == "load_motion_skill" || tool.name == "import_render")
         );
         assert!(
             op_from_mcp(&McpCall {
-                name: "load_motion_skill".into(),
-                arguments: json!({}),
-            })
-            .is_err()
-        );
-        assert!(
-            op_from_mcp(&McpCall {
-                name: "import_render".into(),
-                arguments: json!({ "path": "/tmp/graphic.mp4", "duration": 4.0 }),
+                name: "add_motion".into(),
+                arguments: json!({
+                    "kind": "stat",
+                    "text": "47%",
+                    "at": 2.0
+                }),
             })
             .is_err()
         );

@@ -342,14 +342,16 @@ pub enum Op {
         duration: Duration,
         track_id: Option<TrackId>,
     },
-    /// An illustration of what is being said: a chart, a house, a diagram.
-    /// The still is already in the bin. This places it, the label, and the person.
+    /// An illustration of what is being said: a chart, a house, a diagram, a motion graphic.
+    /// The picture is already in the bin. This places it, the words, and the person.
     AddDesign {
         media_id: MediaId,
         at: Time,
         duration: Duration,
         layout: DesignLayout,
         text: String,
+        /// How the editor draws `text`. The picture is the media clip.
+        label: GraphicKind,
     },
     /// Kdenlive mixer: track fader, balance, and solo. `None` track is the master fader.
     SetMix {
@@ -911,7 +913,8 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             duration,
             layout,
             text,
-        } => place_design(timeline, *media_id, *at, *duration, *layout, text)?,
+            label,
+        } => place_design(timeline, *media_id, *at, *duration, *layout, text, *label)?,
         Op::AddGraphic {
             graphic,
             start,
@@ -1197,6 +1200,7 @@ fn place_design(
     duration: Duration,
     layout: DesignLayout,
     text: &str,
+    label: GraphicKind,
 ) -> Result<String> {
     let seconds = duration.as_seconds().clamp(1.2, 15.0);
     let duration = Duration::from_seconds(seconds);
@@ -1225,20 +1229,20 @@ fn place_design(
         }
     }
     let design_id = timeline.place_clip(design_track, picture, PlaceMode::Normal)?;
-    let label = text.trim();
-    if !label.is_empty() {
-        let (kind, x, y) = match layout {
-            DesignLayout::Behind => (GraphicKind::LowerThird, Some(0.28), Some(0.42)),
-            DesignLayout::Beside => (GraphicKind::LowerThird, Some(0.74), Some(0.86)),
-            DesignLayout::Cutaway => (GraphicKind::LowerThird, None, None),
+    let words = text.trim();
+    if !words.is_empty() {
+        let (x, y) = match layout {
+            DesignLayout::Behind => (Some(0.28), Some(0.42)),
+            DesignLayout::Beside => (Some(0.74), Some(0.86)),
+            DesignLayout::Cutaway => (None, None),
         };
         let gfx = named_video_track(timeline, "GFX");
         let mut clip = clip_for_media(MediaId::new(), at, duration, TrackKind::Video, Time::ZERO);
         clip.media_id = None;
         clip.kind = ClipKind::Graphic {
             graphic: Graphic {
-                kind,
-                text: label.to_string(),
+                kind: label,
+                text: words.to_string(),
                 x,
                 y,
             },

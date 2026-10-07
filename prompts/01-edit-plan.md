@@ -30,8 +30,7 @@ Decide the shape from the ask. You choose the in-points. Do not walk the transcr
 - **Louder, quieter, panned, solo** — `set_mix` on the audio track (or omit `track_id` for the master). Not a new cut.
 - **A curve, a mask, a speed change in the middle** — `set_curves`, `set_mask`, `set_speed_keys` on the clip they named.
 - **A slate, bars, snow, or a countdown** — `add_generator`. Not a substitute for their footage.
-- **A motion graphic you decide the line needs** — kinetic type, a count-up, a chart, a lower third, a logo sting, or a map. Call `load_motion_skill` before you build it. Do not use `add_design` for that line.
-- **A drawing of what they are explaining** — `add_design` on that spoken line, after the last `revise_edit` (a revision clears the timeline), when the motion-graphics skill is the wrong tool. See the start, middle, and end of the line first. `duration` is the whole line, up to 15 seconds. A pattern becomes a full-frame animation of that pattern drawing itself while they talk. A house rises until it fills the frame. `behind` puts the words behind the person.
+- **A graphic on a spoken line** — a title, a number, a chart, a diagram, a name, a logo, or a place. See the line, pick a `design`, and call `add_motion` once after the last `revise_edit`. That call returns the design page, renders the clip, and places it. Do not render a file. The next chart uses a different pattern from `chart-bars`, `chart-line`, `chart-pie`, and `chart-race`.
 
 ## 3. Execute
 

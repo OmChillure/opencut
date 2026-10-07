@@ -1,5 +1,6 @@
 mod edit;
 mod mcp;
+mod motion;
 mod routes;
 mod state;
 

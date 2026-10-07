@@ -69,15 +69,8 @@ pub(crate) async fn call_tool(
     if name == "generate_broll" {
         return generate_broll(db, project_id, &mut project.timeline, &call.arguments).await;
     }
-    if name == "add_design" {
-        return add_design(db, project_id, &mut project.timeline, &call.arguments).await;
-    }
-    if name == "import_render" {
-        return import_render(db, project_id, &call.arguments).await;
-    }
-    if name == "load_motion_skill" {
-        let file = call.arguments.get("file").and_then(Value::as_str);
-        return oc_providers::load_motion_skill(file);
+    if name == "add_motion" {
+        return add_motion(db, project_id, &mut project.timeline, &call.arguments).await;
     }
     if name == "snap_cuts_to_beats" {
         let raw = call
@@ -197,51 +190,38 @@ async fn generate_broll(
     ))
 }
 
-/// Illustration of the thing being explained. A short animation, a label, and a layout.
-async fn add_design(
+fn design_layout(raw: Option<&str>) -> oc_core::DesignLayout {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "behind" | "back" | "text_behind" | "under" => oc_core::DesignLayout::Behind,
+        "beside" | "side" | "split" => oc_core::DesignLayout::Beside,
+        _ => oc_core::DesignLayout::Cutaway,
+    }
+}
+
+/// One motion graphic. The host reads the design page, renders it, and places the clip.
+async fn add_motion(
     db: &Db,
     project_id: Uuid,
     timeline: &mut Timeline,
     arguments: &Value,
 ) -> Result<String, String> {
-    let prompt = arguments
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| "add_design needs a prompt".to_string())?;
-    let at = arguments
-        .get("at")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| "add_design needs at".to_string())?
-        .max(0.0);
-    let requested = arguments
-        .get("duration")
-        .and_then(Value::as_f64)
-        .unwrap_or(4.0)
-        .clamp(2.0, 15.0)
-        .round() as u32;
-    let text = arguments
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let layout = design_layout(arguments.get("layout").and_then(Value::as_str));
-    let aspect = broll_aspect(timeline, arguments.get("aspect").and_then(Value::as_str));
-    let (bytes, seconds) =
-        oc_providers::imagine_clip(&design_prompt(prompt), requested, &aspect).await?;
-    let media_id = Uuid::now_v7();
-    let filename = format!("design-{media_id}.mp4");
-    store_r2_media(
-        db,
-        project_id,
-        media_id,
-        &filename,
-        "video/mp4",
-        bytes.to_vec(),
-    )
+    let ask = motion_ask(arguments)?;
+    let aspect = broll_aspect(timeline, None);
+    let (width, height) = crate::motion::frame_size(&aspect);
+    let bytes = crate::motion::render_mp4(&crate::motion::RenderJob {
+        design: &ask.design,
+        text: &ask.text,
+        prompt: &ask.prompt,
+        style: &ask.style,
+        duration: ask.duration as f64,
+        width,
+        height,
+    })
     .await?;
+    let media_id = Uuid::now_v7();
+    let filename = format!("motion-{media_id}.mp4");
+    store_r2_media(db, project_id, media_id, &filename, "video/mp4", bytes).await?;
+    let seconds = ask.duration as f64;
     let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
     oc_db::set_media_duration(db, media_id, ticks.max(1))
         .await
@@ -255,10 +235,11 @@ async fn add_design(
         &mut undo,
         Op::AddDesign {
             media_id: MediaId::from_uuid(media_id),
-            at: Time::from_seconds(at),
+            at: Time::from_seconds(ask.at),
             duration: oc_core::Duration::from_seconds(seconds),
-            layout,
-            text,
+            layout: ask.layout,
+            text: String::new(),
+            label: oc_core::GraphicKind::Title,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -266,51 +247,133 @@ async fn add_design(
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!(
-        "design {media_id} ({layout:?}, {seconds:.1}s, {aspect}) — {}",
-        applied.note
+        "placed {} media {media_id} ({:?}, {seconds:.1}s, {aspect}). The clip is on the timeline. Do not render a file. {}\n\n# {}\n{}\n\n{}\n\nThe clip is already placed. This page is the design. Do not run a renderer.",
+        ask.design, ask.layout, applied.note, ask.design, ask.page_path, ask.page
     ))
 }
 
-fn design_layout(raw: Option<&str>) -> oc_core::DesignLayout {
-    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "behind" | "back" | "text_behind" | "under" => oc_core::DesignLayout::Behind,
-        "beside" | "side" | "split" => oc_core::DesignLayout::Beside,
-        _ => oc_core::DesignLayout::Cutaway,
-    }
+#[derive(Debug)]
+struct MotionAsk {
+    design: String,
+    text: String,
+    at: f64,
+    duration: u32,
+    layout: oc_core::DesignLayout,
+    prompt: String,
+    style: String,
+    page_path: String,
+    page: String,
 }
 
-fn design_prompt(subject: &str) -> String {
-    format!(
-        "Flat motion graphic on one solid background. The artwork touches all four edges. \
-         No letters, no numbers, no people, no border. \
-         One subject and one move: it starts in one place in the frame and ends in another, \
-         so the change of place is obvious. It does not bob in place. \
-         If this is a chart pattern or a diagram, that diagram draws itself in one continuous stroke \
-         until the finished form fills the frame. It is not a real-world object with the same name. \
-         {subject}"
-    )
+fn motion_ask(arguments: &Value) -> Result<MotionAsk, String> {
+    let spec = crate::motion::resolve(
+        arguments.get("design").and_then(Value::as_str).unwrap_or(""),
+        arguments.get("kind").and_then(Value::as_str).unwrap_or(""),
+    )?;
+    let text = arguments
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "add_motion needs text".to_string())?
+        .to_string();
+    let at = arguments
+        .get("at")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "add_motion needs at".to_string())?
+        .max(0.0);
+    let duration = arguments
+        .get("duration")
+        .and_then(Value::as_f64)
+        .unwrap_or(4.0)
+        .clamp(2.0, 8.0)
+        .round() as u32;
+    let layout_raw = arguments
+        .get("layout")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let layout = if layout_raw.is_some() {
+        design_layout(layout_raw)
+    } else if spec.behind {
+        oc_core::DesignLayout::Behind
+    } else {
+        oc_core::DesignLayout::Cutaway
+    };
+    let prompt = arguments
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .chars()
+        .take(400)
+        .collect();
+    let style = arguments
+        .get("style")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("bold")
+        .to_ascii_lowercase();
+    let page = crate::motion::design_page(spec)?;
+    Ok(MotionAsk {
+        design: spec.id.to_string(),
+        text,
+        at,
+        duration,
+        layout,
+        prompt,
+        style,
+        page_path: spec.page.to_string(),
+        page,
+    })
 }
 
 #[cfg(test)]
 mod design_prompt_tests {
-    use super::design_prompt;
+    use super::motion_ask;
+    use serde_json::json;
 
     #[test]
-    fn a_graphic_is_one_move_with_the_words_left_out() {
-        let prompt = design_prompt("a bullish flag drawing itself");
-        assert!(prompt.contains("one move"), "{prompt}");
-        assert!(prompt.contains("No letters"), "{prompt}");
-        assert!(prompt.contains("continuous stroke"), "{prompt}");
-        assert!(prompt.contains("bullish flag"), "{prompt}");
+    fn a_motion_call_picks_a_design_and_returns_its_page() {
+        let ask = motion_ask(&json!({
+            "design": "stat-ring",
+            "text": "47%",
+            "at": 3.2,
+            "duration": 6
+        }))
+        .unwrap();
+        assert_eq!(ask.design, "stat-ring");
+        assert_eq!(ask.text, "47%");
+        assert_eq!(ask.duration, 6);
+        assert!(ask.page.contains("count"), "{}" , ask.page_path);
     }
 
     #[test]
-    fn a_render_outside_the_project_is_refused() {
-        let err = super::allowed_render("/etc/passwd").unwrap_err();
-        assert!(
-            err.contains("mp4") || err.contains("not found") || err.contains("project"),
-            "{err}"
-        );
+    fn a_kind_selects_the_usual_design_for_that_family() {
+        let ask = motion_ask(&json!({
+            "kind": "map",
+            "text": "Nagpur",
+            "prompt": "a route across the campus",
+            "at": 1
+        }))
+        .unwrap();
+        assert_eq!(ask.design, "map-route");
+        assert!(ask.page_path.contains("maps"), "{}", ask.page_path);
+        assert_eq!(ask.layout, oc_core::DesignLayout::Cutaway);
+    }
+
+    #[test]
+    fn a_lower_third_sits_behind_the_person_unless_a_layout_is_named() {
+        let ask = motion_ask(&json!({"design": "lower-bar", "text": "Asha", "at": 1})).unwrap();
+        assert_eq!(ask.layout, oc_core::DesignLayout::Behind);
+    }
+
+    #[test]
+    fn a_motion_call_needs_a_design_and_the_words() {
+        let kind = motion_ask(&json!({"text": "Hello", "at": 1})).unwrap_err();
+        assert!(kind.contains("design"), "{kind}");
+        let text = motion_ask(&json!({"design": "kinetic-slam", "at": 1})).unwrap_err();
+        assert!(text.contains("text"), "{text}");
     }
 }
 
@@ -331,81 +394,6 @@ fn broll_aspect(timeline: &Timeline, requested: Option<&str>) -> String {
     } else {
         "16:9".into()
     }
-}
-
-/// A rendered motion graphic on disk, copied into the bin. Does not place it.
-async fn import_render(db: &Db, project_id: Uuid, arguments: &Value) -> Result<String, String> {
-    let raw = arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "import_render needs a path".to_string())?;
-    let seconds = arguments
-        .get("duration")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| "import_render needs duration".to_string())?
-        .clamp(0.2, 60.0);
-    let path = allowed_render(raw)?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|e| format!("read render: {e}"))?;
-    const MAX: usize = 200 * 1024 * 1024;
-    if bytes.is_empty() || bytes.len() > MAX {
-        return Err("render is empty or over 200 MB".into());
-    }
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp4")
-        .to_ascii_lowercase();
-    let content_type = match ext.as_str() {
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        _ => "video/mp4",
-    };
-    let media_id = Uuid::now_v7();
-    let filename = format!("motion-{media_id}.{ext}");
-    store_r2_media(db, project_id, media_id, &filename, content_type, bytes).await?;
-    let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
-    oc_db::set_media_duration(db, media_id, ticks.max(1))
-        .await
-        .map_err(|e| e.to_string())?;
-    oc_db::set_media_status(db, media_id, "ready")
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(format!(
-        "media {media_id} ({seconds:.1}s) is in the bin. place_clip it on the spoken line."
-    ))
-}
-
-fn allowed_render(raw: &str) -> Result<std::path::PathBuf, String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Err("import_render needs a path".into());
-    }
-    let canon = std::path::Path::new(raw)
-        .canonicalize()
-        .map_err(|_| format!("render not found: {raw}"))?;
-    if !canon.is_file() {
-        return Err("render is not a file".into());
-    }
-    let ext = canon
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "mp4" | "webm" | "mov") {
-        return Err("import_render accepts mp4, webm, or mov".into());
-    }
-    let temp = std::env::temp_dir();
-    let under_temp = canon.starts_with(&temp);
-    let under_cwd = std::env::current_dir()
-        .ok()
-        .is_some_and(|root| canon.starts_with(&root));
-    let in_videos = canon.components().any(|part| part.as_os_str() == "videos");
-    if under_temp || under_cwd || in_videos {
-        return Ok(canon);
-    }
-    Err("render must be under this project, videos/, or the temp dir".into())
 }
 
 /// Put generated bytes on R2 and store that object key. A failed put leaves no local file.

@@ -1,6 +1,6 @@
 # Motion
 
-This brief decides camera moves and `add_design`. A generic push in another brief yields to this one.
+This brief decides camera moves and `add_motion`. A generic push in another brief yields to this one.
 
 The shot list already has `motion`: `l2r`, `r2l`, `toward`, `away`, or `none`. Read it before you move anything.
 
@@ -14,12 +14,13 @@ The shot list already has `motion`: `l2r`, `r2l`, `toward`, `away`, or `none`. R
 
 ## The graphic
 
-You decide. If a spoken line needs kinetic type, a count-up, a chart from the numbers they say, a lower third or callout, a logo sting, or a map because the line is about a place, call `load_motion_skill` before you build it. Follow what it returns. Call it again with `file` set to the category or agent page it names. Render that graphic, then `import_render` and `place_clip`. Do not use `add_design` for that line. A camera move is not a reason to load the skill.
+Every graphic is `add_motion`. See the start, middle, and end of the spoken line, then pick one `design`. That call returns the design page, renders the clip, and places it. Do not render a file. A camera move is not a reason to call it.
 
-`add_design` is the simple drawing: one idea crossing the frame, for the length of that spoken line.
+A punch line or a title: `kinetic-slam`, `kinetic-typewriter`, `kinetic-words`, `kinetic-wave`, `kinetic-bounce`, `kinetic-punch`, `kinetic-blur`, `kinetic-glitch`, `kinetic-burst`, or `kinetic-editorial`.
+A spoken number: `stat-count`, `stat-ring`, or `stat-bars`.
+A chart, a diagram, or several numbers: `chart-bars`, `chart-line`, `chart-pie`, or `chart-race`. The next chart uses a different one of those four.
+A name or a quote: `lower-bar`, `lower-callout`, `lower-quote`, or `lower-split`.
+A brand: `logo-draw` or `logo-lockup`.
+A place the line is about: `map-highlight` or `map-route`.
 
-- `prompt` names one subject and one path: where the form sits in the first moment, and where it sits at the end. The change of place has to be obvious. A form that pulses in the center is a failed graphic.
-- A chart pattern is that diagram drawing itself in one continuous stroke. A house rises until it fills the frame. Those are one action, not a sequence of scenes, and not a real object that happens to share the name.
-- No letters and no numbers in `prompt`. The words go in `text`, and the editor draws that label.
-- A short line gets one stroke. Do not ask a two-second clip to tell a three-part story.
-- Pick `layout` from the three frames you saw. Empty space on one side: `beside`. The person can spare a corner and the idea is the picture: `behind`. The idea needs the whole frame: `cutaway`.
+`text` is the words or the number, exactly as spoken. The clip already draws them. `prompt` is the series for a chart, the place for a map, or the mark for a logo. `style` is `bold`, `editorial`, `swiss`, `terminal`, `spotlight`, `clean`, or `neon`. `duration` is the length of that line. The host keeps it between 2 and 8 seconds. `layout` is `cutaway`, `beside`, or `behind`. Empty space on one side: `beside`. The person can spare a corner: `behind`. The idea needs the whole frame: `cutaway`. A lower third sits behind unless you name a layout. `kind` is only a shortcut (`kinetic`, `stat`, `chart`, `lower`, `logo`, `map`) when you have not picked a design. Call `add_motion` after the last `revise_edit`.

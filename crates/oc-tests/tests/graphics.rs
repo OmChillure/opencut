@@ -166,6 +166,7 @@ fn explanation_drawing_sits_behind_the_speaker() {
             duration: Duration::from_seconds(3.0),
             layout: DesignLayout::Behind,
             text: "Head and shoulders".into(),
+            label: GraphicKind::LowerThird,
         },
     )
     .unwrap();
@@ -222,12 +223,46 @@ fn house_drawing_sits_beside_the_speaker() {
             duration: Duration::from_seconds(4.0),
             layout: DesignLayout::Beside,
             text: "Three-bed house".into(),
+            label: GraphicKind::LowerThird,
         },
     )
     .unwrap();
     let design = tl.tracks.iter().find(|t| t.name == "Design").unwrap();
     assert!(design.clips[0].look.card.is_some());
     assert!(tl.tracks.iter().all(|t| t.name != "Front"));
+}
+
+#[test]
+fn a_motion_title_is_drawn_as_a_title() {
+    let mut tl = Timeline::default();
+    let mut undo = UndoStack::new();
+    apply(
+        &mut tl,
+        &mut undo,
+        Op::AddDesign {
+            media_id: MediaId::new(),
+            at: Time::from_seconds(1.0),
+            duration: Duration::from_seconds(3.0),
+            layout: DesignLayout::Cutaway,
+            text: "Hacktoberfest".into(),
+            label: GraphicKind::Title,
+        },
+    )
+    .unwrap();
+    let label = tl
+        .tracks
+        .iter()
+        .flat_map(|t| &t.clips)
+        .find(|c| matches!(c.kind, ClipKind::Graphic { .. }))
+        .unwrap();
+    match &label.kind {
+        ClipKind::Graphic { graphic } => {
+            assert_eq!(graphic.kind, GraphicKind::Title);
+            assert_eq!(graphic.text, "Hacktoberfest");
+            assert_eq!(graphic.x, None);
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
