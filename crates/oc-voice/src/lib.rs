@@ -40,3 +40,25 @@ impl Cue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cue_lands_on_the_timeline_as_a_bottom_line() {
+        let cue = Cue {
+            start: Time::from_seconds(1.0),
+            end: Time::from_seconds(2.5),
+            text: "Hi".into(),
+            speaker: Some("host".into()),
+        };
+        let line = cue.into_timeline();
+        assert_eq!(line.text, "Hi");
+        assert_eq!(line.speaker.as_deref(), Some("host"));
+        assert_eq!(line.place, oc_timeline::CaptionPlace::Bottom);
+        assert_eq!(line.font, oc_timeline::CaptionFont::Sans);
+        assert_eq!(line.effect, oc_timeline::CaptionEffect::None);
+        assert!((line.start.as_seconds() - 1.0).abs() < 1e-6);
+    }
+}

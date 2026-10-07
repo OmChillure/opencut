@@ -108,3 +108,20 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::punctuate_transcript;
+    use crate::Transcript;
+
+    #[test]
+    fn an_empty_transcript_stays_empty() {
+        let transcript = punctuate_transcript(Transcript {
+            language: None,
+            full_text: String::new(),
+            cues: Vec::new(),
+        });
+        assert!(transcript.full_text.is_empty());
+        assert!(transcript.cues.is_empty());
+    }
+}

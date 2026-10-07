@@ -16,6 +16,19 @@ pub fn configured() -> bool {
         .is_some_and(|k| !k.trim().is_empty())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_follows_the_env_key() {
+        let set = std::env::var("GROQ_API_KEY")
+            .ok()
+            .is_some_and(|key| !key.trim().is_empty());
+        assert_eq!(configured(), set);
+    }
+}
+
 pub async fn transcribe_wav(wav: &Path) -> Result<Transcript, String> {
     let key = std::env::var("GROQ_API_KEY")
         .ok()
