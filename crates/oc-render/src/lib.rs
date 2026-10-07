@@ -180,3 +180,18 @@ pub fn render(req: &RenderRequest) -> Result<RenderResult, RenderError> {
         filter: compiled.filter,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stills_are_images_and_video_is_not() {
+        assert!(still_input(Path::new("frame.PNG")));
+        assert!(still_input(Path::new("frame.jpeg")));
+        assert!(still_input(Path::new("frame.webp")));
+        assert!(still_input(Path::new("frame.gif")));
+        assert!(!still_input(Path::new("clip.mp4")));
+        assert!(!still_input(Path::new("clip")));
+    }
+}

@@ -2,7 +2,7 @@ mod draw;
 #[cfg(feature = "gpu")]
 mod gpu;
 
-pub use draw::{FrameSource, Surface, composite};
+pub use draw::{FrameSource, Surface, composite, mosaic_cell};
 #[cfg(feature = "gpu")]
 pub use gpu::{MonitorPath, monitor_path, present_monitor};
 

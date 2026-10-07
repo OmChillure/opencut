@@ -733,8 +733,8 @@ fn eq_filters(
         }
         s.push_str(",format=yuv420p");
     }
-    if fx.grain > 0.02 {
-        let alls = (fx.grain * 28.0).clamp(1.0, 40.0);
+    let alls = fx.noise_alls();
+    if alls > 0.0 {
         s.push_str(&format!(",noise=alls={alls:.1}:allf=t"));
     }
     if fx.vignette > 0.02 {
@@ -829,7 +829,11 @@ fn lut_expr(lut: oc_timeline::Lut, r: &str, g: &str, b: &str) -> (String, String
 fn audio_fx(fx: &oc_timeline::AudioFx) -> String {
     let mut s = String::new();
     if fx.denoise {
-        s.push_str(",afftdn=nr=12:nf=-25");
+        s.push_str(&format!(
+            ",afftdn=nr={:.0}:nf={:.0}",
+            oc_timeline::DENOISE_NR_DB,
+            oc_timeline::DENOISE_NF_DB
+        ));
     }
     if fx.low.abs() > 0.05 {
         s.push_str(&format!(

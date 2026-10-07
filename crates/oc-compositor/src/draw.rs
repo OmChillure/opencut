@@ -194,7 +194,7 @@ fn mix_weights(
 }
 
 /// Cell size is large at the start of a pixelize and small at the end.
-fn mosaic_cell(p: f32, width: u32, height: u32) -> (u32, u32) {
+pub fn mosaic_cell(p: f32, width: u32, height: u32) -> (u32, u32) {
     let cells = 6.0 + p.clamp(0.0, 1.0) * 40.0;
     let cw = (width as f32 / cells).round().max(1.0) as u32;
     let ch = (height as f32 / cells).round().max(1.0) as u32;

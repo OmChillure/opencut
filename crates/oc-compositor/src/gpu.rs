@@ -1,4 +1,5 @@
 //! Monitor composite on wgpu. The CPU path in `draw` stays the reference and the fallback.
+#![cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
@@ -862,7 +863,7 @@ fn pack_layer(
         color[1],
     ];
     gpu.slide = slide_of(*transition, *mix, width, height);
-    let (cell_w, cell_h) = mosaic_cell(*mix, width, height);
+    let (cell_w, cell_h) = crate::draw::mosaic_cell(*mix, width, height);
     gpu.genb = [color[2], cell_w as f32, cell_h as f32, 0.0];
     gpu.counts = [
         curves.all.len() as f32,
@@ -977,13 +978,6 @@ fn slide_of(kind: TransitionKind, mix: f32, width: u32, height: u32) -> [f32; 4]
         -dx as f32 * (1.0 - p) * width as f32,
         -dy as f32 * (1.0 - p) * height as f32,
     ]
-}
-
-fn mosaic_cell(mix: f32, width: u32, height: u32) -> (u32, u32) {
-    let cells = 6.0 + mix.clamp(0.0, 1.0) * 40.0;
-    let cell_w = (width as f32 / cells).round().max(1.0) as u32;
-    let cell_h = (height as f32 / cells).round().max(1.0) as u32;
-    (cell_w.max(1), cell_h.max(1))
 }
 
 fn write_curve(dst: &mut [[f32; 4]; 16], base: usize, points: &[CurvePoint]) {
