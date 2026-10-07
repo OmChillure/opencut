@@ -158,16 +158,146 @@ impl R2 {
         bytes: Vec<u8>,
         content_type: &str,
     ) -> Result<(), StorageError> {
-        self.client
-            .put_object()
+        // One connection under-fills a link to Cloudflare. Larger files go up
+        // as parallel parts. R2 requires every part but the last to be at least 5 MiB.
+        const PART: usize = 8 * 1024 * 1024;
+        if bytes.len() <= PART {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .content_type(content_type)
+                .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+                .send()
+                .await
+                .map_err(aws_sdk_s3::Error::from)?;
+            return Ok(());
+        }
+        self.put_parts(key, bytes, content_type, PART).await
+    }
+
+    async fn put_parts(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+        part_size: usize,
+    ) -> Result<(), StorageError> {
+        use aws_sdk_s3::types::CompletedMultipartUpload;
+
+        let chunks = split_parts(bytes, part_size);
+        let created = self
+            .client
+            .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
             .content_type(content_type)
-            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
             .send()
             .await
             .map_err(aws_sdk_s3::Error::from)?;
+        let Some(upload_id) = created.upload_id().map(str::to_string) else {
+            return Err(StorageError::Sdk("R2 did not return an upload id".into()));
+        };
+        tracing::info!(
+            key,
+            parts = chunks.len(),
+            "multipart upload"
+        );
+        let uploaded = self.send_parts(key, &upload_id, chunks).await;
+        let parts = match uploaded {
+            Ok(parts) => parts,
+            Err(err) => {
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await;
+                return Err(err);
+            }
+        };
+        let completed = CompletedMultipartUpload::builder()
+            .set_parts(Some(parts))
+            .build();
+        if let Err(err) = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+        {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(aws_sdk_s3::Error::from(err).into());
+        }
         Ok(())
+    }
+
+    async fn send_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        chunks: Vec<Vec<u8>>,
+    ) -> Result<Vec<aws_sdk_s3::types::CompletedPart>, StorageError> {
+        use aws_sdk_s3::types::CompletedPart;
+
+        const IN_FLIGHT: usize = 4;
+        let mut pending = chunks.into_iter().enumerate();
+        let mut set = tokio::task::JoinSet::new();
+        let mut inflight = 0usize;
+        let mut done = Vec::new();
+        loop {
+            while inflight < IN_FLIGHT {
+                let Some((index, chunk)) = pending.next() else {
+                    break;
+                };
+                let part_number = (index + 1) as i32;
+                let client = self.client.clone();
+                let bucket = self.bucket.clone();
+                let key = key.to_string();
+                let upload_id = upload_id.to_string();
+                set.spawn(async move {
+                    let out = client
+                        .upload_part()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .part_number(part_number)
+                        .body(aws_sdk_s3::primitives::ByteStream::from(chunk))
+                        .send()
+                        .await
+                        .map_err(aws_sdk_s3::Error::from)?;
+                    let etag = out.e_tag().ok_or_else(|| {
+                        StorageError::Sdk("R2 part returned no etag".into())
+                    })?;
+                    Ok::<_, StorageError>(
+                        CompletedPart::builder()
+                            .part_number(part_number)
+                            .e_tag(etag)
+                            .build(),
+                    )
+                });
+                inflight += 1;
+            }
+            let Some(joined) = set.join_next().await else {
+                break;
+            };
+            inflight -= 1;
+            done.push(joined.map_err(|err| StorageError::Sdk(err.to_string()))??);
+        }
+        done.sort_by_key(|part| part.part_number().unwrap_or(0));
+        Ok(done)
     }
 
     pub async fn delete_object(&self, key: &str) -> Result<(), StorageError> {
@@ -243,5 +373,43 @@ impl R2 {
             count += chunk.len() as u32;
         }
         Ok(count)
+    }
+}
+
+/// Split `bytes` into owned pieces of `part_size`. The last piece is the remainder.
+fn split_parts(mut bytes: Vec<u8>, part_size: usize) -> Vec<Vec<u8>> {
+    let mut parts = Vec::new();
+    while bytes.len() > part_size {
+        let rest = bytes.split_off(part_size);
+        parts.push(bytes);
+        bytes = rest;
+    }
+    if !bytes.is_empty() {
+        parts.push(bytes);
+    }
+    parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_parts;
+
+    #[test]
+    fn a_large_upload_splits_into_full_parts() {
+        let part = 8;
+        let bytes = vec![1u8; 20];
+        let parts = split_parts(bytes, part);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 8);
+        assert_eq!(parts[2].len(), 4);
+        assert!(parts[..parts.len() - 1].iter().all(|part| part.len() >= 5));
+    }
+
+    #[test]
+    fn a_short_upload_stays_one_part() {
+        let parts = split_parts(vec![7u8; 8], 8);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].len(), 8);
     }
 }
