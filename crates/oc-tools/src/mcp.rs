@@ -49,6 +49,11 @@ pub enum Inspect {
         subject: Option<String>,
         limit: usize,
     },
+    ListGaps {
+        media_id: MediaId,
+        start: Option<f64>,
+        end: Option<f64>,
+    },
 }
 
 #[must_use]
@@ -65,6 +70,15 @@ pub fn inspect_from_mcp(call: &McpCall) -> Option<Inspect> {
         "get_music" => media_id(&call.arguments, "media_id")
             .ok()
             .map(|media_id| Inspect::GetMusic { media_id }),
+        "list_gaps" => {
+            media_id(&call.arguments, "media_id")
+                .ok()
+                .map(|media_id| Inspect::ListGaps {
+                    media_id,
+                    start: call.arguments.get("start").and_then(Value::as_f64),
+                    end: call.arguments.get("end").and_then(Value::as_f64),
+                })
+        }
         "find_shots" => Some(Inspect::FindShots {
             scale: call
                 .arguments
@@ -146,6 +160,18 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 ("media_id", str_prop("Media id from list_bin"), true),
                 ("start", num_prop("Range start in source seconds"), true),
                 ("end", num_prop("Range end in source seconds"), true),
+            ]),
+        },
+        McpTool {
+            name: "list_gaps".into(),
+            description:
+                "Filler lines (um, uh, like) and silence longer than 0.7s on one file. \
+                 Times are source seconds. Trim from these. Optional start and end limit the list."
+                    .into(),
+            input_schema: object(&[
+                ("media_id", str_prop("Media id from list_bin"), true),
+                ("start", num_prop("Optional window start in source seconds"), false),
+                ("end", num_prop("Optional window end in source seconds"), false),
             ]),
         },
         McpTool {

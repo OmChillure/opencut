@@ -37,10 +37,12 @@ async fn main() -> anyhow::Result<()> {
             Ok(Some(job)) => {
                 fail = 0;
                 tracing::info!(id = %job.id, kind = %job.kind, "claimed job");
+                let beat = job_heartbeat(db.clone(), job.id);
                 let err = handle(&db, r2.as_ref(), &job.kind, job.payload)
                     .await
                     .err()
                     .map(|e| e.to_string());
+                beat.abort();
                 if let Some(e) = &err {
                     tracing::error!(id = %job.id, "{e}");
                 }
@@ -85,6 +87,17 @@ struct ExportPayload {
     preset: oc_tools::ExportPreset,
 }
 
+fn job_heartbeat(db: Db, id: Uuid) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(oc_db::JOB_HEARTBEAT_SECS)).await;
+            if let Err(err) = oc_db::touch_job(&db, id).await {
+                tracing::warn!(job = %id, "job heartbeat: {err}");
+            }
+        }
+    })
+}
+
 async fn handle(
     db: &Db,
     r2: Option<&R2>,
@@ -106,7 +119,7 @@ async fn handle(
 
 struct OpenedMedia {
     path: std::path::PathBuf,
-    /// Temp directory to delete after the job. `None` when the file is already local.
+    /// Temp directory to delete after the job.
     cleanup: Option<std::path::PathBuf>,
 }
 
@@ -116,15 +129,13 @@ async fn open_media(r2: Option<&R2>, key: &str) -> anyhow::Result<OpenedMedia> {
     }
     let r2 = r2.context("R2 required")?;
     let bytes = r2.get_bytes(key).await?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("oc-src-{stamp}"));
+    let dir = std::env::temp_dir().join(format!("oc-src-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&dir).await?;
-    let name = key.rsplit('/').next().unwrap_or("media.bin");
-    let path = dir.join(name);
-    tokio::fs::write(&path, &bytes).await?;
+    let path = dir.join(oc_db::object_file_name(key));
+    if let Err(err) = tokio::fs::write(&path, &bytes).await {
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        return Err(err.into());
+    }
     Ok(OpenedMedia {
         path,
         cleanup: Some(dir),
@@ -142,7 +153,9 @@ async fn transcribe(db: &Db, r2: Option<&R2>, p: TranscribePayload) -> anyhow::R
     let opened = match open_media(r2, &p.r2_key).await {
         Ok(opened) => opened,
         Err(e) => {
-            oc_db::set_media_status(db, p.media_id, "ready").await?;
+            if let Err(status) = oc_db::set_media_status(db, p.media_id, "failed").await {
+                tracing::warn!(media = %p.media_id, "could not mark media failed: {status}");
+            }
             return Err(e);
         }
     };
@@ -196,7 +209,9 @@ async fn understand_file(
     let quiet = !had_speech;
     match oc_media::analyze_path(path).await {
         Ok(mut look) => {
-            if quiet {
+            // Speech onsets are not a beat. A music file still gets a grid when the
+            // words are lyrics, and a quiet picture gets one when nothing was said.
+            if wants_beat_grid(quiet, look.has_video) {
                 if let Some(music) = music_grid(path).await {
                     look.music = Some(music);
                 }
@@ -450,7 +465,7 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
     }
     let out_dir = std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into());
     tokio::fs::create_dir_all(&out_dir).await?;
-    let filename = format!("{}-{}.mp4", p.project_id, p.preset.label());
+    let filename = p.preset.file_name(p.project_id);
     let output = std::path::PathBuf::from(&out_dir).join(&filename);
     let req = oc_render::RenderRequest {
         timeline: project.timeline,
@@ -463,12 +478,8 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
         .map_err(|e| anyhow::anyhow!("render join: {e}"))??;
     if let Some(r2) = r2 {
         let bytes = tokio::fs::read(&rendered.output).await?;
-        let key = oc_media::object_key(
-            oc_media::ObjectKind::Export,
-            oc_timeline::ProjectId::from_uuid(p.project_id),
-            oc_timeline::MediaId::from_uuid(p.project_id),
-            &filename,
-        );
+        let key =
+            oc_media::export_object_key(oc_timeline::ProjectId::from_uuid(p.project_id), &filename);
         // The editor plays the local file. A denied upload must not fail that render.
         match r2.put_bytes(&key, bytes, "video/mp4").await {
             Ok(()) => tracing::info!(
@@ -492,4 +503,41 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
         );
     }
     Ok(())
+}
+
+/// A talking picture's onsets are speech, not a beat grid. An audio file still
+/// gets a grid when the words are lyrics. A quiet picture gets one too.
+fn wants_beat_grid(quiet: bool, has_video: bool) -> bool {
+    quiet || !has_video
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dress_safe, wants_beat_grid};
+
+    #[test]
+    fn dress_safe_uses_the_vertical_theme() {
+        let mut cues = vec![oc_core::CaptionCue {
+            start: oc_core::Time::ZERO,
+            end: oc_core::Time::from_seconds(2.0),
+            text: "hello there".into(),
+            speaker: None,
+            place: oc_core::CaptionPlace::Bottom,
+            font: oc_core::CaptionFont::Sans,
+            effect: oc_core::CaptionEffect::None,
+        }];
+        let timeline = oc_core::Timeline::new(oc_core::FrameRate::FPS_30, 1080, 1920);
+        dress_safe(&mut cues, &timeline);
+        assert_eq!(cues[0].font, oc_core::CaptionFont::Display);
+        assert_eq!(cues[0].effect, oc_core::CaptionEffect::Pop);
+        assert_eq!(cues[0].place, oc_core::CaptionPlace::Lower);
+    }
+
+    #[test]
+    fn beat_grid_skips_talking_video_and_keeps_music_files() {
+        assert!(!wants_beat_grid(false, true));
+        assert!(wants_beat_grid(true, true));
+        assert!(wants_beat_grid(false, false));
+        assert!(wants_beat_grid(true, false));
+    }
 }

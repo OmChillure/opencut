@@ -17,8 +17,9 @@ use tracing_subscriber::EnvFilter;
 use crate::routes::{
     apply_ops, chat, complete_upload, create_chat, create_project, delete_project,
     generate_captions, get_chat, get_export, get_media_file, get_project, head_export, health,
-    list_ai_providers, list_chats, list_media, list_projects, patch_media, put_media_bytes,
-    register_media, request_upload, save_chat_messages, transcribe_media, update_project,
+    list_ai_providers, list_chats, list_media, list_projects, open_session, patch_media,
+    put_media_bytes, register_media, request_upload, save_chat_messages, transcribe_media,
+    update_project,
 };
 use crate::state::AppState;
 
@@ -28,6 +29,23 @@ fn max_upload_bytes() -> usize {
         .and_then(|s| s.parse().ok())
         .filter(|n: &usize| *n > 0)
         .unwrap_or(2 * 1024 * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_limit_follows_a_positive_override() {
+        let fallback = 2 * 1024 * 1024 * 1024;
+        match std::env::var("OPENCUT_MAX_UPLOAD_BYTES") {
+            Ok(raw) => match raw.parse::<usize>() {
+                Ok(n) if n > 0 => assert_eq!(max_upload_bytes(), n),
+                _ => assert_eq!(max_upload_bytes(), fallback),
+            },
+            Err(_) => assert_eq!(max_upload_bytes(), fallback),
+        }
+    }
 }
 
 #[tokio::main]
@@ -48,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/session", post(open_session))
         .route("/v1/projects", get(list_projects).post(create_project))
         .route(
             "/v1/projects/{id}",

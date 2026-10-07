@@ -40,6 +40,7 @@ impl From<oc_db::DbError> for ApiError {
         match value {
             oc_db::DbError::NotFound => Self::new(StatusCode::NOT_FOUND, "not found"),
             oc_db::DbError::BadUser => Self::new(StatusCode::BAD_REQUEST, "sign in with an email"),
+            oc_db::DbError::WrongPassword => Self::new(StatusCode::UNAUTHORIZED, "wrong password"),
             other => Self::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         }
     }
@@ -52,30 +53,42 @@ impl axum::response::IntoResponse for ApiError {
     }
 }
 
-/// The signed-in email. Fetch sends `x-opencut-user`. A media or export URL may use `?user=`.
+/// The signed-in email. Fetch sends `x-opencut-token`. A media or export URL may use `?token=`.
 pub struct SignedIn(pub String);
 
-impl<S> FromRequestParts<S> for SignedIn
-where
-    S: Send + Sync,
-{
+/// Header wins. `?user=` is not a credential.
+pub(crate) fn presented_token(header: &str, query: &str) -> String {
+    let header = header.trim();
+    if header.is_empty() {
+        query_param(query, "token")
+    } else {
+        header.to_string()
+    }
+}
+
+impl FromRequestParts<AppState> for SignedIn {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let header = parts
             .headers
-            .get("x-opencut-user")
+            .get("x-opencut-token")
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
-        let from_query = query_param(parts.uri.query().unwrap_or(""), "user");
-        let raw = if header.is_empty() {
-            from_query.as_str()
-        } else {
-            header
-        };
-        let email = oc_db::normalize_user_email(raw)
-            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "sign in with an email"))?;
-        Ok(SignedIn(email))
+        let token = presented_token(header, parts.uri.query().unwrap_or(""));
+        if token.is_empty() {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "sign in"));
+        }
+        match oc_db::email_for_session(&state.db, &token).await {
+            Ok(email) => Ok(SignedIn(email)),
+            Err(oc_db::DbError::NotFound) => {
+                Err(ApiError::new(StatusCode::UNAUTHORIZED, "sign in"))
+            }
+            Err(other) => Err(other.into()),
+        }
     }
 }
 
@@ -681,6 +694,8 @@ async fn run_chat(
                     tracing::info!(tool = %call.name, "host tool");
                     let (ok, result) = if call.name == "see" {
                         see_host(&state, id, &call.arguments, &mut seen).await
+                    } else if call.name == "watch" {
+                        watch_host(&state, id, &call.arguments, &mut seen).await
                     } else {
                         match edit::call_tool(&state.db, id, &call.name, call.arguments.clone())
                             .await
@@ -704,8 +719,8 @@ async fn run_chat(
                             }
                         }
                     };
-                    if call.name == "see" {
-                        batch.push_str(&compact_tool("see", &result));
+                    if call.name == "see" || call.name == "watch" {
+                        batch.push_str(&compact_tool(call.name.as_str(), &result));
                         batch.push('\n');
                         if ok {
                             notes.push(result.clone());
@@ -766,6 +781,51 @@ async fn run_chat(
     Ok(())
 }
 
+async fn watch_host(
+    state: &AppState,
+    project_id: Uuid,
+    arguments: &serde_json::Value,
+    seen: &mut Vec<oc_providers::PromptImage>,
+) -> (bool, String) {
+    let media = arguments
+        .get("media_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let start = arguments
+        .get("start")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let end = arguments
+        .get("end")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(start);
+    let Ok(media_id) = Uuid::parse_str(media) else {
+        return (false, format!("tool error: bad media id {media}"));
+    };
+    match edit::watch_range(
+        &state.db,
+        state.r2.as_ref(),
+        project_id,
+        media_id,
+        start,
+        end,
+    )
+    .await
+    {
+        Ok(watched) => {
+            let text = watched.text.clone();
+            for frame in watched.frames {
+                if seen.len() >= 8 {
+                    break;
+                }
+                seen.push(frame);
+            }
+            (true, text)
+        }
+        Err(err) => (false, format!("tool error: {err}")),
+    }
+}
+
 async fn see_host(
     state: &AppState,
     project_id: Uuid,
@@ -782,8 +842,12 @@ async fn see_host(
     };
     match edit::see_frame(&state.db, state.r2.as_ref(), project_id, media_id, at).await {
         Ok(frame) => {
-            let caption = frame.caption.clone();
-            seen.push(frame);
+            let mut caption = frame.caption.clone();
+            if seen.len() >= 8 {
+                caption.push_str(" (frame held; this turn already has 8 frames)");
+            } else {
+                seen.push(frame);
+            }
             (true, caption)
         }
         Err(err) => (false, format!("tool error: {err}")),
@@ -1075,64 +1139,233 @@ pub async fn get_media_file(
     ))
 }
 
-fn latest_export(id: Uuid) -> Result<std::path::PathBuf, ApiError> {
-    let dir = std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into());
-    let prefix = id.to_string();
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?;
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(&prefix) || !name.ends_with(".mp4") || name.starts_with('.') {
-            continue;
-        }
-        if !mp4_has_moov(&entry.path()) {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
-            best = Some((modified, entry.path()));
-        }
-    }
-    best.map(|(_, path)| path)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))
+/// Worker clocks and Postgres can disagree by a few seconds.
+const EXPORT_CLOCK_SLACK_MS: u64 = 5_000;
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ExportQuery {
+    #[serde(default)]
+    preset: String,
 }
 
-pub async fn head_export(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    SignedIn(email): SignedIn,
-) -> ApiResult<Response> {
-    owned(&state, id, &email).await?;
-    let path = latest_export(id)?;
-    let len = std::fs::metadata(&path)
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?
-        .len();
-    Ok(Response::builder()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalExport {
+    Absent,
+    Writing { modified_ms: u64 },
+    Ready { modified_ms: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExportStamp {
+    modified_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportChoice {
+    Wait,
+    Local,
+    Remote,
+}
+
+enum LocatedExport {
+    Local(std::path::PathBuf),
+    Remote { key: String, bytes: u64 },
+}
+
+fn export_dir() -> String {
+    std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into())
+}
+
+fn local_export_path(id: Uuid, preset: oc_core::ExportPreset) -> std::path::PathBuf {
+    std::path::PathBuf::from(export_dir()).join(preset.file_name(id))
+}
+
+fn export_preset_wire(preset: oc_core::ExportPreset) -> String {
+    serde_json::to_value(preset)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn parse_export_preset(raw: &str) -> Option<oc_core::ExportPreset> {
+    match raw.trim() {
+        "youtube-1080" | "youtube_1080" | "youtube1080" => Some(oc_core::ExportPreset::Youtube1080),
+        "vertical-1080" | "vertical_1080" | "vertical1080" => {
+            Some(oc_core::ExportPreset::Vertical1080)
+        }
+        "square-1080" | "square_1080" | "square1080" => Some(oc_core::ExportPreset::Square1080),
+        _ => None,
+    }
+}
+
+fn file_modified_ms(path: &std::path::Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|age| age.as_millis() as u64)
+}
+
+fn read_local_export(path: &std::path::Path) -> LocalExport {
+    if !path.is_file() {
+        return LocalExport::Absent;
+    }
+    let modified_ms = file_modified_ms(path).unwrap_or(0);
+    if mp4_has_moov(path) {
+        LocalExport::Ready { modified_ms }
+    } else {
+        LocalExport::Writing { modified_ms }
+    }
+}
+
+fn export_is_current(modified_ms: u64, job_started_ms: Option<i64>) -> bool {
+    match job_started_ms {
+        Some(started) if started > 0 => {
+            modified_ms.saturating_add(EXPORT_CLOCK_SLACK_MS) >= started as u64
+        }
+        _ => true,
+    }
+}
+
+/// Pick the requested preset. A newer file of another preset is not a candidate.
+/// A file older than the latest export job is the previous render.
+fn choose_export(
+    local: LocalExport,
+    remote: Option<ExportStamp>,
+    job_started_ms: Option<i64>,
+) -> ExportChoice {
+    if let LocalExport::Writing { modified_ms } = local {
+        if job_started_ms.is_some() && export_is_current(modified_ms, job_started_ms) {
+            return ExportChoice::Wait;
+        }
+    }
+    let local_ms = match local {
+        LocalExport::Ready { modified_ms } if export_is_current(modified_ms, job_started_ms) => {
+            Some(modified_ms)
+        }
+        _ => None,
+    };
+    let remote_ms = remote
+        .filter(|stamp| export_is_current(stamp.modified_ms, job_started_ms))
+        .map(|stamp| stamp.modified_ms);
+    match (local_ms, remote_ms) {
+        (Some(local_ms), Some(remote_ms)) if remote_ms > local_ms => ExportChoice::Remote,
+        (Some(_), _) => ExportChoice::Local,
+        (None, Some(_)) => ExportChoice::Remote,
+        (None, None) => ExportChoice::Wait,
+    }
+}
+
+async fn requested_preset(
+    state: &AppState,
+    id: Uuid,
+    raw: &str,
+) -> Result<oc_core::ExportPreset, ApiError> {
+    if raw.is_empty() {
+        let project = oc_db::get_project(&state.db, id).await?;
+        return Ok(export_preset(&project.timeline));
+    }
+    parse_export_preset(raw)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "unknown export preset"))
+}
+
+async fn locate_export(
+    state: &AppState,
+    id: Uuid,
+    preset: oc_core::ExportPreset,
+) -> Result<LocatedExport, ApiError> {
+    let started = oc_db::latest_export_job_ms(&state.db, id, &export_preset_wire(preset)).await?;
+    let path = local_export_path(id, preset);
+    let local = read_local_export(&path);
+    let filename = preset.file_name(id);
+    let key = oc_media::export_object_key(ProjectId::from_uuid(id), &filename);
+    let (remote, head_failed) = match &state.r2 {
+        Some(r2) => match r2.stat_object(&key).await {
+            Ok(found) => (found, false),
+            Err(err) => {
+                tracing::warn!(project = %id, "export object: {err}");
+                (None, true)
+            }
+        },
+        None => (None, false),
+    };
+    let stamp = remote.map(|item| ExportStamp {
+        modified_ms: item.modified_ms,
+    });
+    match choose_export(local, stamp, started) {
+        ExportChoice::Local => Ok(LocatedExport::Local(path)),
+        ExportChoice::Remote => Ok(LocatedExport::Remote {
+            key,
+            bytes: remote.map(|item| item.bytes).unwrap_or(0),
+        }),
+        ExportChoice::Wait if head_failed && matches!(local, LocalExport::Absent) => Err(
+            ApiError::new(StatusCode::BAD_GATEWAY, "export store is unavailable"),
+        ),
+        ExportChoice::Wait => Err(ApiError::new(StatusCode::NOT_FOUND, "no export yet")),
+    }
+}
+
+fn export_head(len: u64) -> Response {
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/mp4")
         .header(header::CONTENT_LENGTH, len)
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::ACCEPT_RANGES, "bytes")
         .body(Body::empty())
-        .unwrap_or_else(|_| Response::new(Body::empty())))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+pub async fn head_export(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ExportQuery>,
+    SignedIn(email): SignedIn,
+) -> ApiResult<Response> {
+    owned(&state, id, &email).await?;
+    let preset = requested_preset(&state, id, &query.preset).await?;
+    match locate_export(&state, id, preset).await? {
+        LocatedExport::Local(path) => {
+            let len = std::fs::metadata(&path)
+                .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?
+                .len();
+            Ok(export_head(len))
+        }
+        LocatedExport::Remote { bytes, .. } => Ok(export_head(bytes)),
+    }
 }
 
 pub async fn get_export(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<ExportQuery>,
     SignedIn(email): SignedIn,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
     owned(&state, id, &email).await?;
-    let path = latest_export(id)?;
-    serve_local_file(&path, "video/mp4", headers.get(header::RANGE))
-        .await
-        .map(with_no_store)
+    let preset = requested_preset(&state, id, &query.preset).await?;
+    match locate_export(&state, id, preset).await? {
+        LocatedExport::Local(path) => {
+            serve_local_file(&path, "video/mp4", headers.get(header::RANGE))
+                .await
+                .map(with_no_store)
+        }
+        LocatedExport::Remote { key, .. } => {
+            let Some(r2) = &state.r2 else {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "no export yet"));
+            };
+            let url = r2
+                .presign_get(&key, Duration::from_secs(6 * 3600))
+                .await
+                .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()))?;
+            Ok(Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, url)
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::empty())
+                .unwrap_or_else(|_| Response::new(Body::empty())))
+        }
+    }
 }
 
 fn with_no_store(mut response: Response) -> Response {
@@ -1269,6 +1502,27 @@ pub async fn patch_media(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// What to do after the bytes are stored. Images are ready. Everything else is watched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UploadFollowUp {
+    Ready,
+    Transcribe,
+}
+
+pub(crate) fn upload_follow_up(
+    key: &str,
+    content_type: &str,
+) -> Result<UploadFollowUp, &'static str> {
+    if !oc_db::is_r2_object_key(key) {
+        return Err("the file is not on R2 yet — import it again");
+    }
+    if content_type.starts_with("image/") {
+        Ok(UploadFollowUp::Ready)
+    } else {
+        Ok(UploadFollowUp::Transcribe)
+    }
+}
+
 pub async fn complete_upload(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
@@ -1276,21 +1530,30 @@ pub async fn complete_upload(
 ) -> ApiResult<Json<serde_json::Value>> {
     owned(&state, id, &email).await?;
     let media = oc_db::get_media(&state.db, media_id).await?;
-    oc_db::set_media_status(&state.db, media_id, "ready").await?;
-    if !media.content_type.starts_with("image/") {
-        let _ = oc_db::enqueue_job(
-            &state.db,
-            "transcribe",
-            serde_json::json!({
-                "project_id": id,
-                "media_id": media_id,
-                "r2_key": media.r2_key,
-            }),
-        )
-        .await;
-        oc_db::set_media_status(&state.db, media_id, "transcribing").await?;
+    if media.project_id != id {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
     }
-    Ok(Json(serde_json::json!({ "status": "ready" })))
+    match upload_follow_up(&media.r2_key, &media.content_type) {
+        Err(message) => Err(ApiError::new(StatusCode::CONFLICT, message)),
+        Ok(UploadFollowUp::Ready) => {
+            oc_db::set_media_status(&state.db, media_id, "ready").await?;
+            Ok(Json(serde_json::json!({ "status": "ready" })))
+        }
+        Ok(UploadFollowUp::Transcribe) => {
+            oc_db::enqueue_job(
+                &state.db,
+                "transcribe",
+                serde_json::json!({
+                    "project_id": id,
+                    "media_id": media_id,
+                    "r2_key": media.r2_key,
+                }),
+            )
+            .await?;
+            oc_db::set_media_status(&state.db, media_id, "transcribing").await?;
+            Ok(Json(serde_json::json!({ "status": "transcribing" })))
+        }
+    }
 }
 
 pub async fn generate_captions(
@@ -1318,6 +1581,16 @@ pub async fn transcribe_media(
     if media.project_id != id {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
     }
+    match upload_follow_up(&media.r2_key, &media.content_type) {
+        Err(message) => return Err(ApiError::new(StatusCode::CONFLICT, message)),
+        Ok(UploadFollowUp::Ready) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "images are not transcribed",
+            ));
+        }
+        Ok(UploadFollowUp::Transcribe) => {}
+    }
     let job = oc_db::enqueue_job(
         &state.db,
         "transcribe",
@@ -1333,21 +1606,34 @@ pub async fn transcribe_media(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct UserQuery {
-    user: String,
-}
-
-#[derive(Deserialize)]
 pub(crate) struct CreateChatBody {
-    user: String,
     title: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct SaveChatBody {
-    user: String,
     #[serde(default)]
     messages: Vec<oc_db::ChatMessageInput>,
+}
+
+#[derive(Deserialize)]
+pub struct SessionBody {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Serialize)]
+pub struct SessionResponse {
+    pub email: String,
+    pub token: String,
+}
+
+pub async fn open_session(
+    State(state): State<AppState>,
+    Json(body): Json<SessionBody>,
+) -> ApiResult<Json<SessionResponse>> {
+    let (email, token) = oc_db::open_session(&state.db, &body.email, &body.password).await?;
+    Ok(Json(SessionResponse { email, token }))
 }
 
 #[derive(Serialize)]
@@ -1361,10 +1647,9 @@ pub async fn list_chats(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     SignedIn(email): SignedIn,
-    Query(query): Query<UserQuery>,
 ) -> ApiResult<Json<Vec<oc_db::ChatRow>>> {
     owned(&state, id, &email).await?;
-    Ok(Json(oc_db::list_chats(&state.db, id, &query.user).await?))
+    Ok(Json(oc_db::list_chats(&state.db, id, &email).await?))
 }
 
 pub async fn create_chat(
@@ -1374,7 +1659,7 @@ pub async fn create_chat(
     Json(body): Json<CreateChatBody>,
 ) -> ApiResult<Json<oc_db::ChatRow>> {
     owned(&state, id, &email).await?;
-    let chat = oc_db::create_chat(&state.db, id, &body.user, body.title.as_deref()).await?;
+    let chat = oc_db::create_chat(&state.db, id, &email, body.title.as_deref()).await?;
     tracing::info!(project = %id, chat = %chat.id, "chat created");
     Ok(Json(chat))
 }
@@ -1383,10 +1668,9 @@ pub async fn get_chat(
     State(state): State<AppState>,
     Path((id, chat_id)): Path<(Uuid, Uuid)>,
     SignedIn(email): SignedIn,
-    Query(query): Query<UserQuery>,
 ) -> ApiResult<Json<ChatDetail>> {
     owned(&state, id, &email).await?;
-    let (chat, messages) = oc_db::get_chat(&state.db, id, chat_id, &query.user).await?;
+    let (chat, messages) = oc_db::get_chat(&state.db, id, chat_id, &email).await?;
     Ok(Json(ChatDetail { chat, messages }))
 }
 
@@ -1397,8 +1681,7 @@ pub async fn save_chat_messages(
     Json(body): Json<SaveChatBody>,
 ) -> ApiResult<Json<oc_db::ChatRow>> {
     owned(&state, id, &email).await?;
-    let chat =
-        oc_db::save_chat_messages(&state.db, id, chat_id, &body.user, &body.messages).await?;
+    let chat = oc_db::save_chat_messages(&state.db, id, chat_id, &email, &body.messages).await?;
     tracing::info!(project = %id, chat = %chat_id, n = body.messages.len(), "chat saved");
     Ok(Json(chat))
 }
@@ -1406,6 +1689,31 @@ pub async fn save_chat_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_complete_waits_for_an_r2_object() {
+        assert!(upload_follow_up("workspace/abc", "video/mp4").is_err());
+        assert!(upload_follow_up("local/clip.mp4", "video/mp4").is_err());
+        assert!(upload_follow_up("", "video/mp4").is_err());
+        assert_eq!(
+            upload_follow_up("raw/p/m/a.mp4", "video/mp4").unwrap(),
+            UploadFollowUp::Transcribe
+        );
+        assert_eq!(
+            upload_follow_up("raw/p/m/a.png", "image/png").unwrap(),
+            UploadFollowUp::Ready
+        );
+    }
+
+    #[test]
+    fn a_session_reads_the_token_and_ignores_the_email() {
+        assert_eq!(presented_token("", "user=ada@studio.com&token=abc"), "abc");
+        assert_eq!(
+            presented_token("header-token", "user=ada@studio.com"),
+            "header-token"
+        );
+        assert_eq!(presented_token("", "user=ada@studio.com"), "");
+    }
 
     #[test]
     fn a_finished_tool_carries_the_timeline_before_the_reply_ends() {
@@ -1462,5 +1770,187 @@ mod tests {
         assert!(mp4_has_moov(&done));
         assert!(!mp4_has_moov(&writing));
         assert!(!mp4_has_moov(&decoy));
+    }
+
+    #[test]
+    fn query_email_is_percent_decoded() {
+        assert_eq!(query_param("user=a%40b.com&x=1", "user"), "a@b.com");
+        assert_eq!(query_param("user=a+b", "user"), "a b");
+        assert_eq!(query_param("other=1", "user"), "");
+        assert_eq!(percent_decode("%2"), "%2");
+    }
+
+    #[test]
+    fn an_export_file_is_named_for_its_preset() {
+        let id = Uuid::nil();
+        assert_eq!(
+            oc_core::ExportPreset::Youtube1080.file_name(id),
+            "00000000-0000-0000-0000-000000000000-youtube-1080.mp4"
+        );
+        assert_ne!(
+            oc_core::ExportPreset::Youtube1080.file_name(id),
+            oc_core::ExportPreset::Vertical1080.file_name(id)
+        );
+        let wire = export_preset_wire(oc_core::ExportPreset::Vertical1080);
+        assert_eq!(
+            wire,
+            serde_json::to_value(oc_core::ExportPreset::Vertical1080)
+                .unwrap()
+                .as_str()
+                .unwrap()
+        );
+        assert_eq!(
+            parse_export_preset(&wire),
+            Some(oc_core::ExportPreset::Vertical1080)
+        );
+        assert_eq!(
+            parse_export_preset("youtube-1080"),
+            Some(oc_core::ExportPreset::Youtube1080)
+        );
+        assert_eq!(
+            parse_export_preset("square_1080"),
+            Some(oc_core::ExportPreset::Square1080)
+        );
+        assert_eq!(parse_export_preset("nope"), None);
+        assert_eq!(
+            local_export_path(id, oc_core::ExportPreset::Square1080),
+            std::path::PathBuf::from(export_dir())
+                .join("00000000-0000-0000-0000-000000000000-square-1080.mp4")
+        );
+    }
+
+    #[test]
+    fn the_requested_preset_is_served_and_an_older_render_is_not() {
+        let started = 1_000_000_i64;
+        let old = ExportStamp {
+            modified_ms: (started as u64) - 60_000,
+        };
+        let fresh = ExportStamp {
+            modified_ms: (started as u64) + 1_000,
+        };
+        let older_than_slack = ExportStamp {
+            modified_ms: (started as u64) - EXPORT_CLOCK_SLACK_MS - 1,
+        };
+        assert_eq!(
+            choose_export(
+                LocalExport::Ready {
+                    modified_ms: old.modified_ms
+                },
+                None,
+                Some(started)
+            ),
+            ExportChoice::Wait
+        );
+        assert_eq!(
+            choose_export(LocalExport::Absent, Some(fresh), Some(started)),
+            ExportChoice::Remote
+        );
+        assert_eq!(
+            choose_export(
+                LocalExport::Writing {
+                    modified_ms: fresh.modified_ms
+                },
+                Some(old),
+                Some(started)
+            ),
+            ExportChoice::Wait
+        );
+        assert_eq!(
+            choose_export(
+                LocalExport::Ready {
+                    modified_ms: fresh.modified_ms
+                },
+                Some(old),
+                Some(started)
+            ),
+            ExportChoice::Local
+        );
+        let newer_remote = ExportStamp {
+            modified_ms: fresh.modified_ms + 5_000,
+        };
+        assert_eq!(
+            choose_export(
+                LocalExport::Ready {
+                    modified_ms: fresh.modified_ms
+                },
+                Some(newer_remote),
+                Some(started)
+            ),
+            ExportChoice::Remote
+        );
+        assert_eq!(
+            choose_export(
+                LocalExport::Ready {
+                    modified_ms: older_than_slack.modified_ms
+                },
+                None,
+                Some(started)
+            ),
+            ExportChoice::Wait
+        );
+        assert_eq!(
+            choose_export(
+                LocalExport::Ready {
+                    modified_ms: (started as u64) - 1_000,
+                },
+                None,
+                Some(started)
+            ),
+            ExportChoice::Local
+        );
+        assert_eq!(
+            choose_export(
+                LocalExport::Ready {
+                    modified_ms: old.modified_ms
+                },
+                None,
+                None
+            ),
+            ExportChoice::Local
+        );
+        assert_eq!(
+            choose_export(
+                LocalExport::Writing {
+                    modified_ms: old.modified_ms
+                },
+                Some(old),
+                None
+            ),
+            ExportChoice::Remote
+        );
+    }
+
+    #[test]
+    fn a_partial_export_is_not_a_finished_file() {
+        let dir = std::env::temp_dir().join("oc-export-pick");
+        std::fs::create_dir_all(&dir).unwrap();
+        let done = dir.join("done.mp4");
+        let writing = dir.join("writing.mp4");
+        let mut finished = box_bytes(b"ftyp", b"isom");
+        finished.extend(box_bytes(b"moov", b"mvhd"));
+        std::fs::write(&done, &finished).unwrap();
+        std::fs::write(&writing, b"ftyp").unwrap();
+        assert!(matches!(
+            read_local_export(&done),
+            LocalExport::Ready { .. }
+        ));
+        assert!(matches!(
+            read_local_export(&writing),
+            LocalExport::Writing { .. }
+        ));
+        assert!(matches!(
+            read_local_export(&dir.join("missing.mp4")),
+            LocalExport::Absent
+        ));
+    }
+
+    #[test]
+    fn byte_range_reads_start_and_optional_end() {
+        assert_eq!(parse_byte_range("bytes=0-99"), Some((0, Some(99))));
+        assert_eq!(parse_byte_range("bytes=10-"), Some((10, None)));
+        assert_eq!(parse_byte_range("bytes=-"), Some((0, None)));
+        assert_eq!(parse_byte_range("bytes=4-8, 10-12"), Some((4, Some(8))));
+        assert_eq!(parse_byte_range("items=0-1"), None);
+        assert_eq!(parse_byte_range("bytes=nope-1"), None);
     }
 }

@@ -267,7 +267,10 @@ struct MotionAsk {
 
 fn motion_ask(arguments: &Value) -> Result<MotionAsk, String> {
     let spec = crate::motion::resolve(
-        arguments.get("design").and_then(Value::as_str).unwrap_or(""),
+        arguments
+            .get("design")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
         arguments.get("kind").and_then(Value::as_str).unwrap_or(""),
     )?;
     let text = arguments
@@ -345,7 +348,7 @@ mod design_prompt_tests {
         assert_eq!(ask.design, "stat-ring");
         assert_eq!(ask.text, "47%");
         assert_eq!(ask.duration, 6);
-        assert!(ask.page.contains("count"), "{}" , ask.page_path);
+        assert!(ask.page.contains("count"), "{}", ask.page_path);
     }
 
     #[test]
@@ -634,6 +637,243 @@ pub(crate) fn review_facts(
     oc_core::ReviewFacts::from_timeline(timeline, &shots, sources, beats, has_music)
 }
 
+pub(crate) struct Watched {
+    pub text: String,
+    pub frames: Vec<oc_providers::PromptImage>,
+}
+
+/// Three frames across a source range, plus the words and holes in it.
+pub(crate) async fn watch_range(
+    db: &Db,
+    r2: Option<&oc_db::R2>,
+    project_id: Uuid,
+    media_id: Uuid,
+    start: f64,
+    end: f64,
+) -> Result<Watched, String> {
+    let media = oc_db::list_media(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = media
+        .iter()
+        .find(|m| m.id == media_id)
+        .ok_or_else(|| format!("media {media_id} is not in this project"))?;
+    if row.content_type.starts_with("audio/") {
+        return Err("watch needs a picture, not an audio file".into());
+    }
+    if !start.is_finite() || !end.is_finite() {
+        return Err("watch needs a real source range".into());
+    }
+    let start = start.max(0.0);
+    let end = end.max(start);
+    let times = oc_core::watch_times(start, end);
+    if times.is_empty() {
+        return Err("watch needs a real source range".into());
+    }
+    let mut temps = Vec::new();
+    let opened = open_for_frames(row, r2, &mut temps).await;
+    let Some(path) = opened else {
+        clear_frame_temps(&mut temps).await;
+        return Err(format!("media {media_id} is not on R2"));
+    };
+    let mut frames = Vec::new();
+    for at in &times {
+        let dest =
+            std::env::temp_dir().join(format!("oc-watch-{}-{}.jpg", media_id, Uuid::new_v4()));
+        let grabbed = oc_media::grab_jpeg(&path, *at, &dest).await;
+        let jpeg = if grabbed.is_ok() {
+            tokio::fs::read(&dest).await.ok()
+        } else {
+            None
+        };
+        let _ = tokio::fs::remove_file(&dest).await;
+        let Some(jpeg) = jpeg.filter(|bytes| bytes.len() >= 32) else {
+            continue;
+        };
+        frames.push(oc_providers::PromptImage {
+            caption: format!("media {media_id} @ {at:.1}s"),
+            jpeg,
+        });
+    }
+    clear_frame_temps(&mut temps).await;
+    if frames.is_empty() {
+        return Err(format!("no frames in {media_id} {start:.1}–{end:.1}s"));
+    }
+    let transcripts = oc_db::list_transcripts_for_project(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let speech = speech_by_media(&transcripts);
+    let looks = look_by_media(
+        &oc_db::list_analysis_for_project(db, project_id)
+            .await
+            .unwrap_or_default(),
+    );
+    let text = watch_text(row, &speech, looks.get(&media_id), start, end, &times);
+    Ok(Watched { text, frames })
+}
+
+fn watch_text(
+    row: &oc_db::MediaRow,
+    speech: &HashMap<Uuid, Speech>,
+    look: Option<&oc_db::AnalysisRow>,
+    start: f64,
+    end: f64,
+    times: &[f64],
+) -> String {
+    let mut out = format!("watch {} {:.1}–{:.1}s\n", row.id, start, end);
+    out.push_str("frames:");
+    for at in times {
+        out.push_str(&format!(" {at:.1}s"));
+    }
+    out.push('\n');
+    let cues = speech
+        .get(&row.id)
+        .map(|spoken| spoken.cues.as_slice())
+        .unwrap_or(&[]);
+    let mut words = 0;
+    for cue in cues {
+        let a = cue.start.as_seconds();
+        let b = cue.end.as_seconds();
+        if b <= start + 0.05 || a >= end - 0.05 {
+            continue;
+        }
+        if words == 0 {
+            out.push_str("words:\n");
+        }
+        words += 1;
+        if words > 24 {
+            continue;
+        }
+        out.push_str(&format!("{a:.1}-{b:.1}  {}\n", cue.text.replace('\n', " ")));
+    }
+    if words == 0 {
+        out.push_str("words: none in this range\n");
+    } else if words > 24 {
+        out.push_str(&format!("… {} more lines\n", words - 24));
+    }
+    if let Some(look) = look {
+        let mut shown = 0;
+        for shot in shot_looks(look) {
+            if shot.end <= start + 0.05 || shot.start >= end - 0.05 {
+                continue;
+            }
+            if shown == 0 {
+                out.push_str("shots:\n");
+            }
+            shown += 1;
+            let scale = shot
+                .card
+                .as_ref()
+                .and_then(|card| {
+                    let scale = card.scale.trim();
+                    if scale.is_empty() { None } else { Some(scale) }
+                })
+                .unwrap_or(shot.look.as_str());
+            out.push_str(&format!(
+                "{:.1}-{:.1} {scale} {}\n",
+                shot.start, shot.end, shot.subject
+            ));
+        }
+    }
+    let refs: Vec<(f64, f64, &str)> = cues
+        .iter()
+        .map(|cue| {
+            (
+                cue.start.as_seconds(),
+                cue.end.as_seconds(),
+                cue.text.as_str(),
+            )
+        })
+        .collect();
+    let (_, dur) = spec_from_row(row);
+    let gaps =
+        oc_core::gaps_overlapping(&oc_core::source_gaps(&refs, dur.as_seconds()), start, end);
+    if gaps.is_empty() {
+        out.push_str("gaps: none\n");
+    } else {
+        out.push_str("gaps:\n");
+        out.push_str(&format_gaps(&gaps));
+    }
+    out
+}
+
+fn list_gaps(
+    media: &[oc_db::MediaRow],
+    speech: &HashMap<Uuid, Speech>,
+    media_id: oc_core::MediaId,
+    start: Option<f64>,
+    end: Option<f64>,
+) -> String {
+    let id = media_id.as_uuid();
+    let Some(row) = media.iter().find(|row| row.id == id) else {
+        return format!("media {id} not in bin");
+    };
+    let (_, dur) = spec_from_row(row);
+    let source_end = dur.as_seconds();
+    let window_start = start.unwrap_or(0.0).max(0.0);
+    let window_end = end.unwrap_or(source_end).max(window_start);
+    let refs: Vec<(f64, f64, &str)> = speech
+        .get(&id)
+        .map(|s| {
+            s.cues
+                .iter()
+                .map(|cue| {
+                    (
+                        cue.start.as_seconds(),
+                        cue.end.as_seconds(),
+                        cue.text.as_str(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let gaps = oc_core::gaps_overlapping(
+        &oc_core::source_gaps(&refs, source_end),
+        window_start,
+        window_end,
+    );
+    if gaps.is_empty() {
+        return format!(
+            "gaps {id} {:.1}–{:.1}s: no filler or silence longer than {:.1}s\n",
+            window_start,
+            window_end,
+            oc_core::SILENCE_GAP_SECS
+        );
+    }
+    format!(
+        "gaps {id} {:.1}–{:.1}s\n{}",
+        window_start,
+        window_end,
+        format_gaps(&gaps)
+    )
+}
+
+fn format_gaps(gaps: &[oc_core::SourceGap]) -> String {
+    let mut out = String::new();
+    for gap in gaps.iter().take(48) {
+        match gap.kind {
+            oc_core::GapKind::Filler => {
+                out.push_str(&format!(
+                    "filler {:.2}–{:.2}  {}\n",
+                    gap.start, gap.end, gap.text
+                ));
+            }
+            oc_core::GapKind::Silence => {
+                out.push_str(&format!(
+                    "silence {:.2}–{:.2}  {:.1}s\n",
+                    gap.start,
+                    gap.end,
+                    gap.end - gap.start
+                ));
+            }
+        }
+    }
+    if gaps.len() > 48 {
+        out.push_str(&format!("… {} more gaps\n", gaps.len() - 48));
+    }
+    out
+}
+
 /// One JPEG at a source time. The model calls `see` when it wants to look.
 pub(crate) async fn see_frame(
     db: &Db,
@@ -652,25 +892,24 @@ pub(crate) async fn see_frame(
     if row.content_type.starts_with("audio/") {
         return Err("see needs a picture, not an audio file".into());
     }
+    let Some(at) = finite_source_time(at) else {
+        return Err("see needs a real source time".into());
+    };
     let mut temps = Vec::new();
-    let path = open_for_frames(row, r2, &mut temps)
-        .await
-        .ok_or_else(|| format!("media {media_id} is not on R2"))?;
-    let dest = std::env::temp_dir().join(format!(
-        "oc-see-{}-{}.jpg",
-        std::process::id(),
-        at.to_bits()
-    ));
-    let grabbed = oc_media::grab_jpeg(&path, at.max(0.0), &dest).await;
+    let opened = open_for_frames(row, r2, &mut temps).await;
+    let Some(path) = opened else {
+        clear_frame_temps(&mut temps).await;
+        return Err(format!("media {media_id} is not on R2"));
+    };
+    let dest = std::env::temp_dir().join(format!("oc-see-{}-{}.jpg", media_id, Uuid::new_v4()));
+    let grabbed = oc_media::grab_jpeg(&path, at, &dest).await;
     let jpeg = if grabbed.is_ok() {
         tokio::fs::read(&dest).await.ok()
     } else {
         None
     };
     let _ = tokio::fs::remove_file(&dest).await;
-    for dir in temps {
-        let _ = tokio::fs::remove_dir_all(dir).await;
-    }
+    clear_frame_temps(&mut temps).await;
     let jpeg = jpeg
         .filter(|b| b.len() >= 32)
         .ok_or_else(|| format!("no frame at {at:.1}s in {media_id}"))?;
@@ -690,13 +929,30 @@ async fn open_for_frames(
     }
     let r2 = r2?;
     let bytes = r2.get_bytes(&row.r2_key).await.ok()?;
-    let dir = std::env::temp_dir().join(format!("oc-see-src-{}-{}", std::process::id(), row.id));
-    tokio::fs::create_dir_all(&dir).await.ok()?;
-    let name = row.r2_key.rsplit('/').next().unwrap_or("media.bin");
-    let path = dir.join(name);
-    tokio::fs::write(&path, bytes).await.ok()?;
-    temps.push(dir);
+    let dir = std::env::temp_dir().join(format!("oc-see-src-{}", Uuid::new_v4()));
+    if tokio::fs::create_dir_all(&dir).await.is_err() {
+        return None;
+    }
+    temps.push(dir.clone());
+    let path = dir.join(oc_db::object_file_name(&row.r2_key));
+    if tokio::fs::write(&path, bytes).await.is_err() {
+        return None;
+    }
     Some(path)
+}
+
+fn finite_source_time(at: f64) -> Option<f64> {
+    if at.is_finite() {
+        Some(at.max(0.0))
+    } else {
+        None
+    }
+}
+
+async fn clear_frame_temps(temps: &mut Vec<std::path::PathBuf>) {
+    for dir in temps.drain(..) {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
 }
 
 pub(crate) fn run_inspect(
@@ -801,6 +1057,11 @@ pub(crate) fn run_inspect(
             subject,
             limit,
         ),
+        Inspect::ListGaps {
+            media_id,
+            start,
+            end,
+        } => list_gaps(media, speech, media_id, start, end),
         Inspect::ListCues { media_id } => {
             let id = media_id.as_uuid();
             let Some(s) = speech.get(&id) else {
