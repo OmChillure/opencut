@@ -7,11 +7,11 @@ mod ops;
 mod plan;
 mod registry;
 mod review;
+mod watch;
 
 pub use finish::{
-    CoverShot, SpokenLine, already_finished, caption_recipe_for, finish_reel,
-    has_burnable_captions, mapped_cues, program_clips, redress_unset_captions,
-    wants_picture_finish,
+    CoverShot, SpokenLine, caption_recipe_for, has_burnable_captions, mapped_cues, program_clips,
+    redress_unset_captions,
 };
 pub use intent::{Intent, asks_for_whole_piece, is_director_request, parse_intent};
 pub use mcp::{Inspect, McpCall, McpTool, inspect_from_mcp, mcp_tools, op_from_mcp};
@@ -24,6 +24,7 @@ pub use ops::{
 pub use plan::{SourceWindow, build_plan, cue_faces, plan_from_value, revise_plan};
 pub use registry::{actions, modes, tool, tools, track_actions};
 pub use review::{CutReview, ReviewFacts, ShotNote, SourceSpan, Spoken, review_cut, review_with};
+pub use watch::{GapKind, SILENCE_GAP_SECS, SourceGap, gaps_overlapping, source_gaps, watch_times};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,13 +85,6 @@ pub struct ToolSpec {
     pub shortcut: Option<&'static str>,
     pub kind: ToolKind,
     pub group: ToolGroup,
-}
-
-impl ToolId {
-    #[must_use]
-    pub fn is_mode(self) -> bool {
-        tool(self).is_some_and(|t| t.kind == ToolKind::Mode)
-    }
 }
 
 impl Default for ToolId {

@@ -275,3 +275,65 @@ pub fn actions() -> impl Iterator<Item = &'static ToolSpec> {
 pub fn track_actions() -> impl Iterator<Item = &'static ToolSpec> {
     ALL.iter().filter(|spec| spec.group == ToolGroup::Tracks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ToolGroup, ToolId, ToolKind};
+    use std::collections::HashSet;
+
+    fn touch(id: ToolId) -> ToolId {
+        match id {
+            ToolId::Select => ToolId::Select,
+            ToolId::Razor => ToolId::Razor,
+            ToolId::Spacer => ToolId::Spacer,
+            ToolId::Slip => ToolId::Slip,
+            ToolId::Ripple => ToolId::Ripple,
+            ToolId::Roll => ToolId::Roll,
+            ToolId::Slide => ToolId::Slide,
+            ToolId::RateStretch => ToolId::RateStretch,
+            ToolId::Multicam => ToolId::Multicam,
+            ToolId::Split => ToolId::Split,
+            ToolId::SplitAll => ToolId::SplitAll,
+            ToolId::Merge => ToolId::Merge,
+            ToolId::Extract => ToolId::Extract,
+            ToolId::Lift => ToolId::Lift,
+            ToolId::TrimStart => ToolId::TrimStart,
+            ToolId::TrimEnd => ToolId::TrimEnd,
+            ToolId::MarkIn => ToolId::MarkIn,
+            ToolId::MarkOut => ToolId::MarkOut,
+            ToolId::InsertAt => ToolId::InsertAt,
+            ToolId::OverwriteAt => ToolId::OverwriteAt,
+            ToolId::InsertSpace => ToolId::InsertSpace,
+            ToolId::DeleteSpace => ToolId::DeleteSpace,
+            ToolId::DetachAudio => ToolId::DetachAudio,
+            ToolId::Group => ToolId::Group,
+            ToolId::Ungroup => ToolId::Ungroup,
+            ToolId::Link => ToolId::Link,
+            ToolId::Unlink => ToolId::Unlink,
+            ToolId::AddMarker => ToolId::AddMarker,
+            ToolId::AddVideo => ToolId::AddVideo,
+            ToolId::AddAudio => ToolId::AddAudio,
+            ToolId::AddCaption => ToolId::AddCaption,
+        }
+    }
+
+    #[test]
+    fn every_tool_has_one_spec_and_shortcuts_do_not_collide() {
+        let mut seen = HashSet::new();
+        let mut shortcuts = HashSet::new();
+        for spec in tools() {
+            assert!(seen.insert(touch(spec.id)), "duplicate {:?}", spec.id);
+            assert_eq!(tool(spec.id).map(|item| item.label), Some(spec.label));
+            if spec.kind == ToolKind::Mode {
+                assert_eq!(spec.group, ToolGroup::Modes);
+            }
+            if let Some(key) = spec.shortcut {
+                assert!(shortcuts.insert(key), "shortcut {key} is used twice");
+            }
+        }
+        assert_eq!(seen.len(), tools().len());
+        assert_eq!(modes().count(), 9);
+        assert_eq!(track_actions().count(), 3);
+    }
+}

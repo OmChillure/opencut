@@ -328,6 +328,11 @@ impl Timeline {
         mut clip: Clip,
         mode: PlaceMode,
     ) -> Result<ClipId> {
+        if matches!(mode, PlaceMode::Insert | PlaceMode::Overwrite) {
+            let (start, duration) = marked_place(clip.start, clip.duration, self.mark_range());
+            clip.start = start;
+            clip.duration = duration;
+        }
         match mode {
             PlaceMode::Normal => {
                 if let Some(hit) = overlapping(self, track_id, clip.start, clip.end(), None) {
@@ -589,6 +594,165 @@ impl Timeline {
             _ => None,
         }
     }
+
+    /// Delete the in–out span and leave the hole.
+    pub fn lift_marked(&mut self) -> Result<Duration> {
+        let (start, end) = self.marked_span()?;
+        self.lift_span(start, end)?;
+        self.clear_marks();
+        Ok(end - start)
+    }
+
+    /// Delete the in–out span and close the gap.
+    pub fn extract_marked(&mut self) -> Result<Duration> {
+        let (start, end) = self.marked_span()?;
+        let span = end - start;
+        self.lift_span(start, end)?;
+        self.ripple_closed(end, span);
+        self.clear_marks();
+        Ok(span)
+    }
+
+    fn marked_span(&self) -> Result<(Time, Time)> {
+        self.mark_range()
+            .ok_or_else(|| TimelineError::Message("set in and out, with out after in".into()))
+    }
+
+    fn clear_marks(&mut self) {
+        self.mark_in = None;
+        self.mark_out = None;
+    }
+
+    fn lift_span(&mut self, start: Time, end: Time) -> Result<()> {
+        let tracks: Vec<TrackId> = self
+            .tracks
+            .iter()
+            .filter(|track| !track.locked)
+            .map(|track| track.id)
+            .collect();
+        for track_id in tracks {
+            for _ in 0..64 {
+                let hit = self.track(track_id).and_then(|track| {
+                    track
+                        .clips
+                        .iter()
+                        .find(|clip| clip.start < end && clip.end() > start)
+                        .map(|clip| clip.id)
+                });
+                let Some(id) = hit else {
+                    break;
+                };
+                self.lift_one(id, start, end)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn lift_one(&mut self, id: ClipId, start: Time, end: Time) -> Result<()> {
+        let (clip_start, clip_end) = {
+            let Some((_, clip)) = self.find_clip(id) else {
+                return Ok(());
+            };
+            (clip.start, clip.end())
+        };
+        if clip_end <= start || clip_start >= end {
+            return Ok(());
+        }
+        if clip_start >= start && clip_end <= end {
+            self.remove_clip(id)?;
+            return Ok(());
+        }
+        if clip_start < start && clip_end > end {
+            if let Some(middle) = self.split_inside(id, start)? {
+                if self.split_inside(middle, end)?.is_some() {
+                    if self.find_clip(middle).is_some() {
+                        self.remove_clip(middle)?;
+                    }
+                } else {
+                    self.keep_tail(middle, end)?;
+                }
+            } else {
+                self.keep_head(id, clip_start, start)?;
+            }
+            return Ok(());
+        }
+        if clip_start < start {
+            self.keep_head(id, clip_start, start)?;
+            return Ok(());
+        }
+        self.keep_tail(id, end)?;
+        Ok(())
+    }
+
+    fn keep_head(&mut self, id: ClipId, clip_start: Time, start: Time) -> Result<()> {
+        let head = start - clip_start;
+        if head.as_ticks() > 0 {
+            self.trim(id, clip_start, head)
+        } else {
+            self.remove_clip(id)?;
+            Ok(())
+        }
+    }
+
+    fn keep_tail(&mut self, id: ClipId, end: Time) -> Result<()> {
+        let Some((_, clip)) = self.find_clip(id) else {
+            return Ok(());
+        };
+        let clip_end = clip.end();
+        let tail = clip_end - end;
+        if tail.as_ticks() > 0 {
+            self.trim(id, end, tail)
+        } else {
+            self.remove_clip(id)?;
+            Ok(())
+        }
+    }
+
+    fn split_inside(&mut self, id: ClipId, at: Time) -> Result<Option<ClipId>> {
+        match self.split(id, at) {
+            Ok(right) => Ok(Some(right)),
+            Err(TimelineError::SplitOutOfRange) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn ripple_closed(&mut self, end: Time, span: Duration) {
+        if span.as_ticks() <= 0 {
+            return;
+        }
+        for track in &mut self.tracks {
+            if track.locked {
+                continue;
+            }
+            for clip in &mut track.clips {
+                if clip.start >= end {
+                    clip.start -= span;
+                }
+            }
+        }
+    }
+}
+
+/// Insert and overwrite land on the in–out range when both marks are set.
+#[must_use]
+pub fn marked_place(
+    start: Time,
+    duration: Duration,
+    marks: Option<(Time, Time)>,
+) -> (Time, Duration) {
+    let Some((mark_in, mark_out)) = marks else {
+        return (start, duration);
+    };
+    let span = mark_out - mark_in;
+    if span.as_ticks() <= 0 {
+        return (start, duration);
+    }
+    let duration = if span.as_ticks() < duration.as_ticks() {
+        span
+    } else {
+        duration
+    };
+    (mark_in, duration)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -889,5 +1053,76 @@ mod tests {
             .unwrap();
         let clips = &tl.first_track(TrackKind::Video).unwrap().clips;
         assert_eq!(clips.len(), 3);
+    }
+
+    #[test]
+    fn mark_range_needs_both_marks_in_order() {
+        let mut tl = Timeline::default();
+        assert!(tl.mark_range().is_none());
+        tl.set_mark_in(Some(Time::from_seconds(1.0)));
+        assert!(tl.mark_range().is_none());
+        tl.set_mark_out(Some(Time::from_seconds(1.0)));
+        assert!(tl.mark_range().is_none());
+        tl.set_mark_out(Some(Time::from_seconds(0.5)));
+        assert!(tl.mark_range().is_none());
+        tl.set_mark_out(Some(Time::from_seconds(3.0)));
+        let (start, end) = tl.mark_range().unwrap();
+        assert_eq!(start, Time::from_seconds(1.0));
+        assert_eq!(end, Time::from_seconds(3.0));
+    }
+
+    #[test]
+    fn extract_closes_the_marked_span_and_lift_leaves_it() {
+        let mut lifted = Timeline::default();
+        let track = lifted.first_track(TrackKind::Video).unwrap().id;
+        lifted.add_clip(track, video(0.0, 4.0)).unwrap();
+        lifted.set_mark_in(Some(Time::from_seconds(1.0)));
+        lifted.set_mark_out(Some(Time::from_seconds(2.0)));
+        lifted.lift_marked().unwrap();
+        assert!(lifted.mark_range().is_none());
+        let clips = &lifted.first_track(TrackKind::Video).unwrap().clips;
+        assert_eq!(clips.len(), 2);
+        assert!((clips[0].duration.as_seconds() - 1.0).abs() < 1e-3);
+        assert!((clips[1].start.as_seconds() - 2.0).abs() < 1e-3);
+        assert!((clips[1].duration.as_seconds() - 2.0).abs() < 1e-3);
+
+        let mut extracted = Timeline::default();
+        let track = extracted.first_track(TrackKind::Video).unwrap().id;
+        extracted.add_clip(track, video(0.0, 4.0)).unwrap();
+        extracted.set_mark_in(Some(Time::from_seconds(1.0)));
+        extracted.set_mark_out(Some(Time::from_seconds(2.0)));
+        extracted.extract_marked().unwrap();
+        let clips = &extracted.first_track(TrackKind::Video).unwrap().clips;
+        assert_eq!(clips.len(), 2);
+        assert!((clips[0].end().as_seconds() - 1.0).abs() < 1e-3);
+        assert!((clips[1].start.as_seconds() - 1.0).abs() < 1e-3);
+        assert!((clips[1].duration.as_seconds() - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn insert_and_overwrite_use_the_marked_span() {
+        let (start, duration) = marked_place(
+            Time::ZERO,
+            Duration::from_seconds(8.0),
+            Some((Time::from_seconds(1.0), Time::from_seconds(2.5))),
+        );
+        assert_eq!(start, Time::from_seconds(1.0));
+        assert!((duration.as_seconds() - 1.5).abs() < 1e-6);
+
+        let mut tl = Timeline::default();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        tl.add_clip(track, video(0.0, 4.0)).unwrap();
+        tl.set_mark_in(Some(Time::from_seconds(1.0)));
+        tl.set_mark_out(Some(Time::from_seconds(2.0)));
+        tl.place_clip(track, video(0.0, 5.0), PlaceMode::Overwrite)
+            .unwrap();
+        let covering = tl
+            .first_track(TrackKind::Video)
+            .unwrap()
+            .clips
+            .iter()
+            .find(|clip| (clip.start.as_seconds() - 1.0).abs() < 1e-3)
+            .unwrap();
+        assert!((covering.duration.as_seconds() - 1.0).abs() < 1e-3);
     }
 }

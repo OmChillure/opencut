@@ -59,3 +59,18 @@ pub fn timeline_with_two_shots() -> (Timeline, ClipId, ClipId) {
     let b = tl.add_clip(track, video(4.0, 4.0)).unwrap();
     (tl, a, b)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_shot_fixture_is_four_seconds_each() {
+        let (timeline, a, b) = timeline_with_two_shots();
+        let (_, left) = timeline.find_clip(a).unwrap();
+        let (_, right) = timeline.find_clip(b).unwrap();
+        assert!((left.duration.as_seconds() - 4.0).abs() < 1e-6);
+        assert!((right.start.as_seconds() - 4.0).abs() < 1e-6);
+        assert_ne!(left.media_id, right.media_id);
+    }
+}

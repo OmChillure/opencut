@@ -7,17 +7,18 @@ mod project;
 mod undo;
 
 pub use caption::{caption_motion, caption_reveal, dress_cues, look_for, shot_is_face};
-pub use edit::PlaceMode;
+pub use edit::{PlaceMode, marked_place};
 pub use ids::{ClipId, GroupId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
 pub use lut::{CubeLut, canonical_color, cube_text, ffmpeg_color, parse_cube};
 pub use model::{
     AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionEffect, CaptionFont, CaptionMood,
     CaptionPlace, CaptionRecipe, CaptionStyle, Clip, ClipKind, ClipLook, Crop, CurvePoint, Curves,
-    Ease, EditPlan, EditSlot, FrameCard, Fx, Generator, Grade, Graphic, GraphicKind, LineLook, Lut,
-    Marker, MaskShape, Mix, SpeedKey, Timeline, Track, TrackKind, Transform, TransitionKind,
+    DENOISE_NF_DB, DENOISE_NR_DB, Ease, EditPlan, EditSlot, FrameCard, Fx, Generator, Grade,
+    Graphic, GraphicKind, LineLook, Lut, Marker, MaskShape, Mix, SpeedKey, Timeline, Track,
+    TrackKind, Transform, TransitionKind, denoise_curve, denoise_sample,
 };
 pub use project::Project;
-pub use undo::{Edit, UndoEntry, UndoStack};
+pub use undo::{UndoEntry, UndoStack};
 
 pub use oc_time::{Duration, FrameRate, Time};
 
@@ -89,6 +90,47 @@ mod tests {
         let joined = tl.find_clip(id).unwrap().1;
         assert!((joined.duration.as_seconds() - 4.0).abs() < 1e-6);
         assert_eq!(tl.first_track(TrackKind::Video).unwrap().clips.len(), 1);
+    }
+
+    #[test]
+    fn film_grain_uses_the_export_noise_amount() {
+        let film = Fx::film();
+        assert!((film.noise_alls() - 5.04).abs() < 0.01);
+        assert!((film.grain_overlay() - 0.126).abs() < 0.001);
+        assert_eq!(Fx::default().noise_alls(), 0.0);
+        assert_eq!(
+            Fx {
+                grain: 0.01,
+                ..Fx::default()
+            }
+            .grain_overlay(),
+            0.0
+        );
+        assert!(
+            (Fx {
+                grain: 2.0,
+                ..Fx::default()
+            }
+            .noise_alls()
+                - 40.0)
+                .abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn denoise_pulls_the_floor_down_by_twelve_db() {
+        let floor = 10f32.powf(DENOISE_NF_DB / 20.0);
+        let cut = 10f32.powf(-DENOISE_NR_DB / 20.0);
+        let quiet = floor * 0.5;
+        let gain = cut + (1.0 - cut) * 0.5;
+        assert!((denoise_sample(quiet) - quiet * gain).abs() < 1e-5);
+        assert!((denoise_sample(0.5) - 0.5).abs() < 1e-5);
+        assert!(denoise_sample(quiet).abs() < quiet.abs());
+        let curve = denoise_curve(3);
+        assert_eq!(curve.len(), 3);
+        assert!((curve[0] - denoise_sample(-1.0)).abs() < 1e-5);
+        assert!((curve[2] - denoise_sample(1.0)).abs() < 1e-5);
     }
 
     #[test]

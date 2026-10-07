@@ -46,3 +46,18 @@ id_ty!(MediaId);
 id_ty!(GroupId);
 id_ty!(LinkId);
 id_ty!(MarkerId);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_roundtrip_keeps_the_same_value() {
+        let raw = Uuid::nil();
+        let id = ClipId::from_uuid(raw);
+        assert_eq!(id.as_uuid(), raw);
+        assert_eq!(id.to_string(), raw.to_string());
+        let back: ClipId = serde_json::from_str(&serde_json::to_string(&id).unwrap()).unwrap();
+        assert_eq!(back, id);
+    }
+}

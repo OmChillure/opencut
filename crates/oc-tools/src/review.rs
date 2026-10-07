@@ -153,6 +153,9 @@ pub fn review_with(
     for stack in stacked_talk(&videos, speech) {
         issues.push(stack);
     }
+    for jump in grade_jumps(&videos) {
+        issues.push(jump);
+    }
     let mut text = String::from("Cut review:\n");
     for line in &lines {
         text.push_str(line);
@@ -276,6 +279,37 @@ fn reversed(a: &str, b: &str) -> bool {
         (a, b),
         ("l2r", "r2l") | ("r2l", "l2r") | ("toward", "away") | ("away", "toward")
     )
+}
+
+fn grade_jumps(videos: &[&Clip]) -> Vec<String> {
+    let mut ordered: Vec<&Clip> = videos.to_vec();
+    ordered.sort_by(|a, b| a.start.cmp(&b.start));
+    let mut notes = Vec::new();
+    for pair in ordered.windows(2) {
+        let gap = pair[1].start.as_seconds() - pair[0].end().as_seconds();
+        if gap > 0.25 || gap < -0.35 {
+            continue;
+        }
+        let left = &pair[0].look.grade;
+        let right = &pair[1].look.grade;
+        let delta = (left.exposure - right.exposure)
+            .abs()
+            .max((left.temperature - right.temperature).abs())
+            .max((left.contrast - right.contrast).abs())
+            .max((left.saturation - right.saturation).abs());
+        if !delta.is_finite() || delta < 0.22 {
+            continue;
+        }
+        notes.push(format!(
+            "grade jumps at {:.1}s: exposure {:.2} then {:.2}, temperature {:.2} then {:.2}",
+            pair[1].start.as_seconds(),
+            left.exposure,
+            right.exposure,
+            left.temperature,
+            right.temperature
+        ));
+    }
+    notes
 }
 
 fn video_clips(timeline: &Timeline) -> Vec<&Clip> {
@@ -747,6 +781,43 @@ mod tests {
         ];
         let review = review_cut(&tl, &speech, "cut this");
         assert!(review.text.contains("stacked"), "{}", review.text);
+    }
+
+    #[test]
+    fn a_grade_jump_on_a_join_is_sent_back() {
+        let media = MediaId::new();
+        let mut joined = video_clip(media, 3.0, 3.0, 3.0);
+        joined.look.grade.exposure = 0.4;
+        let review = review_cut(
+            &tl_with(vec![video_clip(media, 0.0, 3.0, 0.0), joined]),
+            &[],
+            "cut this",
+        );
+        assert!(review.text.contains("grade jumps"), "{}", review.text);
+        let mut apart = video_clip(media, 8.0, 3.0, 3.0);
+        apart.look.grade.exposure = 0.4;
+        let separated = review_cut(
+            &tl_with(vec![video_clip(media, 0.0, 3.0, 0.0), apart]),
+            &[],
+            "cut this",
+        );
+        assert!(
+            !separated.text.contains("grade jumps"),
+            "{}",
+            separated.text
+        );
+        let mut mono = video_clip(media, 3.0, 3.0, 3.0);
+        mono.look.grade.lut = oc_timeline::Lut::Mono;
+        let look_change = review_cut(
+            &tl_with(vec![video_clip(media, 0.0, 3.0, 0.0), mono]),
+            &[],
+            "cut this",
+        );
+        assert!(
+            !look_change.text.contains("grade jumps"),
+            "{}",
+            look_change.text
+        );
     }
 
     #[test]

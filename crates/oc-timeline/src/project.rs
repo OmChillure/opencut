@@ -19,3 +19,17 @@ impl Project {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_project_starts_on_a_landscape_timeline() {
+        let project = Project::new("Reel");
+        assert_eq!(project.name, "Reel");
+        assert_eq!(project.timeline.width, 1920);
+        assert_eq!(project.timeline.height, 1080);
+        assert_eq!(project.timeline.tracks.len(), 3);
+    }
+}

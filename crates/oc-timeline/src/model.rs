@@ -410,51 +410,6 @@ impl Grade {
     }
 
     #[must_use]
-    pub fn interview() -> Self {
-        Self {
-            exposure: 0.03,
-            contrast: 0.06,
-            saturation: 0.02,
-            temperature: 0.0,
-            ..Self::default()
-        }
-    }
-
-    #[must_use]
-    pub fn ad() -> Self {
-        Self {
-            exposure: 0.06,
-            contrast: 0.2,
-            saturation: 0.08,
-            temperature: -0.02,
-            gain: 0.06,
-            lut: Lut::TealOrange,
-            ..Self::default()
-        }
-    }
-
-    #[must_use]
-    pub fn vlog() -> Self {
-        Self {
-            exposure: 0.05,
-            contrast: 0.1,
-            saturation: 0.1,
-            temperature: 0.04,
-            lut: Lut::Warm,
-            ..Self::default()
-        }
-    }
-
-    #[must_use]
-    pub fn documentary() -> Self {
-        Self {
-            contrast: 0.05,
-            saturation: -0.04,
-            ..Self::default()
-        }
-    }
-
-    #[must_use]
     pub fn is_identity(self) -> bool {
         self.exposure.abs() < 1e-4
             && self.contrast.abs() < 1e-4
@@ -491,6 +446,22 @@ impl Fx {
     #[must_use]
     pub fn is_identity(self) -> bool {
         self.blur < 1e-4 && self.grain < 1e-4 && self.vignette < 1e-4
+    }
+
+    /// ffmpeg `noise=alls`. Zero when grain is off, otherwise `grain * 28` clamped to 1..40.
+    #[must_use]
+    pub fn noise_alls(self) -> f32 {
+        if self.grain <= 0.02 {
+            0.0
+        } else {
+            (self.grain * 28.0).clamp(1.0, 40.0)
+        }
+    }
+
+    /// Monitor overlay opacity. The export filter's ceiling is 40.
+    #[must_use]
+    pub fn grain_overlay(self) -> f32 {
+        self.noise_alls() / 40.0
     }
 }
 
@@ -755,6 +726,37 @@ pub enum Generator {
 
 fn default_color() -> String {
     "#000000".into()
+}
+
+/// ffmpeg `afftdn=nr`. The monitor expander uses the same reduction.
+pub const DENOISE_NR_DB: f32 = 12.0;
+/// ffmpeg `afftdn=nf`. Samples quieter than this are pulled down.
+pub const DENOISE_NF_DB: f32 = -25.0;
+
+/// One sample through the monitor's stand-in for `afftdn=nr=12:nf=-25`.
+#[must_use]
+pub fn denoise_sample(sample: f32) -> f32 {
+    let floor = 10f32.powf(DENOISE_NF_DB / 20.0);
+    let cut = 10f32.powf(-DENOISE_NR_DB / 20.0);
+    let level = sample.abs();
+    if level >= floor || floor <= f32::EPSILON {
+        return sample;
+    }
+    let blend = level / floor;
+    let gain = cut + (1.0 - cut) * blend;
+    sample * gain
+}
+
+/// WaveShaper curve over -1..1. `steps` is at least 2.
+#[must_use]
+pub fn denoise_curve(steps: usize) -> Vec<f32> {
+    let steps = steps.max(2);
+    (0..steps)
+        .map(|index| {
+            let x = (index as f32 / (steps - 1) as f32) * 2.0 - 1.0;
+            denoise_sample(x)
+        })
+        .collect()
 }
 
 /// Loudness, noise, EQ, and compression.
@@ -2057,10 +2059,6 @@ impl Timeline {
 
     pub fn first_track(&self, kind: TrackKind) -> Option<&Track> {
         self.tracks.iter().find(|t| t.kind == kind)
-    }
-
-    pub fn first_track_mut(&mut self, kind: TrackKind) -> Option<&mut Track> {
-        self.tracks.iter_mut().find(|t| t.kind == kind)
     }
 
     pub fn replace_caption_cues(

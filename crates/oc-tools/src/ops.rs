@@ -106,6 +106,12 @@ impl ExportPreset {
             Self::Square1080 => "square-1080",
         }
     }
+
+    /// `{project}-{label}.mp4`. The worker writes this name and the API reads it.
+    #[must_use]
+    pub fn file_name(self, project_id: impl std::fmt::Display) -> String {
+        format!("{project_id}-{}.mp4", self.label())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -249,6 +255,10 @@ pub enum Op {
     SetMarkOut {
         time: Option<Time>,
     },
+    /// Ripple-delete the in–out range.
+    ExtractMarked,
+    /// Delete the in–out range and leave the hole.
+    LiftMarked,
     PlaceMedia {
         media_id: MediaId,
         track_id: Option<TrackId>,
@@ -691,6 +701,14 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
         Op::SetMarkOut { time } => {
             timeline.set_mark_out(*time);
             "set mark out".into()
+        }
+        Op::ExtractMarked => {
+            let span = timeline.extract_marked()?;
+            format!("extract {:.2}s", span.as_seconds())
+        }
+        Op::LiftMarked => {
+            let span = timeline.lift_marked()?;
+            format!("lift {:.2}s", span.as_seconds())
         }
         Op::PlaceMedia {
             media_id,

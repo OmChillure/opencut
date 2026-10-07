@@ -127,12 +127,25 @@ pub fn mcp_tools() -> Vec<McpTool> {
         McpTool {
             name: "see".into(),
             description:
-                "Grab one frame of a video at any source time, in seconds. You see the JPEG. \
-                 Call this whenever you need to look during the edit."
+                "Grab one frame of a video at one source time, in seconds. You see the JPEG. \
+                 Use watch for a range. Use see when you already know the moment."
                     .into(),
             input_schema: object(&[
                 ("media_id", str_prop("Media id from list_bin"), true),
                 ("at", num_prop("Source time in seconds"), true),
+            ]),
+        },
+        McpTool {
+            name: "watch".into(),
+            description:
+                "Look across a source range. You see three frames (in, middle, out) plus the \
+                 words, the shot labels, and the filler or silence inside that range. \
+                 Call this before you cut or grade a span. start and end are source seconds."
+                    .into(),
+            input_schema: object(&[
+                ("media_id", str_prop("Media id from list_bin"), true),
+                ("start", num_prop("Range start in source seconds"), true),
+                ("end", num_prop("Range end in source seconds"), true),
             ]),
         },
         McpTool {
@@ -1795,9 +1808,21 @@ mod parse_tests {
             .into_iter()
             .find(|tool| tool.name == "add_motion")
             .expect("add_motion");
-        assert!(motion.description.contains("kinetic-slam"), "{}", motion.description);
-        assert!(motion.description.contains("chart-bars"), "{}", motion.description);
-        assert!(motion.description.contains("design page"), "{}", motion.description);
+        assert!(
+            motion.description.contains("kinetic-slam"),
+            "{}",
+            motion.description
+        );
+        assert!(
+            motion.description.contains("chart-bars"),
+            "{}",
+            motion.description
+        );
+        assert!(
+            motion.description.contains("design page"),
+            "{}",
+            motion.description
+        );
         assert!(
             !mcp_tools()
                 .iter()

@@ -8,12 +8,6 @@ pub struct UndoEntry {
     pub timeline: Timeline,
 }
 
-/// Snapshot of the timeline taken before an edit.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Edit {
-    pub timeline: Timeline,
-}
-
 /// Named command stack, same idea as Kdenlive's Undo History.
 /// Capped so a long session does not keep every timeline forever.
 const CAP: usize = 40;
@@ -98,16 +92,6 @@ impl UndoStack {
     }
 
     #[must_use]
-    pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
-    }
-
-    #[must_use]
-    pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
-    }
-
-    #[must_use]
     pub fn depth(&self) -> usize {
         self.undo.len()
     }
@@ -127,5 +111,28 @@ impl UndoStack {
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_keeps_the_newest_forty_and_can_be_cleared() {
+        let mut stack = UndoStack::new();
+        let timeline = Timeline::default();
+        for i in 0..45 {
+            stack.checkpoint_named(timeline.clone(), format!("{i}"));
+        }
+        assert_eq!(stack.depth(), 40);
+        assert_eq!(stack.labels()[0], "5");
+        assert_eq!(stack.labels().last().map(String::as_str), Some("44"));
+        let mut current = timeline.clone();
+        assert!(stack.undo(&mut current));
+        assert_eq!(stack.redo_labels(), vec!["44".to_string()]);
+        stack.clear();
+        assert_eq!(stack.depth(), 0);
+        assert!(stack.redo_labels().is_empty());
     }
 }
