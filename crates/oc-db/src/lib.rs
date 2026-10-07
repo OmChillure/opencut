@@ -1,6 +1,7 @@
+mod pass;
 mod storage;
 
-pub use storage::{R2, R2Config, StorageError};
+pub use storage::{ObjectStat, R2, R2Config, StorageError};
 
 use chrono::{DateTime, Utc};
 use oc_timeline::{Project, ProjectId, Timeline};
@@ -27,6 +28,8 @@ pub enum DbError {
     Json(#[from] serde_json::Error),
     #[error("bad user")]
     BadUser,
+    #[error("wrong password")]
+    WrongPassword,
 }
 
 impl DbError {
@@ -120,6 +123,9 @@ pub async fn migrate(pool: &Db) -> Result<(), DbError> {
         .execute(pool)
         .await?;
     sqlx::raw_sql(include_str!("../migrations/0004_projects_owner.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!("../migrations/0005_sessions.sql"))
         .execute(pool)
         .await?;
     Ok(())
@@ -356,6 +362,29 @@ pub fn is_r2_object_key(key: &str) -> bool {
     !key.is_empty() && !key.starts_with("workspace/") && !key.starts_with("local/")
 }
 
+/// Last path segment of an object key, safe to join onto a temp directory.
+/// `..` and an empty name become `media.bin` so a key cannot escape that directory.
+#[must_use]
+pub fn object_file_name(key: &str) -> String {
+    let raw = key.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let raw = raw.trim_matches('.');
+    if raw.is_empty() || raw.contains('\0') {
+        return "media.bin".into();
+    }
+    let mut out = String::new();
+    for ch in raw.chars().take(120) {
+        if ch.is_control() {
+            continue;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        "media.bin".into()
+    } else {
+        out
+    }
+}
+
 pub async fn list_media(pool: &Db, project_id: Uuid) -> Result<Vec<MediaRow>, DbError> {
     let rows = query_as::<MediaRow>(
         "select id, project_id, r2_key, filename, content_type, byte_size, duration_ticks, width, height, status, created_at
@@ -411,22 +440,58 @@ pub async fn enqueue_job(
     Ok(id)
 }
 
-pub async fn claim_job(pool: &Db) -> Result<Option<JobRow>, DbError> {
-    let row = query_as::<JobRow>(
-        "update jobs
+/// A live worker updates `updated_at` this often. A crash stops the updates.
+pub const JOB_HEARTBEAT_SECS: u64 = 30;
+/// Reclaim a running job after this many seconds without a heartbeat.
+pub const JOB_STALE_AFTER_SECS: u64 = 120;
+
+const CLAIM_JOB_SQL: &str = "update jobs
          set status = 'running', updated_at = now()
          where id = (
             select id from jobs
             where status = 'queued'
+               or (status = 'running' and updated_at < now() - interval '120 seconds')
             order by created_at
             for update skip locked
             limit 1
          )
-         returning id, kind, status, payload, error",
-    )
-    .fetch_optional(pool)
-    .await?;
+         returning id, kind, status, payload, error";
+
+const LATEST_EXPORT_JOB: &str = "select created_at from jobs
+         where kind = 'export'
+           and payload->>'project_id' = $1
+           and payload->>'preset' = $2
+         order by created_at desc
+         limit 1";
+
+pub async fn claim_job(pool: &Db) -> Result<Option<JobRow>, DbError> {
+    let row = query_as::<JobRow>(CLAIM_JOB_SQL)
+        .fetch_optional(pool)
+        .await?;
     Ok(row)
+}
+
+/// Keep a running job from being claimed by another worker.
+pub async fn touch_job(pool: &Db, id: Uuid) -> Result<(), DbError> {
+    query("update jobs set updated_at = now() where id = $1 and status = 'running'")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// When the newest export job for this preset was queued, in unix milliseconds.
+pub async fn latest_export_job_ms(
+    pool: &Db,
+    project_id: Uuid,
+    preset: &str,
+) -> Result<Option<i64>, DbError> {
+    let row = query_as::<(DateTime<Utc>,)>(LATEST_EXPORT_JOB)
+        .bind(project_id.to_string())
+        .bind(preset)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(created,)| created.timestamp_millis()))
 }
 
 pub async fn job_finished(pool: &Db, id: Uuid) -> Result<bool, DbError> {
@@ -617,6 +682,67 @@ pub struct ChatMessageInput {
     pub tool_args: String,
     #[serde(default)]
     pub tool_result: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PasswordRow {
+    password_hash: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct EmailRow {
+    email: String,
+}
+
+/// First sign-in claims the email. A later sign-in must match that password.
+/// Returns `(email, token)`.
+pub async fn open_session(
+    pool: &Db,
+    email: &str,
+    password: &str,
+) -> Result<(String, String), DbError> {
+    let email = normalize_user_email(email)?;
+    if password.chars().count() < 4 || password.len() > 200 {
+        return Err(DbError::BadUser);
+    }
+    let salt = *Uuid::new_v4().as_bytes();
+    let hash = pass::hash_password(password, &salt, pass::PBKDF2_ITERS);
+    query(
+        "insert into users (email, password_hash) values ($1, $2)
+         on conflict (email) do nothing",
+    )
+    .bind(&email)
+    .bind(&hash)
+    .execute(pool)
+    .await?;
+    let stored = query_as::<PasswordRow>("select password_hash from users where email = $1")
+        .bind(&email)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    if !pass::password_matches(password, &stored.password_hash) {
+        return Err(DbError::WrongPassword);
+    }
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    query("insert into sessions (token, email) values ($1, $2)")
+        .bind(&token)
+        .bind(&email)
+        .execute(pool)
+        .await?;
+    Ok((email, token))
+}
+
+pub async fn email_for_session(pool: &Db, token: &str) -> Result<String, DbError> {
+    let token = token.trim();
+    if token.len() < 16 || token.len() > 200 {
+        return Err(DbError::NotFound);
+    }
+    query_as::<EmailRow>("select email from sessions where token = $1")
+        .bind(token)
+        .fetch_optional(pool)
+        .await?
+        .map(|row| row.email)
+        .ok_or(DbError::NotFound)
 }
 
 pub fn normalize_user_email(raw: &str) -> Result<String, DbError> {
@@ -855,6 +981,31 @@ async fn chat_for_user(
 #[cfg(test)]
 mod tests {
     use super::prefer_session_pooler;
+
+    #[test]
+    fn an_object_name_cannot_leave_its_temp_directory() {
+        assert_eq!(super::object_file_name("raw/p/m/clip.mp4"), "clip.mp4");
+        assert_eq!(super::object_file_name("raw/p/m/.."), "media.bin");
+        assert_eq!(super::object_file_name("raw/p/m/"), "media.bin");
+        assert_eq!(super::object_file_name(".."), "media.bin");
+        assert_eq!(
+            super::object_file_name("raw/p/m/my take.mp4"),
+            "my take.mp4"
+        );
+    }
+
+    #[test]
+    fn claim_reclaims_a_job_that_stopped_heartbeating() {
+        assert!(super::CLAIM_JOB_SQL.contains("status = 'queued'"));
+        assert!(super::CLAIM_JOB_SQL.contains("status = 'running'"));
+        assert!(super::CLAIM_JOB_SQL.contains("interval '120 seconds'"));
+        assert!(super::CLAIM_JOB_SQL.contains("for update skip locked"));
+        assert_eq!(super::JOB_STALE_AFTER_SECS, 120);
+        assert!(super::JOB_HEARTBEAT_SECS * 3 < super::JOB_STALE_AFTER_SECS);
+        assert!(super::LATEST_EXPORT_JOB.contains("kind = 'export'"));
+        assert!(super::LATEST_EXPORT_JOB.contains("payload->>'project_id'"));
+        assert!(super::LATEST_EXPORT_JOB.contains("payload->>'preset'"));
+    }
 
     #[test]
     fn rewrites_supabase_transaction_port() {

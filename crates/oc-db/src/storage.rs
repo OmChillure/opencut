@@ -34,6 +34,12 @@ fn explain_store(err: &aws_sdk_s3::Error) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectStat {
+    pub bytes: u64,
+    pub modified_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct R2 {
     client: Client,
@@ -59,6 +65,23 @@ impl R2Config {
             endpoint: std::env::var("R2_ENDPOINT").ok().filter(|s| !s.is_empty()),
         })
     }
+}
+
+fn object_missing(
+    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_object::HeadObjectError>,
+) -> bool {
+    use aws_sdk_s3::error::SdkError;
+    use aws_sdk_s3::operation::head_object::HeadObjectError;
+
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+
+    let SdkError::ServiceError(service) = err else {
+        return false;
+    };
+    if matches!(service.err(), HeadObjectError::NotFound(_)) {
+        return true;
+    }
+    service.raw().status().as_u16() == 404 || service.err().code() == Some("NoSuchKey")
 }
 
 fn env(key: &'static str) -> Result<String, StorageError> {
@@ -134,6 +157,30 @@ impl R2 {
         Ok(req.uri().to_string())
     }
 
+    /// `Ok(None)` when the key is not in the bucket.
+    pub async fn stat_object(&self, key: &str) -> Result<Option<ObjectStat>, StorageError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(out) => {
+                let modified_ms = out
+                    .last_modified()
+                    .and_then(|stamp| stamp.to_millis().ok())
+                    .filter(|ms| *ms >= 0)
+                    .unwrap_or(0) as u64;
+                let bytes = out.content_length().unwrap_or(0).max(0) as u64;
+                Ok(Some(ObjectStat { bytes, modified_ms }))
+            }
+            Err(err) if object_missing(&err) => Ok(None),
+            Err(err) => Err(StorageError::from(aws_sdk_s3::Error::from(err))),
+        }
+    }
+
     pub async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError> {
         let out = self
             .client
@@ -198,11 +245,7 @@ impl R2 {
         let Some(upload_id) = created.upload_id().map(str::to_string) else {
             return Err(StorageError::Sdk("R2 did not return an upload id".into()));
         };
-        tracing::info!(
-            key,
-            parts = chunks.len(),
-            "multipart upload"
-        );
+        tracing::info!(key, parts = chunks.len(), "multipart upload");
         let uploaded = self.send_parts(key, &upload_id, chunks).await;
         let parts = match uploaded {
             Ok(parts) => parts,
@@ -278,9 +321,9 @@ impl R2 {
                         .send()
                         .await
                         .map_err(aws_sdk_s3::Error::from)?;
-                    let etag = out.e_tag().ok_or_else(|| {
-                        StorageError::Sdk("R2 part returned no etag".into())
-                    })?;
+                    let etag = out
+                        .e_tag()
+                        .ok_or_else(|| StorageError::Sdk("R2 part returned no etag".into()))?;
                     Ok::<_, StorageError>(
                         CompletedPart::builder()
                             .part_number(part_number)
