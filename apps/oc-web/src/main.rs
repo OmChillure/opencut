@@ -140,6 +140,24 @@ struct HeldImport {
 struct CtxHeld(Signal<Vec<HeldImport>>);
 
 #[derive(Clone, Copy)]
+struct CtxUploading(Signal<Vec<String>>);
+
+fn begin_upload(mut uploading: Signal<Vec<String>>, id: &str) {
+    let mut list = uploading.write();
+    if !list.iter().any(|row| row == id) {
+        list.push(id.to_string());
+    }
+}
+
+fn note_upload(mut uploading: Signal<Vec<String>>, id: &str, name: &str, result: Result<(), String>) {
+    uploading.write().retain(|row| row != id);
+    match result {
+        Ok(()) => show_toast().success(format!("{name} uploaded")),
+        Err(err) => show_toast().error(format!("{name} did not upload: {err}")),
+    }
+}
+
+#[derive(Clone, Copy)]
 struct CtxProject(Signal<String>);
 #[derive(Clone, Copy)]
 struct CtxTargetTrack(Signal<String>);
@@ -288,6 +306,7 @@ fn Workspace(id: String) -> Element {
     let mut undo = use_signal(oc_core::UndoStack::new);
     let selected_clip = use_signal(|| None::<String>);
     let held = use_signal(Vec::<HeldImport>::new);
+    let uploading = use_signal(Vec::<String>::new);
     let clock = Clock {
         current,
         duration,
@@ -310,6 +329,7 @@ fn Workspace(id: String) -> Element {
     use_context_provider(|| CtxActive(active));
     use_context_provider(|| CtxProject(project_id));
     use_context_provider(|| CtxHeld(held));
+    use_context_provider(|| CtxUploading(uploading));
     use_context_provider(|| clock);
     use_context_provider(|| edit_mode);
     use_context_provider(|| edit_tool);
@@ -581,6 +601,7 @@ fn Header(name: Signal<String>) -> Element {
     let project_id = use_context::<CtxProject>().0;
     let save = use_context::<WorkspaceSave>();
     let held = use_context::<CtxHeld>().0;
+    let uploading = use_context::<CtxUploading>().0;
     let unsaved = !held.read().is_empty();
     rsx! {
         header { class: "header",
@@ -614,7 +635,7 @@ fn Header(name: Signal<String>) -> Element {
                     class: if unsaved { "btn btn-primary" } else { "btn btn-ghost" },
                     disabled: !unsaved,
                     title: "Send imported files that have not reached R2",
-                    onclick: move |_| save_held_imports(held, save),
+                    onclick: move |_| save_held_imports(held, uploading, save),
                     "Retry upload"
                 }
                 button {
@@ -1058,6 +1079,7 @@ fn MediaPanel() -> Element {
     let edit_mode = use_context::<Signal<EditMode>>();
     let mut drag = use_context::<Signal<Option<DragSession>>>();
     let mut held = use_context::<CtxHeld>().0;
+    let mut uploading = use_context::<CtxUploading>().0;
     let save = use_context::<WorkspaceSave>();
 
     rsx! {
@@ -1093,25 +1115,20 @@ fn MediaPanel() -> Element {
                                         content_type: ctype.clone(),
                                         bytes: bytes.to_vec(),
                                     });
+                                    begin_upload(uploading, &id);
                                     let pid = save.project_id.peek().clone();
-                                    match crate::api::store_imported(
+                                    let result = crate::api::store_imported(
                                         &pid,
                                         &id,
                                         &name,
                                         &ctype,
                                         bytes.to_vec(),
                                     )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            held.write().retain(|row| row.id != id);
-                                        }
-                                        Err(err) => {
-                                            show_toast().error(format!(
-                                                "{name} did not reach R2: {err}"
-                                            ));
-                                        }
+                                    .await;
+                                    if result.is_ok() {
+                                        held.write().retain(|row| row.id != id);
                                     }
+                                    note_upload(uploading, &id, &name, result);
                                 }
                             });
                         },
@@ -1126,13 +1143,25 @@ fn MediaPanel() -> Element {
                         let add_url = url.clone();
                         let id = item.id.clone();
                         let selected = active.read().as_deref() == Some(url.as_str());
+                        let uploading_now = uploading.read().iter().any(|row| row == &id);
+                        let tile_class = if uploading_now {
+                            "media-tile uploading"
+                        } else if selected {
+                            "media-tile on"
+                        } else {
+                            "media-tile"
+                        };
                         let kind = item.kind;
                         let name = item.name.clone();
                         let drag_item = item.clone();
                         rsx! {
                             div {
-                                class: if selected { "media-tile on" } else { "media-tile" },
-                                title: "Drag onto a track, or press + at the playhead",
+                                class: "{tile_class}",
+                                title: if uploading_now {
+                                    "Uploading..."
+                                } else {
+                                    "Drag onto a track, or press + at the playhead"
+                                },
                                 button {
                                     class: "media-add",
                                     title: "Add to timeline",
@@ -1232,6 +1261,9 @@ fn MediaPanel() -> Element {
                                     }
                                     span { class: "media-name", "{name}" }
                                 }
+                                if uploading_now {
+                                    div { class: "media-upload", "Uploading..." }
+                                }
                                 button {
                                     class: "media-x",
                                     title: "Remove",
@@ -1239,6 +1271,8 @@ fn MediaPanel() -> Element {
                                         let remove_id = id.clone();
                                         let remove_url = url.clone();
                                         library.write().retain(|item| item.id != remove_id);
+                                        held.write().retain(|row| row.id != remove_id);
+                                        uploading.write().retain(|row| row != &remove_id);
                                         for track in tracks.write().iter_mut() {
                                             track.clips.retain(|clip| clip.media_id != remove_id);
                                         }
@@ -1478,6 +1512,7 @@ fn Timeline() -> Element {
     let mut tl_h = use_context::<CtxTimelineH>().0;
     let mut tl_drag = use_context::<Signal<Option<(f64, f64)>>>();
     let save = use_context::<WorkspaceSave>();
+    let uploading = use_context::<CtxUploading>().0;
     let mut view_h = use_signal(|| 280.0_f64);
     let mut view_w = use_signal(|| 800.0_f64);
     let mut trim = use_signal(|| None::<(String, bool)>);
@@ -1992,6 +2027,7 @@ fn Timeline() -> Element {
                                                 let is_audio = media_kind == MediaKind::Audio
                                                     || track.kind == TrackKindUi::Audio;
                                                 let selected = selected_clip.read().as_deref() == Some(clip.id.as_str());
+                                                let clip_uploading = uploading.read().iter().any(|row| row == &clip.media_id);
                                                 let lifted = lifted_id.as_deref() == Some(clip.id.as_str());
                                                 let mix = !clip.transition.is_empty()
                                                     && clip.transition != "cut";
@@ -2011,6 +2047,9 @@ fn Timeline() -> Element {
                                                     }
                                                     if !clip.graphic.is_empty() {
                                                         c.push_str(" gfx-clip");
+                                                    }
+                                                    if clip_uploading {
+                                                        c.push_str(" uploading");
                                                     }
                                                     c
                                                 };
@@ -2071,7 +2110,10 @@ fn Timeline() -> Element {
                                                         } else {
                                                             div { class: "nle-strip" }
                                                         }
-                                                        span { class: "nle-name", "{name}" }
+                                                        span {
+                                                            class: "nle-name",
+                                                            if clip_uploading { "Uploading..." } else { "{name}" }
+                                                        }
                                                         if selected {
                                                             div {
                                                                 class: "nle-trim in",
@@ -2152,35 +2194,31 @@ fn confirm_leave(held: Signal<Vec<HeldImport>>) -> bool {
         .unwrap_or(false)
 }
 
-fn save_held_imports(mut held: Signal<Vec<HeldImport>>, save: WorkspaceSave) {
+fn save_held_imports(
+    mut held: Signal<Vec<HeldImport>>,
+    uploading: Signal<Vec<String>>,
+    save: WorkspaceSave,
+) {
     let batch = held.peek().clone();
     if batch.is_empty() {
         return;
     }
     let pid = page_project_id().unwrap_or_else(|| save.project_id.peek().clone());
     spawn(async move {
-        let mut failed = 0usize;
         for file in batch {
-            match crate::api::store_imported(
+            begin_upload(uploading, &file.id);
+            let result = crate::api::store_imported(
                 &pid,
                 &file.id,
                 &file.name,
                 &file.content_type,
                 file.bytes,
             )
-            .await
-            {
-                Ok(()) => {
-                    held.write().retain(|row| row.id != file.id);
-                }
-                Err(err) => {
-                    failed += 1;
-                    show_toast().error(format!("{} did not reach R2: {err}", file.name));
-                }
+            .await;
+            if result.is_ok() {
+                held.write().retain(|row| row.id != file.id);
             }
-        }
-        if failed == 0 {
-            show_toast().success("Imported files are on R2.");
+            note_upload(uploading, &file.id, &file.name, result);
         }
     });
 }
@@ -3707,6 +3745,7 @@ fn send_prompt(
     let library = use_context::<Signal<Vec<MediaItem>>>();
     let active = use_context::<CtxActive>().0;
     let mut held = use_context::<CtxHeld>().0;
+    let uploading = use_context::<CtxUploading>().0;
     let batch = held.peek().clone();
     let opening = persistable(&messages.read());
     let mut bound = chat_id.peek().clone();
@@ -3724,21 +3763,25 @@ fn send_prompt(
             if !api::chat_current(turn) {
                 break;
             }
-            match api::store_imported(&pid, &file.id, &file.name, &file.content_type, file.bytes)
-                .await
-            {
-                Ok(()) => {
-                    held.write().retain(|row| row.id != file.id);
-                }
-                Err(err) => {
-                    if api::chat_current(turn) {
-                        messages.write().push(ChatMsg::status(format!(
-                            "{} is not on R2 — {err}",
-                            file.name
-                        )));
-                    }
-                }
+            begin_upload(uploading, &file.id);
+            let result = api::store_imported(
+                &pid,
+                &file.id,
+                &file.name,
+                &file.content_type,
+                file.bytes,
+            )
+            .await;
+            if result.is_ok() {
+                held.write().retain(|row| row.id != file.id);
+            } else if api::chat_current(turn) {
+                let err = result.as_ref().err().map(String::as_str).unwrap_or("");
+                messages.write().push(ChatMsg::status(format!(
+                    "{} is not on R2 — {err}",
+                    file.name
+                )));
             }
+            note_upload(uploading, &file.id, &file.name, result);
         }
         if !api::chat_current(turn) {
             if api::chat_generation() == turn {
