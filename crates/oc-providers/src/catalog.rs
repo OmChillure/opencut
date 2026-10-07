@@ -125,3 +125,21 @@ pub fn catalog() -> Vec<ProviderStatus> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_names_parse_and_each_family_has_a_fallback() {
+        assert_eq!(ProviderId::parse("spacexai"), Some(ProviderId::Xai));
+        assert_eq!(ProviderId::parse("anthropic"), Some(ProviderId::Claude));
+        assert_eq!(ProviderId::parse("openai"), Some(ProviderId::Openai));
+        assert_eq!(ProviderId::parse("nope"), None);
+        for id in all_providers() {
+            assert_eq!(ProviderId::parse(id.as_str()), Some(id));
+            assert!(!id.fallback_models().is_empty());
+            assert!(!id.login_hint().is_empty());
+        }
+    }
+}

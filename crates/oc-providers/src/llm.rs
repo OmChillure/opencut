@@ -1,6 +1,6 @@
-//! AI providers. They receive MCP tools from `oc-tools` and return text or tool calls.
+//! Chat replies from a signed-in CLI. The editor does not call a vendor SDK.
 
-use oc_tools::{McpCall, McpTool};
+use oc_tools::McpCall;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -107,14 +107,26 @@ pub struct ChatTurn {
     pub content: String,
 }
 
-/// Any chat model the editor can use. Implement this; do not call vendors from tools.
-pub trait Llm {
-    fn name(&self) -> &'static str;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn complete(
-        &self,
-        system: &str,
-        turns: &[ChatTurn],
-        tools: &[McpTool],
-    ) -> impl std::future::Future<Output = Result<LlmReply, LlmError>> + Send;
+    #[test]
+    fn a_tool_event_keeps_its_name_and_status_through_json() {
+        let event = ChatEvent::tool(
+            "1",
+            "see",
+            serde_json::json!({"at": 1}),
+            Some("ok".into()),
+            "done",
+        );
+        assert_eq!(event.name(), "see");
+        assert_eq!(event.status_label(), "done");
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "tool");
+        let back: ChatEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back.name(), "see");
+        assert_eq!(back.status_label(), "done");
+        assert_eq!(ChatEvent::text("hi").name(), "");
+    }
 }

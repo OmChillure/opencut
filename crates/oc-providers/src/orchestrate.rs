@@ -137,51 +137,48 @@ async fn run_provider(
         && !std::path::Path::new(&bin).is_file()
         && !which(&bin);
     if acp_missing {
-        tracing::warn!(bin = %bin, "acp adapter not on PATH — print fallback");
-        return match id {
-            ProviderId::Claude => {
-                emit(
-                    events,
-                    ChatEvent::status("ACP adapter missing — `claude -p`"),
-                )
-                .await;
-                claude_print(prompt, frames).await
-            }
-            ProviderId::Openai => {
-                emit(
-                    events,
-                    ChatEvent::status("ACP adapter missing — `codex exec`"),
-                )
-                .await;
-                codex_print(prompt, frames).await
-            }
-            ProviderId::Xai => Err(LlmError::Message(format!("ACP adapter missing: {bin}"))),
-        };
+        let err = refuse_untoolable(id, None);
+        tracing::warn!(bin = %bin, "{err}");
+        emit(events, ChatEvent::status(err.to_string())).await;
+        return Err(err);
     }
     tracing::info!(bin = %bin, args = %args.join(" "), "acp launch");
     match spawn_acp(&bin, &args, model, prompt, mcp_servers, frames, events).await {
         Ok(text) => Ok(text),
-        Err(err) => match id {
-            ProviderId::Xai => Err(err),
-            ProviderId::Claude => {
-                tracing::warn!("{err}; falling back to `claude -p`");
-                emit(
-                    events,
-                    ChatEvent::status("ACP adapter missing — `claude -p`"),
-                )
-                .await;
-                claude_print(prompt, frames).await
-            }
-            ProviderId::Openai => {
-                tracing::warn!("{err}; falling back to `codex exec`");
-                emit(
-                    events,
-                    ChatEvent::status("ACP adapter missing — `codex exec`"),
-                )
-                .await;
-                codex_print(prompt, frames).await
-            }
-        },
+        Err(err) => {
+            let err = edit_failure(id, err);
+            tracing::warn!("{err}");
+            emit(events, ChatEvent::status(err.to_string())).await;
+            Err(err)
+        }
+    }
+}
+
+fn edit_failure(id: ProviderId, err: LlmError) -> LlmError {
+    match id {
+        ProviderId::Xai => err,
+        ProviderId::Claude | ProviderId::Openai => refuse_untoolable(id, Some(err.to_string())),
+    }
+}
+
+/// `claude -p` and `codex exec` return text only. They cannot call OpenCut tools.
+fn refuse_untoolable(id: ProviderId, detail: Option<String>) -> LlmError {
+    let hint = acp_missing_message(id);
+    match detail {
+        Some(detail) if !detail.is_empty() => LlmError::Message(format!("{detail}\n{hint}")),
+        _ => LlmError::Message(hint),
+    }
+}
+
+fn acp_missing_message(id: ProviderId) -> String {
+    match id {
+        ProviderId::Openai => "Codex cannot edit without codex-acp. Install codex-acp, set \
+             OPENCUT_CODEX_ACP to that binary, or set OPENCUT_ACP_NPX=1."
+            .into(),
+        ProviderId::Claude => "Claude cannot edit without claude-agent-acp. Install it, set \
+             OPENCUT_CLAUDE_ACP to that binary, or set OPENCUT_ACP_NPX=1."
+            .into(),
+        ProviderId::Xai => "ACP adapter missing.".into(),
     }
 }
 
@@ -236,7 +233,7 @@ fn claude_launch(model: &str) -> (String, Vec<String>) {
             vec!["-y".into(), "@agentclientprotocol/claude-agent-acp".into()],
         );
     }
-    // No adapter on PATH — run_provider falls through to `claude -p`.
+    // No adapter on PATH. Editing refuses this path instead of `claude -p`.
     ("claude-agent-acp".into(), acp_model_args(model))
 }
 
@@ -363,18 +360,9 @@ async fn emit(events: Option<&EventSink>, ev: ChatEvent) {
 
 /// One ACP process for a whole chat. Later turns send only the new text.
 pub struct DirectorSession {
-    inner: SessionInner,
+    client: AcpClient,
+    session_id: String,
     chars: usize,
-    started: bool,
-}
-
-enum SessionInner {
-    Acp {
-        client: AcpClient,
-        session_id: String,
-    },
-    /// CLI has no memory. The caller must resend context.
-    Stateless,
 }
 
 impl DirectorSession {
@@ -395,48 +383,45 @@ impl DirectorSession {
             && !std::path::Path::new(&bin).is_file()
             && !which(&bin);
         if acp_missing {
-            return Ok(Self {
-                inner: SessionInner::Stateless,
-                chars: 0,
-                started: false,
-            });
+            let err = refuse_untoolable(id, None);
+            tracing::warn!(bin = %bin, "{err}");
+            emit(events.as_ref(), ChatEvent::status(err.to_string())).await;
+            return Err(err);
         }
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".into());
-        match AcpClient::connect(&bin, &args, events.clone()).await {
-            Ok(mut client) => match client
-                .open_session(&cwd, Some(model), mcp_servers, events.as_ref())
-                .await
-            {
-                Ok(session_id) => Ok(Self {
-                    inner: SessionInner::Acp { client, session_id },
-                    chars: 0,
-                    started: false,
-                }),
-                Err(err) => {
-                    tracing::warn!("acp session/new failed: {err}");
-                    Ok(Self {
-                        inner: SessionInner::Stateless,
-                        chars: 0,
-                        started: false,
-                    })
-                }
-            },
+        let mut client = match AcpClient::connect(&bin, &args, events.clone()).await {
+            Ok(client) => client,
             Err(err) => {
-                tracing::warn!("acp connect failed: {err}");
-                Ok(Self {
-                    inner: SessionInner::Stateless,
-                    chars: 0,
-                    started: false,
-                })
+                let err = edit_failure(id, err);
+                tracing::warn!("{err}");
+                emit(events.as_ref(), ChatEvent::status(err.to_string())).await;
+                return Err(err);
+            }
+        };
+        match client
+            .open_session(&cwd, Some(model), mcp_servers, events.as_ref())
+            .await
+        {
+            Ok(session_id) => Ok(Self {
+                client,
+                session_id,
+                chars: 0,
+            }),
+            Err(err) => {
+                let err = edit_failure(id, err);
+                tracing::warn!("{err}");
+                emit(events.as_ref(), ChatEvent::status(err.to_string())).await;
+                Err(err)
             }
         }
     }
 
+    /// An open session can call tools. A missing adapter is an error from [`open`].
     #[must_use]
     pub fn remembers(&self) -> bool {
-        matches!(self.inner, SessionInner::Acp { .. })
+        true
     }
 
     #[must_use]
@@ -451,19 +436,10 @@ impl DirectorSession {
         events: Option<&EventSink>,
     ) -> Result<LlmReply, LlmError> {
         self.chars += message.len();
-        self.started = true;
-        let text = match &mut self.inner {
-            SessionInner::Acp { client, session_id } => {
-                client
-                    .continue_prompt(session_id, message, frames, events)
-                    .await?
-            }
-            SessionInner::Stateless => {
-                return Err(LlmError::Message(
-                    "no ACP session — use complete_stream".into(),
-                ));
-            }
-        };
+        let text = self
+            .client
+            .continue_prompt(&self.session_id, message, frames, events)
+            .await?;
         Ok(parse_tool_reply(text))
     }
 }
@@ -795,6 +771,22 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn codex_without_acp_cannot_edit() {
+        let msg = acp_missing_message(ProviderId::Openai);
+        assert!(msg.contains("codex-acp"));
+        assert!(msg.contains("OPENCUT_CODEX_ACP"));
+        assert!(msg.contains("OPENCUT_ACP_NPX"));
+        assert!(!msg.contains("codex exec"));
+        let wrapped = refuse_untoolable(ProviderId::Openai, Some("connect failed".into()));
+        let text = wrapped.to_string();
+        assert!(text.contains("connect failed"));
+        assert!(text.contains("codex-acp"));
+        let claude = acp_missing_message(ProviderId::Claude);
+        assert!(claude.contains("OPENCUT_CLAUDE_ACP"));
+        assert!(!claude.contains("claude -p"));
     }
 
     #[test]
