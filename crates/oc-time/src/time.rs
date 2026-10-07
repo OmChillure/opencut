@@ -4,7 +4,9 @@ use std::fmt;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 /// A point on the media clock, stored as an integer tick count.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct Time(i64);
 
@@ -22,11 +24,6 @@ impl Time {
     }
 
     #[must_use]
-    pub fn from_millis(ms: i64) -> Self {
-        Self::from_ticks(ms.saturating_mul(TICKS_PER_SECOND) / 1_000)
-    }
-
-    #[must_use]
     pub const fn as_ticks(self) -> i64 {
         self.0
     }
@@ -34,26 +31,6 @@ impl Time {
     #[must_use]
     pub fn as_seconds(self) -> f64 {
         self.0 as f64 / TICKS_PER_SECOND as f64
-    }
-
-    #[must_use]
-    pub fn as_millis(self) -> i64 {
-        self.0.saturating_mul(1_000) / TICKS_PER_SECOND
-    }
-
-    #[must_use]
-    pub fn saturating_add(self, duration: Duration) -> Self {
-        Self(self.0.saturating_add(duration.as_ticks()))
-    }
-
-    #[must_use]
-    pub fn saturating_sub(self, duration: Duration) -> Self {
-        Self(self.0.saturating_sub(duration.as_ticks()))
-    }
-
-    #[must_use]
-    pub fn duration_since(self, earlier: Self) -> Duration {
-        Duration::from_ticks(self.0.saturating_sub(earlier.0).max(0))
     }
 
     #[must_use]

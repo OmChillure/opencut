@@ -27,10 +27,8 @@ pub const TICKS_PER_SECOND: i64 = 120_000;
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum TimeError {
-    #[error("frame rate numerator must be > 0")]
+    #[error("frame rate numerator and denominator must be > 0")]
     InvalidFrameRate,
-    #[error("duration must be >= 0")]
-    NegativeDuration,
 }
 
 #[cfg(test)]
@@ -85,5 +83,24 @@ mod tests {
         assert_eq!(json, "1234");
         let back: Time = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn nearest_rate_cycles_and_rejects_zero() {
+        assert_eq!(FrameRate::nearest(23.976), FrameRate::FPS_23_976);
+        assert_eq!(FrameRate::nearest(30.0), FrameRate::FPS_30);
+        assert_eq!(FrameRate::FPS_60.cycle(), FrameRate::FPS_23_976);
+        assert_eq!(FrameRate::FPS_24.label(), "24");
+        assert_eq!(FrameRate::FPS_29_97.label(), "29.97");
+        assert!(FrameRate::new(0, 1).is_err());
+        assert!(FrameRate::new(24, 0).is_err());
+    }
+
+    #[test]
+    fn duration_adds_and_prints_seconds() {
+        let span = Duration::from_seconds(1.5) + Duration::from_seconds(0.5);
+        assert_eq!(span.as_ticks(), 240_000);
+        assert_eq!(span.to_string(), "2.000s");
+        assert_eq!((span - Duration::from_seconds(0.5)).as_seconds(), 1.5);
     }
 }
