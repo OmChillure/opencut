@@ -724,11 +724,17 @@ fn eq_filters(
     // then convert to video levels once.
     let procedural = grade_moves(grade);
     if procedural || cube_file.is_some() {
-        s.push_str(",format=gbrp");
+        let affine = grade_affine(grade);
         if procedural {
-            s.push_str(&grade_geq(grade));
+            s.push_str(&grade_mixer(&affine));
+        } else {
+            s.push_str(",format=gbrp");
         }
         if let Some(path) = cube_file {
+            // A cube is sampled on the clamped grade. The float path can sit above 1.
+            if procedural && !mixer_fits(&affine) {
+                s.push_str(",format=gbrp");
+            }
             s.push_str(&format!(",lut3d=file={}", escape_path(path)));
         }
         s.push_str(",format=yuv420p");
@@ -759,71 +765,183 @@ fn grade_moves(grade: &oc_timeline::Grade) -> bool {
         || grade.lut != oc_timeline::Lut::None
 }
 
-/// Same formula as `oc_compositor` `grade_rgb`: contrast around mid gray, then a
-/// brightness multiply, saturation around luma, a small temperature add, then the lut.
-fn grade_geq(grade: &oc_timeline::Grade) -> String {
-    let contrast = 1.0 + grade.contrast + grade.gamma * 0.45;
-    let brightness = 1.0 + grade.exposure + grade.gain * 0.35 + grade.lift * 0.15;
-    let sat = (1.0 + grade.saturation).max(0.0);
-    let temperature = grade.temperature * 0.15;
-    let r0 = rgb_base("r", contrast, brightness);
-    let g0 = rgb_base("g", contrast, brightness);
-    let b0 = rgb_base("b", contrast, brightness);
-    let y = luma_expr(&r0, &g0, &b0);
-    let r1 = format!("({}+{temperature:.5})", sat_expr(&r0, &y, sat));
-    let g1 = sat_expr(&g0, &y, sat);
-    let b1 = format!("({}-{temperature:.5})", sat_expr(&b0, &y, sat));
-    let (r, g, b) = lut_expr(grade.lut, &r1, &g1, &b1);
-    // `b` is geq's interpolation flag, so the blue plane has to use the long name.
-    format!(
-        ",geq=interpolation=nearest:red_expr='clip(255*({r})\\,0\\,255)':green_expr='clip(255*({g})\\,0\\,255)':blue_expr='clip(255*({b})\\,0\\,255)'"
+/// One RGB affine step. Rows mix r, g, b. `b` is added after the mix.
+#[derive(Clone, Copy)]
+struct Affine {
+    m: [[f64; 3]; 3],
+    b: [f64; 3],
+}
+
+fn ident_affine() -> Affine {
+    Affine {
+        m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        b: [0.0, 0.0, 0.0],
+    }
+}
+
+/// `outer` runs after `inner`: `outer * (inner * x) + bias`.
+fn compose(outer: Affine, inner: Affine) -> Affine {
+    let mut m = [[0.0; 3]; 3];
+    for r in 0..3 {
+        for c in 0..3 {
+            m[r][c] = outer.m[r][0] * inner.m[0][c]
+                + outer.m[r][1] * inner.m[1][c]
+                + outer.m[r][2] * inner.m[2][c];
+        }
+    }
+    let mut b = [0.0; 3];
+    for r in 0..3 {
+        b[r] = outer.m[r][0] * inner.b[0]
+            + outer.m[r][1] * inner.b[1]
+            + outer.m[r][2] * inner.b[2]
+            + outer.b[r];
+    }
+    Affine { m, b }
+}
+
+fn scale_affine(k: f64) -> Affine {
+    Affine {
+        m: [[k, 0.0, 0.0], [0.0, k, 0.0], [0.0, 0.0, k]],
+        b: [0.0, 0.0, 0.0],
+    }
+}
+
+fn bias_affine(b: [f64; 3]) -> Affine {
+    let mut affine = ident_affine();
+    affine.b = b;
+    affine
+}
+
+const LUMA_R: f64 = 0.2126;
+const LUMA_G: f64 = 0.7152;
+const LUMA_B: f64 = 0.0722;
+
+fn saturation_affine(sat: f64) -> Affine {
+    let w = 1.0 - sat;
+    Affine {
+        m: [
+            [sat + w * LUMA_R, w * LUMA_G, w * LUMA_B],
+            [w * LUMA_R, sat + w * LUMA_G, w * LUMA_B],
+            [w * LUMA_R, w * LUMA_G, sat + w * LUMA_B],
+        ],
+        b: [0.0, 0.0, 0.0],
+    }
+}
+
+/// Same formula as `oc_compositor` `grade_rgb`, as one matrix plus a bias.
+fn grade_affine(grade: &oc_timeline::Grade) -> Affine {
+    let contrast = 1.0 + f64::from(grade.contrast) + f64::from(grade.gamma) * 0.45;
+    let brightness = 1.0
+        + f64::from(grade.exposure)
+        + f64::from(grade.gain) * 0.35
+        + f64::from(grade.lift) * 0.15;
+    let sat = (1.0 + f64::from(grade.saturation)).max(0.0);
+    let k = contrast * brightness;
+    let off = 0.5 * brightness * (1.0 - contrast);
+    let contrast_step = Affine {
+        m: [[k, 0.0, 0.0], [0.0, k, 0.0], [0.0, 0.0, k]],
+        b: [off, off, off],
+    };
+    let temperature = f64::from(grade.temperature) * 0.15;
+    let temp_step = bias_affine([temperature, 0.0, -temperature]);
+    let lut_step = lut_affine(grade.lut);
+    compose(
+        lut_step,
+        compose(temp_step, compose(saturation_affine(sat), contrast_step)),
     )
 }
 
-fn rgb_base(channel: &str, contrast: f32, brightness: f32) -> String {
-    format!("((({channel}(X\\,Y)/255)-0.5)*{contrast:.5}+0.5)*{brightness:.5}")
-}
-
-fn luma_expr(r: &str, g: &str, b: &str) -> String {
-    format!("(0.2126*({r})+0.7152*({g})+0.0722*({b}))")
-}
-
-fn sat_expr(channel: &str, y: &str, sat: f32) -> String {
-    format!("(({y})+(({channel})-({y}))*{sat:.5})")
-}
-
-fn lut_expr(lut: oc_timeline::Lut, r: &str, g: &str, b: &str) -> (String, String, String) {
+fn lut_affine(lut: oc_timeline::Lut) -> Affine {
     use oc_timeline::Lut;
     match lut {
-        Lut::None => (r.to_string(), g.to_string(), b.to_string()),
-        Lut::Warm => (
-            format!("(({r})+0.08000)"),
-            format!("(({g})+0.03000)"),
-            format!("(({b})-0.04000)"),
-        ),
-        Lut::Cool => (
-            format!("(({r})-0.04000)"),
-            g.to_string(),
-            format!("(({b})+0.08000)"),
-        ),
-        Lut::TealOrange => (
-            format!("(({r})+0.06000)"),
-            g.to_string(),
-            format!("(({b})+0.05000)"),
-        ),
-        Lut::Film => {
-            let y = luma_expr(r, g, b);
-            (
-                format!("(({y})+(({r})-({y}))*1.16000+0.03000)"),
-                format!("(({y})+(({g})-({y}))*1.16000)"),
-                format!("(({y})+(({b})-({y}))*1.16000-0.01500)"),
-            )
-        }
-        Lut::Mono => {
-            let y = luma_expr(r, g, b);
-            (y.clone(), y.clone(), y)
-        }
+        Lut::None => ident_affine(),
+        Lut::Warm => bias_affine([0.08, 0.03, -0.04]),
+        Lut::Cool => bias_affine([-0.04, 0.0, 0.08]),
+        Lut::TealOrange => bias_affine([0.06, 0.0, 0.05]),
+        Lut::Film => compose(bias_affine([0.03, 0.0, -0.015]), saturation_affine(1.16)),
+        Lut::Mono => Affine {
+            m: [
+                [LUMA_R, LUMA_G, LUMA_B],
+                [LUMA_R, LUMA_G, LUMA_B],
+                [LUMA_R, LUMA_G, LUMA_B],
+            ],
+            b: [0.0, 0.0, 0.0],
+        },
     }
+}
+
+/// ffmpeg rejects a `colorchannelmixer` coefficient outside this range.
+fn mixer_fits(affine: &Affine) -> bool {
+    affine
+        .m
+        .iter()
+        .flatten()
+        .chain(affine.b.iter())
+        .all(|c| c.abs() <= 2.0)
+}
+
+fn mixer_args(affine: &Affine) -> String {
+    format!(
+        "colorchannelmixer=rr={:.6}:rg={:.6}:rb={:.6}:ra={:.6}:gr={:.6}:gg={:.6}:gb={:.6}:ga={:.6}:br={:.6}:bg={:.6}:bb={:.6}:ba={:.6}",
+        affine.m[0][0],
+        affine.m[0][1],
+        affine.m[0][2],
+        affine.b[0],
+        affine.m[1][0],
+        affine.m[1][1],
+        affine.m[1][2],
+        affine.b[1],
+        affine.m[2][0],
+        affine.m[2][1],
+        affine.m[2][2],
+        affine.b[2]
+    )
+}
+
+/// Kdenlive's color grade is this filter: a compiled 3×3 mix, not a `geq` script.
+/// `geq` runs the formula on every pixel and is what makes a short export take hours.
+/// Coefficients have to stay in [-2, 2]. A stronger grade is the same mix on float
+/// pixels, split into legal steps, so the highlight is clipped once at the end.
+fn grade_mixer(affine: &Affine) -> String {
+    if mixer_fits(affine) {
+        return format!(",format=gbrap,{}", mixer_args(affine));
+    }
+    let mut chain = vec!["format=gbrapf32le".to_string()];
+    let mut linear = *affine;
+    linear.b = [0.0; 3];
+    let mut ups = 0u32;
+    while !mixer_fits(&linear) && ups < 16 {
+        for row in &mut linear.m {
+            for coeff in row.iter_mut() {
+                *coeff /= 2.0;
+            }
+        }
+        ups += 1;
+    }
+    chain.push(mixer_args(&linear));
+    for _ in 0..ups {
+        chain.push(mixer_args(&scale_affine(2.0)));
+    }
+    let mut left = affine.b;
+    let mut guard = 0;
+    while left.iter().any(|c| c.abs() > 2.0) && guard < 16 {
+        let mut step = [0.0; 3];
+        for i in 0..3 {
+            if left[i] > 2.0 {
+                step[i] = 2.0;
+                left[i] -= 2.0;
+            } else if left[i] < -2.0 {
+                step[i] = -2.0;
+                left[i] += 2.0;
+            }
+        }
+        chain.push(mixer_args(&bias_affine(step)));
+        guard += 1;
+    }
+    if left.iter().any(|c| c.abs() > 1e-6) {
+        chain.push(mixer_args(&bias_affine(left)));
+    }
+    format!(",{}", chain.join(","))
 }
 
 fn audio_fx(fx: &oc_timeline::AudioFx) -> String {
@@ -1527,8 +1645,9 @@ mod tests {
     #[test]
     fn export_grade_uses_the_monitor_math_not_yuv_colorbalance() {
         let filter = eq_filters(&Grade::punchy(), &oc_timeline::Fx::default(), None);
-        assert!(filter.contains("format=gbrp"), "{filter}");
-        assert!(filter.contains("geq="), "{filter}");
+        assert!(filter.contains("format=gbrap"), "{filter}");
+        assert!(filter.contains("colorchannelmixer="), "{filter}");
+        assert!(!filter.contains("geq="), "{filter}");
         assert!(
             !filter.contains("colorbalance"),
             "yuv colorbalance washes the picture: {filter}"
@@ -1542,83 +1661,101 @@ mod tests {
         if !version.status.success() {
             return;
         }
-        let grade = Grade {
-            exposure: 0.28,
-            contrast: 0.18,
-            saturation: 0.22,
-            temperature: 0.12,
-            lift: 0.15,
-            gamma: 0.08,
-            gain: 0.10,
-            lut: Lut::Warm,
-            cube: None,
-        };
+        let grades = [
+            Grade {
+                exposure: 0.28,
+                contrast: 0.18,
+                saturation: 0.22,
+                temperature: 0.12,
+                lift: 0.15,
+                gamma: 0.08,
+                gain: 0.10,
+                lut: Lut::Warm,
+                cube: None,
+            },
+            // Pushes a coefficient past 2 so the float split path is the one that runs.
+            Grade {
+                exposure: 0.4,
+                contrast: 1.4,
+                saturation: 0.8,
+                temperature: -0.4,
+                lift: 0.2,
+                gamma: 0.3,
+                gain: 0.5,
+                lut: Lut::Film,
+                cube: None,
+            },
+        ];
         let samples: [[u8; 3]; 4] = [
             [16, 16, 16],
             [128, 128, 128],
             [190, 140, 115],
             [235, 235, 235],
         ];
-        let chain = eq_filters(&grade, &oc_timeline::Fx::default(), None);
         let dir = std::env::temp_dir().join("oc-grade-match");
         let _ = std::fs::create_dir_all(&dir);
-        for (i, px) in samples.iter().enumerate() {
-            let mut raw = Vec::new();
-            for _ in 0..4 {
-                raw.extend_from_slice(px);
-                raw.push(255);
-            }
-            let input = dir.join(format!("in{i}.rgba"));
-            std::fs::write(&input, &raw).unwrap();
-            let rgb_grade = chain.trim_end_matches(",format=yuv420p");
-            let filter = format!("[0:v]scale=2:2:flags=neighbor{rgb_grade},format=rgb24");
-            let out = std::process::Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgba",
-                    "-s",
-                    "2x2",
-                    "-i",
-                ])
-                .arg(&input)
-                .args([
-                    "-filter_complex",
-                    &filter,
-                    "-frames:v",
-                    "1",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgb24",
-                    "pipe:1",
-                ])
-                .output()
-                .expect("ffmpeg");
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let rgb = [
-                px[0] as f32 / 255.0,
-                px[1] as f32 / 255.0,
-                px[2] as f32 / 255.0,
-            ];
-            let want = monitor(rgb, &grade);
-            let got = &out.stdout[..3];
-            for c in 0..3 {
-                let expect = (want[c] * 255.0).round() as i32;
-                let actual = got[c] as i32;
+        for (g, grade) in grades.iter().enumerate() {
+            let chain = eq_filters(grade, &oc_timeline::Fx::default(), None);
+            assert!(chain.contains("colorchannelmixer="), "{chain}");
+            assert!(!chain.contains("geq="), "{chain}");
+            for (i, px) in samples.iter().enumerate() {
+                let mut raw = Vec::new();
+                for _ in 0..4 {
+                    raw.extend_from_slice(px);
+                    raw.push(255);
+                }
+                let input = dir.join(format!("in{g}-{i}.rgba"));
+                std::fs::write(&input, &raw).unwrap();
+                let rgb_grade = chain.trim_end_matches(",format=yuv420p");
+                let filter = format!("[0:v]scale=2:2:flags=neighbor{rgb_grade},format=rgb24");
+                let out = std::process::Command::new("ffmpeg")
+                    .args([
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "rgba",
+                        "-s",
+                        "2x2",
+                        "-i",
+                    ])
+                    .arg(&input)
+                    .args([
+                        "-filter_complex",
+                        &filter,
+                        "-frames:v",
+                        "1",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "rgb24",
+                        "pipe:1",
+                    ])
+                    .output()
+                    .expect("ffmpeg");
                 assert!(
-                    (expect - actual).abs() <= 1,
-                    "sample {i} channel {c}: export {actual} monitor {expect}"
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
                 );
+                let rgb = [
+                    px[0] as f32 / 255.0,
+                    px[1] as f32 / 255.0,
+                    px[2] as f32 / 255.0,
+                ];
+                let want = monitor(rgb, grade);
+                let got = &out.stdout[..3];
+                for c in 0..3 {
+                    let expect = (want[c] * 255.0).round() as i32;
+                    let actual = got[c] as i32;
+                    assert!(
+                        (expect - actual).abs() <= 1,
+                        "grade {g} sample {i} channel {c}: export {actual} monitor {expect}\n{chain}"
+                    );
+                }
             }
         }
     }

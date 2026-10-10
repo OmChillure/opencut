@@ -91,11 +91,7 @@ fn explicit_look(recipe: &CaptionRecipe) -> Option<&LineLook> {
 fn mood_theme(mood: CaptionMood) -> (CaptionPlace, CaptionFont, CaptionEffect) {
     match mood {
         CaptionMood::Clean => (CaptionPlace::Bottom, CaptionFont::Sans, CaptionEffect::Fade),
-        CaptionMood::Kinetic => (
-            CaptionPlace::Lower,
-            CaptionFont::Display,
-            CaptionEffect::Pop,
-        ),
+        CaptionMood::Kinetic => (CaptionPlace::Lower, CaptionFont::Sans, CaptionEffect::Pop),
         CaptionMood::Bold => (
             CaptionPlace::Bottom,
             CaptionFont::Display,
@@ -145,6 +141,47 @@ pub fn caption_reveal(text: &str, effect: CaptionEffect, into: f64, span: f64) -
     chars.into_iter().take(n).collect()
 }
 
+/// Short line stays one beat. A long line, or a hold over ~2.6s with more than four words,
+/// splits into groups of four so the line changes instead of sitting.
+#[must_use]
+pub fn caption_beats(text: &str, span: f64) -> Vec<(String, f64, f64)> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![(String::new(), 0.0, 1.0)];
+    }
+    let split = words.len() > 7 || (span > 2.6 && words.len() > 4);
+    if !split {
+        return vec![(words.join(" "), 0.0, 1.0)];
+    }
+    let groups: Vec<String> = words.chunks(4).map(|group| group.join(" ")).collect();
+    let n = groups.len().max(1) as f64;
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let i = i as f64;
+            (line, i / n, (i + 1.0) / n)
+        })
+        .collect()
+}
+
+/// The beat under `into`, plus time local to that beat so a fade or a pop plays again.
+#[must_use]
+pub fn caption_phrase(text: &str, into: f64, span: f64) -> (String, f64, f64) {
+    let span = if span.is_finite() { span.max(0.2) } else { 0.2 };
+    let beats = caption_beats(text, span);
+    let frac = (into / span).clamp(0.0, 0.999999);
+    let (line, start, end) = beats
+        .iter()
+        .find(|(_, start, end)| frac >= *start - 1e-9 && frac < *end)
+        .or_else(|| beats.last())
+        .map(|(line, start, end)| (line.clone(), *start, *end))
+        .unwrap_or_else(|| (String::new(), 0.0, 1.0));
+    let local_span = ((end - start) * span).max(0.2);
+    let local = (into - start * span).clamp(0.0, local_span);
+    (line, local, local_span)
+}
+
 /// Playhead-locked motion. The monitor rebuilds the node every frame, so this is inline CSS.
 #[must_use]
 pub fn caption_motion(effect: CaptionEffect, into: f64, span: f64) -> String {
@@ -190,7 +227,7 @@ mod tests {
             assert_eq!(look_for(line, index, &kinetic, false), first);
         }
         assert_eq!(first.0, CaptionPlace::Lower);
-        assert_eq!(first.1, CaptionFont::Display);
+        assert_eq!(first.1, CaptionFont::Sans);
         assert_eq!(first.2, CaptionEffect::Pop);
         let clean = CaptionMood::Clean.recipe();
         let (place, font, effect) = look_for("why this street?", 2, &clean, false);
@@ -279,7 +316,7 @@ mod tests {
         let recipe = CaptionMood::Kinetic.recipe();
         let (place, font, effect) = look_for("the city opens up from here", 2, &recipe, true);
         assert_eq!(place, CaptionPlace::Lower);
-        assert_eq!(font, CaptionFont::Display);
+        assert_eq!(font, CaptionFont::Sans);
         assert_eq!(effect, CaptionEffect::Pop);
     }
 
@@ -340,9 +377,50 @@ mod tests {
             assert_eq!(look_for(line, index, &recipe, true), first);
         }
         assert_eq!(first.0, CaptionPlace::Lower);
-        assert_eq!(first.1, CaptionFont::Display);
+        assert_eq!(first.1, CaptionFont::Sans);
         assert_eq!(first.2, CaptionEffect::Pop);
         assert_ne!(first.0, CaptionPlace::Middle);
         assert_ne!(first.0, CaptionPlace::Top);
+    }
+
+    #[test]
+    fn a_style_word_does_not_pick_the_caption() {
+        assert_eq!(CaptionMood::parse("hype"), CaptionMood::Clean);
+        assert_eq!(CaptionMood::parse("reel"), CaptionMood::Clean);
+        assert_eq!(CaptionMood::parse("tiktok"), CaptionMood::Clean);
+        assert_eq!(CaptionMood::parse("ad"), CaptionMood::Clean);
+        assert_eq!(CaptionMood::parse("promo"), CaptionMood::Clean);
+        assert_eq!(CaptionMood::parse("cinematic"), CaptionMood::Clean);
+        assert_eq!(CaptionMood::parse("kinetic"), CaptionMood::Kinetic);
+        assert_eq!(CaptionMood::parse("bold"), CaptionMood::Bold);
+        assert_eq!(CaptionMood::parse("clean"), CaptionMood::Clean);
+        assert_eq!(CaptionMood::resolve(None, "hype"), CaptionMood::Clean);
+        assert_eq!(
+            CaptionMood::resolve(None, "documentary"),
+            CaptionMood::Clean
+        );
+        assert_eq!(
+            CaptionMood::resolve(Some(CaptionMood::Bold), "hype"),
+            CaptionMood::Bold
+        );
+        assert_eq!(
+            CaptionMood::resolve(Some(CaptionMood::Kinetic), "documentary"),
+            CaptionMood::Kinetic
+        );
+        assert_eq!(CaptionMood::resolve(None, "vertical"), CaptionMood::Clean);
+    }
+
+    #[test]
+    fn a_short_line_stays_and_a_long_line_changes() {
+        assert_eq!(caption_beats("teams", 2.0).len(), 1);
+        let beats = caption_beats("food and refreshments are on the house today", 5.0);
+        assert!(beats.len() >= 2, "{beats:?}");
+        assert_ne!(beats.first().unwrap().0, beats.last().unwrap().0);
+        let (early, _, _) =
+            caption_phrase("food and refreshments are on the house today", 0.1, 5.0);
+        let (late, _, _) = caption_phrase("food and refreshments are on the house today", 4.5, 5.0);
+        assert_ne!(early, late);
+        assert_eq!(caption_beats("one two three four five", 2.0).len(), 1);
+        assert!(caption_beats("one two three four five", 3.0).len() >= 2);
     }
 }

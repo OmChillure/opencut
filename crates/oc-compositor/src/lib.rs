@@ -323,6 +323,12 @@ fn push_plate(
     });
 }
 
+/// The pose at `time`, including a move from the start transform to `move_to`.
+#[must_use]
+pub fn clip_pose(clip: &Clip, time: Time) -> Transform {
+    pose_at(clip, time)
+}
+
 fn pose_at(clip: &Clip, time: Time) -> Transform {
     let ClipKind::Video { transform } = &clip.kind else {
         return Transform::default();
@@ -458,6 +464,47 @@ mod tests {
             _ => panic!("expected video layer"),
         }
         assert!(!plan.needs_paint);
+    }
+
+    #[test]
+    fn a_linear_push_is_halfway_at_the_middle() {
+        let mut tl = Timeline::default();
+        let track = tl.first_track(TrackKind::Video).unwrap().id;
+        let mut look = ClipLook::default();
+        look.move_to = Some(Transform {
+            scale: 1.2,
+            ..Transform::default()
+        });
+        look.move_ease = Some(oc_timeline::Ease::Linear);
+        tl.add_clip(
+            track,
+            Clip {
+                id: ClipId::new(),
+                media_id: Some(MediaId::new()),
+                kind: ClipKind::Video {
+                    transform: Transform::default(),
+                },
+                start: Time::ZERO,
+                duration: Duration::from_seconds(2.0),
+                source_in: Time::ZERO,
+                speed: 1.0,
+                group_id: None,
+                link_id: None,
+                disabled: false,
+                look,
+            },
+        )
+        .unwrap();
+        let clip = tl
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .next()
+            .expect("clip");
+        let mid = clip_pose(clip, Time::from_seconds(1.0));
+        let tail = clip_pose(clip, Time::from_seconds(1.99));
+        assert!((mid.scale - 1.1).abs() < 0.02, "{}", mid.scale);
+        assert!(tail.scale > 1.18, "{}", tail.scale);
     }
 
     #[test]

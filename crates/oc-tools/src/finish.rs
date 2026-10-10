@@ -64,7 +64,7 @@ fn cues_share_theme(
     })
 }
 
-/// The theme saved on this timeline. A vertical frame with no theme is kinetic.
+/// The theme saved on this timeline. No named mood stays clean, including a vertical frame.
 #[must_use]
 pub fn caption_recipe_for(timeline: &Timeline) -> CaptionRecipe {
     recipe_for_timeline(timeline)
@@ -75,31 +75,20 @@ fn recipe_for_timeline(timeline: &Timeline) -> CaptionRecipe {
         if let Some(look) = &plan.caption_look {
             let mut recipe = look.clone();
             if recipe.base.is_none() {
-                recipe.base = Some(mood_for_plan(plan, timeline));
+                recipe.base = Some(mood_for_plan(plan));
             }
             return recipe;
         }
         if let Some(mood) = plan.caption_mood {
             return mood.recipe();
         }
-        return mood_for_plan(plan, timeline).recipe();
+        return mood_for_plan(plan).recipe();
     }
-    if timeline.height > timeline.width {
-        CaptionMood::Kinetic.recipe()
-    } else {
-        CaptionMood::Clean.recipe()
-    }
+    CaptionMood::Clean.recipe()
 }
 
-fn mood_for_plan(plan: &EditPlan, timeline: &Timeline) -> CaptionMood {
-    if let Some(mood) = plan.caption_mood {
-        return mood;
-    }
-    match plan.aspect.to_ascii_lowercase().as_str() {
-        "vertical" | "9:16" | "reel" | "portrait" => CaptionMood::Kinetic,
-        "" if timeline.height > timeline.width => CaptionMood::Kinetic,
-        _ => CaptionMood::Clean,
-    }
+fn mood_for_plan(plan: &EditPlan) -> CaptionMood {
+    CaptionMood::resolve(plan.caption_mood, &plan.style)
 }
 
 /// True when a caption track already has words to burn.
@@ -321,13 +310,46 @@ mod tests {
         assert!(redress_unset_captions(&mut timeline));
         let cues = caption_cues(&timeline);
         assert_eq!(cues.len(), 2);
-        assert_eq!(cues[0].place, CaptionPlace::Lower);
-        assert_eq!(cues[0].font, CaptionFont::Display);
-        assert_eq!(cues[0].effect, CaptionEffect::Pop);
+        assert_eq!(cues[0].place, CaptionPlace::Bottom);
+        assert_eq!(cues[0].font, CaptionFont::Sans);
+        assert_eq!(cues[0].effect, CaptionEffect::Fade);
         assert_eq!(cues[1].place, cues[0].place);
         assert_eq!(cues[1].font, cues[0].font);
         assert_eq!(cues[1].effect, cues[0].effect);
         assert!(!redress_unset_captions(&mut timeline));
+    }
+
+    #[test]
+    fn a_style_word_leaves_the_caption_clean() {
+        let mut timeline = Timeline::new(oc_timeline::FrameRate::FPS_30, 1080, 1920);
+        timeline.edit_plan = Some(plan_with_style("hype"));
+        assert_eq!(caption_recipe_for(&timeline).base, Some(CaptionMood::Clean));
+        timeline.edit_plan = Some(plan_with_style("documentary"));
+        assert_eq!(caption_recipe_for(&timeline).base, Some(CaptionMood::Clean));
+        let mut chosen = plan_with_style("hype");
+        chosen.caption_mood = Some(CaptionMood::Kinetic);
+        timeline.edit_plan = Some(chosen);
+        assert_eq!(
+            caption_recipe_for(&timeline).base,
+            Some(CaptionMood::Kinetic)
+        );
+        timeline.edit_plan = None;
+        assert_eq!(caption_recipe_for(&timeline).base, Some(CaptionMood::Clean));
+    }
+
+    fn plan_with_style(style: &str) -> EditPlan {
+        EditPlan {
+            style: style.into(),
+            aspect: "vertical".into(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: true,
+            caption_mood: None,
+            caption_look: None,
+            grade: oc_timeline::Grade::default(),
+            slots: Vec::new(),
+        }
     }
 
     fn plain_cue(start: f64, text: &str) -> CaptionCue {

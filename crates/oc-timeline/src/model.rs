@@ -1031,7 +1031,7 @@ pub enum CaptionMood {
     /// A small line along the bottom.
     #[default]
     Clean,
-    /// One lower-third display line. A close face stays under the mouth.
+    /// One lower-third line that pops. A close face stays under the mouth.
     Kinetic,
     /// One heavier line along the bottom.
     Bold,
@@ -1051,10 +1051,16 @@ impl CaptionMood {
     #[must_use]
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "kinetic" | "reel" | "tiktok" | "hype" | "funky" | "dynamic" => Self::Kinetic,
-            "bold" | "hormozi" | "ad" | "promo" => Self::Bold,
+            "kinetic" => Self::Kinetic,
+            "bold" => Self::Bold,
             _ => Self::Clean,
         }
+    }
+
+    /// An explicit caption mood wins. A style word does not.
+    #[must_use]
+    pub fn resolve(set: Option<Self>, _style: &str) -> Self {
+        set.unwrap_or(Self::Clean)
     }
 
     /// The theme, with no per-line overrides.
@@ -1367,6 +1373,19 @@ impl ClipKind {
 
 fn default_speed() -> f32 {
     1.0
+}
+
+/// A picture or audio clip that ffmpeg has to open. A generator draws its own picture.
+fn clip_source_media(clip: &Clip) -> Option<MediaId> {
+    if clip.disabled {
+        return None;
+    }
+    let id = clip.media_id?;
+    match &clip.kind {
+        ClipKind::Video { .. } if clip.look.generator.is_some() => None,
+        ClipKind::Video { .. } | ClipKind::Audio { .. } => Some(id),
+        ClipKind::Caption { .. } | ClipKind::Graphic { .. } => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1772,6 +1791,24 @@ impl Timeline {
             .max()
             .map(|end| end - Time::ZERO)
             .unwrap_or(Duration::ZERO)
+    }
+
+    /// Media files a render has to open. Disabled clips, captions, graphics,
+    /// and generated pictures are left out. The same id is listed once.
+    #[must_use]
+    pub fn source_media_ids(&self) -> Vec<MediaId> {
+        let mut ids = Vec::new();
+        for track in &self.tracks {
+            for clip in &track.clips {
+                let Some(id) = clip_source_media(clip) else {
+                    continue;
+                };
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
     }
 
     pub fn track(&self, id: TrackId) -> Option<&Track> {

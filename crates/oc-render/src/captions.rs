@@ -116,24 +116,27 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
     shorten_cues(out)
 }
 
-/// A caption stays two short lines. A full sentence is split across the cue.
+/// A caption stays a short line. A long line is split into beats across the cue.
 fn shorten_cues(cues: Vec<BurnedCue>) -> Vec<BurnedCue> {
     let mut out = Vec::new();
     for cue in cues {
-        let words: Vec<&str> = cue.text.split_whitespace().collect();
-        if words.len() <= 7 {
+        let span = (cue.end - cue.start).max(0.4);
+        let beats = oc_timeline::caption_beats(&cue.text, span);
+        if beats.len() <= 1 {
+            let mut cue = cue;
+            if let Some((text, _, _)) = beats.first() {
+                if !text.is_empty() {
+                    cue.text = text.clone();
+                }
+            }
             out.push(cue);
             continue;
         }
-        let groups: Vec<&[&str]> = words.chunks(6).collect();
-        let span = (cue.end - cue.start).max(0.4);
-        let step = span / groups.len() as f64;
-        for (i, group) in groups.iter().enumerate() {
-            let i = i as f64;
+        for (text, start, end) in beats {
             out.push(BurnedCue {
-                start: cue.start + step * i,
-                end: cue.start + step * (i + 1.0),
-                text: group.join(" "),
+                start: cue.start + span * start,
+                end: cue.start + span * end,
+                text,
                 place: cue.place,
                 font: cue.font,
                 effect: cue.effect,
@@ -231,9 +234,9 @@ fn font_override(font: CaptionFont, short: u32) -> String {
             format!("\\fnDejaVu Sans\\fs{size}\\b1")
         }
         CaptionFont::Display => {
-            // A band of type, not a title that covers the picture.
+            // A heavier band of type, still white, still inside the frame.
             let size = (short / 28).clamp(32, 52);
-            format!("\\fnDejaVu Sans\\fs{size}\\b1\\c&H006AE5FF&")
+            format!("\\fnDejaVu Sans\\fs{size}\\b1")
         }
         CaptionFont::Serif => {
             let size = (short / 22).clamp(36, 58);
@@ -255,11 +258,7 @@ fn effect_prefix(effect: CaptionEffect) -> &'static str {
 }
 
 fn dialogue_text(cue: &BurnedCue) -> String {
-    let body = if cue.font == CaptionFont::Display {
-        cue.text.trim().to_uppercase()
-    } else {
-        cue.text.trim().to_string()
-    };
+    let body = cue.text.trim().to_string();
     if cue.effect == CaptionEffect::Typewriter {
         type_on(&body, (cue.end - cue.start).max(0.2))
     } else {
@@ -359,7 +358,9 @@ mod tests {
         assert!(pop.contains("\\fs38"), "{pop}");
         assert!(!pop.contains("\\fs90"), "{pop}");
         assert!(pop.contains("\\fscx62\\fscy62"), "{pop}");
-        assert!(pop.contains("GO"), "{pop}");
+        assert!(pop.contains("}go"), "{pop}");
+        assert!(!pop.contains("GO"), "{pop}");
+        assert!(!pop.contains("&H006AE5FF"), "{pop}");
         let typed = to_ass(
             &[BurnedCue {
                 start: 0.0,
@@ -685,10 +686,17 @@ mod tests {
         )
         .unwrap();
         let burned = captions_for_cut(&tl);
-        assert_eq!(burned.len(), 2, "{burned:?}");
+        assert_eq!(
+            burned.iter().filter(|cue| cue.text == "be a bullish flag").count(),
+            1,
+            "{burned:?}"
+        );
         assert_eq!(burned[0].text, "be a bullish flag");
         assert!((burned[0].start - 5.0).abs() < 1e-6);
-        assert_eq!(burned[1].text, "is the important level though as");
+        assert_eq!(burned[1].text, "is the important level");
         assert!((burned[1].start - 52.2).abs() < 1e-6);
+        assert_eq!(burned.last().unwrap().text, "though as");
+        assert!(burned.last().unwrap().start > 52.2);
+        assert!((burned.last().unwrap().end - 58.2).abs() < 1e-3);
     }
 }

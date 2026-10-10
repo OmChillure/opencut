@@ -6,7 +6,10 @@ mod model;
 mod project;
 mod undo;
 
-pub use caption::{caption_motion, caption_reveal, dress_cues, look_for, shot_is_face};
+pub use caption::{
+    caption_beats, caption_motion, caption_phrase, caption_reveal, dress_cues, look_for,
+    shot_is_face,
+};
 pub use edit::{PlaceMode, marked_place};
 pub use ids::{ClipId, GroupId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
 pub use lut::{CubeLut, canonical_color, cube_text, ffmpeg_color, parse_cube};
@@ -19,6 +22,52 @@ pub use model::{
 };
 pub use project::Project;
 pub use undo::{UndoEntry, UndoStack};
+
+/// One timeline clip the render may have to receive from the browser that holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserHold {
+    pub id: String,
+    pub name: String,
+    pub on_server: bool,
+    pub in_browser: bool,
+}
+
+/// Ids to send for a render. A clip already on the server is skipped.
+/// Missing browser clips are an error, and nothing is sent until every one is here.
+pub fn browser_spool_ids(clips: &[BrowserHold]) -> std::result::Result<Vec<String>, String> {
+    let mut missing = Vec::new();
+    let mut send = Vec::new();
+    for clip in clips {
+        if clip.on_server {
+            continue;
+        }
+        if clip.in_browser {
+            if !send.iter().any(|id| id == &clip.id) {
+                send.push(clip.id.clone());
+            }
+            continue;
+        }
+        if missing.iter().any(|held: &BrowserHold| held.id == clip.id) {
+            continue;
+        }
+        missing.push(clip.clone());
+    }
+    if missing.is_empty() {
+        return Ok(send);
+    }
+    let names = missing
+        .iter()
+        .map(|clip| {
+            if clip.name.is_empty() {
+                clip.id.as_str()
+            } else {
+                clip.name.as_str()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!("These clips are not in this browser: {names}"))
+}
 
 pub use oc_time::{Duration, FrameRate, Time};
 
@@ -255,5 +304,65 @@ mod tests {
         let (l, r) = tl.master.balance();
         assert!((l - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4);
         assert!((r - l).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_render_asks_only_for_picture_and_audio_files() {
+        let mut tl = Timeline::default();
+        let video = tl.first_track(TrackKind::Video).unwrap().id;
+        let audio = tl.first_track(TrackKind::Audio).unwrap().id;
+        let captions = tl.first_track(TrackKind::Caption).unwrap().id;
+        let picture = video_clip(0.0, 2.0);
+        let picture_id = picture.media_id.unwrap();
+        tl.add_clip(video, picture.clone()).unwrap();
+        tl.add_clip(video, picture).unwrap();
+        let mut generated = video_clip(2.0, 1.0);
+        generated.look.generator = Some(Generator::ColorBars);
+        tl.add_clip(video, generated).unwrap();
+        let mut off = video_clip(3.0, 1.0);
+        off.disabled = true;
+        tl.add_clip(video, off).unwrap();
+        let mut sound = video_clip(0.0, 2.0);
+        sound.kind = ClipKind::Audio {
+            volume: 1.0,
+            ducked: false,
+        };
+        let sound_id = sound.media_id.unwrap();
+        tl.add_clip(audio, sound).unwrap();
+        let mut caption = video_clip(0.0, 2.0);
+        caption.kind = ClipKind::Caption {
+            style: CaptionStyle::default(),
+            cues: Vec::new(),
+        };
+        tl.add_clip(captions, caption).unwrap();
+        assert_eq!(tl.source_media_ids(), vec![picture_id, sound_id]);
+    }
+
+    #[test]
+    fn a_browser_spool_skips_server_clips_and_names_what_is_missing() {
+        let server = BrowserHold {
+            id: "server".into(),
+            name: "on-r2.mp4".into(),
+            on_server: true,
+            in_browser: false,
+        };
+        let held = BrowserHold {
+            id: "held".into(),
+            name: "local.mp4".into(),
+            on_server: false,
+            in_browser: true,
+        };
+        let gone = BrowserHold {
+            id: "gone".into(),
+            name: "other-tab.mp4".into(),
+            on_server: false,
+            in_browser: false,
+        };
+        assert_eq!(
+            browser_spool_ids(&[server.clone(), held.clone()]).unwrap(),
+            vec!["held".to_string()]
+        );
+        let err = browser_spool_ids(&[held, gone, server]).unwrap_err();
+        assert_eq!(err, "These clips are not in this browser: other-tab.mp4");
     }
 }
