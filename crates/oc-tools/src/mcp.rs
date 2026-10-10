@@ -129,13 +129,13 @@ pub fn mcp_tools() -> Vec<McpTool> {
             name: "list_bin".into(),
             description:
                 "List imported media in this project (id, kind, duration, speech/look summary). \
-                 Call this when you need the bin. Do not assume it is empty."
+                 The opening message already has the bin. Call this only when that list is missing a file."
                     .into(),
             input_schema: object(&[]),
         },
         McpTool {
             name: "list_timeline".into(),
-            description: "List tracks and clips currently on the timeline. Call when you need the cut.".into(),
+            description: "List tracks and clips currently on the timeline. The opening message already has the cut. Call this after a tool changes it.".into(),
             input_schema: object(&[]),
         },
         McpTool {
@@ -154,7 +154,9 @@ pub fn mcp_tools() -> Vec<McpTool> {
             description:
                 "Look across a source range. You see three frames (in, middle, out) plus the \
                  words, the shot labels, and the filler or silence inside that range. \
-                 Call this before you cut or grade a span. start and end are source seconds."
+                 Call this only when the shot list is still the coarse look (wide, close, action) \
+                 or the frame has no stored grade. One watch of a spoken line is enough for a graphic. \
+                 start and end are source seconds."
                     .into(),
             input_schema: object(&[
                 ("media_id", str_prop("Media id from list_bin"), true),
@@ -166,7 +168,8 @@ pub fn mcp_tools() -> Vec<McpTool> {
             name: "list_gaps".into(),
             description:
                 "Filler lines (um, uh, like) and silence longer than 0.7s on one file. \
-                 Times are source seconds. Trim from these. Optional start and end limit the list."
+                 Times are source seconds. The opening message already lists these. \
+                 Call this only for a window that list left out. Optional start and end limit the list."
                     .into(),
             input_schema: object(&[
                 ("media_id", str_prop("Media id from list_bin"), true),
@@ -182,7 +185,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                  camera, motion (l2r/r2l/toward/away/none), q (1-10), \
                  a role (speech, silence, filler), and the words in that range. \
                  Shots under q5 are omitted. A row with only wide/close/action has not been \
-                 labeled yet. Call this before cutting a long file. Place excerpts on those times."
+                 labeled yet. The opening message already has this list. Call this only when a row you need was cut off."
                     .into(),
             input_schema: object(&[("media_id", str_prop("Media id from list_bin"), true)]),
         },
@@ -190,7 +193,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
             name: "list_cues".into(),
             description:
                 "Timestamped speech cues for one media id (source seconds + text). \
-                 Use this to pick excerpts from a long take."
+                 The opening shot list already has the words. Call this only when a line was cut off."
                     .into(),
             input_schema: object(&[("media_id", str_prop("Media id from list_bin"), true)]),
         },
@@ -429,7 +432,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                  A clean review queues the export."
                 .into(),
             input_schema: object(&[
-                ("style", str_prop("Note for yourself. It does not pick a look."), false),
+                ("style", str_prop("Optional label for this piece, such as documentary or ad. It does not pick the camera or the caption. Call edit_skill for that, and set caption_mood yourself."), false),
                 ("aspect", str_prop("landscape, vertical, square — omit to keep the project frame"), false),
                 ("letterbox", str_prop("true only when the piece should be widescreen"), false),
                 ("music_id", str_prop("Imported music file, when the piece needs a bed"), false),
@@ -438,7 +441,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 (
                     "caption_mood",
                     str_prop(
-                        "One theme for every line: clean, kinetic, or bold. Default clean.",
+                        "One theme for every line: clean, kinetic, or bold. Default clean. A vertical frame is not a reason to pick kinetic.",
                     ),
                     false,
                 ),
@@ -453,7 +456,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 (
                     "slots",
                     str_prop(
-                        "Array of {media_id, source_in, duration, transition?, transition_duration?, speed?, end_scale?, ease?, grade?, fx?, fade_in?, fade_out?, cover?}. Omit transition for a cut. dissolve, fade_black, fade_white, wipe_left, slide_up on the slot that needs that join. end_scale about 1.06 to 1.08 only on a hold whose motion is none. ease is in_out, in, out, or linear.",
+                        "Array of {media_id, source_in, duration, transition?, transition_duration?, speed?, end_scale?, ease?, grade?, fx?, fade_in?, fade_out?, cover?}. Omit transition for a cut. dissolve, fade_black, fade_white, wipe_left, slide_up on the slot that needs that join. end_scale above 1 is a push in and below 1 is an ease out, only on a shot the edit page names. Most slots omit it. ease is in_out, in, out, or linear.",
                     ),
                     true,
                 ),
@@ -544,7 +547,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 ),
                 (
                     "caption_mood",
-                    str_prop("One theme for every line: clean, kinetic, or bold. Default clean."),
+                    str_prop("One theme for every line: clean, kinetic, or bold. Default clean. A vertical frame is not a reason to pick kinetic."),
                     false,
                 ),
                 (
@@ -649,7 +652,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "group".into(),
-            description: "Group clips so they move together.".into(),
+            description: "Group two or more clips so they move and select together.".into(),
             input_schema: object(&[(
                 "clip_ids",
                 (
@@ -666,7 +669,8 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "link".into(),
-            description: "Link video and audio clips (J/L cuts stay together).".into(),
+            description: "Link picture and its sound so a move, split, or J/L cut stays together."
+                .into(),
             input_schema: object(&[(
                 "clip_ids",
                 (
@@ -770,30 +774,6 @@ pub fn mcp_tools() -> Vec<McpTool> {
             ]),
         },
         McpTool {
-            name: "group".into(),
-            description: "Group two or more clips so they select together.".into(),
-            input_schema: object(&[(
-                "clip_ids",
-                (
-                    json!({ "type": "array", "items": { "type": "string" } }),
-                    "Clip ids",
-                ),
-                true,
-            )]),
-        },
-        McpTool {
-            name: "link".into(),
-            description: "Link clips so a move or split keeps them together. Picture and its sound.".into(),
-            input_schema: object(&[(
-                "clip_ids",
-                (
-                    json!({ "type": "array", "items": { "type": "string" } }),
-                    "Clip ids",
-                ),
-                true,
-            )]),
-        },
-        McpTool {
             name: "insert".into(),
             description: "Insert a take and push later clips right. Same fields as place_clip.".into(),
             input_schema: object(&[
@@ -843,17 +823,35 @@ pub fn mcp_tools() -> Vec<McpTool> {
             ]),
         },
         McpTool {
+            name: "edit_skill".into(),
+            description: "Return one decision page. It does not change the timeline and it does not render. \
+                 Call it once before submit_edit. \
+                 page is the spine: explainer, product, ad, trailer, documentary, or music. \
+                 promise is that one call only when you cannot name a spine. \
+                 shot, rhythm, color, or revise is that one call only when that decision is the whole request. \
+                 color only after see or watch showed a frame that needs a correction. \
+                 Do not call a second page. Write the page's On the plan lines onto the slots."
+                .into(),
+            input_schema: object(&[(
+                "page",
+                str_prop(
+                    "promise, explainer, product, ad, trailer, documentary, music, shot, rhythm, revise, or color",
+                ),
+                true,
+            )]),
+        },
+        McpTool {
             name: "add_motion".into(),
-            description: "The only graphic. Return one design page, render that design, and place the clip. \
+            description: "The only graphic. Render that design and place the clip. \
                  One call finishes it. A chart, a diagram, a title, a number, a name, a logo, or a place. \
                  Pass design. kind is only a shortcut: kinetic, stat, chart, lower, logo, or map. \
                  design is one of: kinetic-slam, kinetic-typewriter, kinetic-words, kinetic-wave, kinetic-bounce, kinetic-punch, kinetic-blur, kinetic-glitch, kinetic-editorial, kinetic-burst, stat-count, stat-ring, stat-bars, chart-bars, chart-line, chart-pie, chart-race, lower-bar, lower-callout, lower-quote, lower-split, logo-draw, logo-lockup, map-highlight, map-route. \
-                 text is the words or the number, exactly as spoken. The picture already draws them. \
+                 text is the words or the number, exactly as spoken. The clip already shows those words. \
                  prompt is the series, the place, or the mark when the design needs it. \
                  style is bold, editorial, swiss, terminal, spotlight, clean, or neon. \
                  at is the timeline start. duration is the spoken line, from 2 to 8 seconds. \
                  layout is cutaway, beside, or behind. \
-                 See the line first. Call this after the last revise_edit. A camera move is not a reason to call this. Do not render a file."
+                 One watch of the spoken line is enough. Call this after the last revise_edit. A camera move is not a reason to call this. Do not write HTML. Do not render a file."
                 .into(),
             input_schema: object(&[
                 ("design", str_prop("The design id. The tool description lists them"), false),
@@ -878,6 +876,115 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
     ]);
     out
+}
+
+const PIECE_TOOLS: &[&str] = &[
+    "list_bin",
+    "list_timeline",
+    "see",
+    "watch",
+    "list_gaps",
+    "get_media",
+    "list_cues",
+    "edit_skill",
+    "submit_edit",
+    "revise_edit",
+    "add_motion",
+];
+
+/// Tools advertised on this turn. A piece sees the plan. A named trim sees the full catalog.
+#[must_use]
+pub fn tools_for_request(request: &str) -> Vec<McpTool> {
+    let all = mcp_tools();
+    if !crate::is_director_request(request) {
+        return all;
+    }
+    let mut names: Vec<&str> = PIECE_TOOLS.to_vec();
+    names.extend(extra_piece_tools(&request.to_ascii_lowercase()));
+    all.into_iter()
+        .filter(|tool| names.iter().any(|name| *name == tool.name))
+        .collect()
+}
+
+/// True when this call can change the timeline. Inspect, watch, and see do not.
+#[must_use]
+pub fn call_changes_timeline(name: &str) -> bool {
+    !matches!(
+        name,
+        "list_bin"
+            | "list_timeline"
+            | "see"
+            | "watch"
+            | "list_gaps"
+            | "get_media"
+            | "list_cues"
+            | "get_music"
+            | "find_shots"
+            | "edit_skill"
+    )
+}
+
+fn extra_piece_tools(text: &str) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if mentions(text, "mask") || mentions(text, "masks") {
+        names.push("set_mask");
+    }
+    if mentions(text, "curve") || mentions(text, "curves") {
+        names.push("set_curves");
+    }
+    if mentions(text, "cube") || mentions(text, "cubes") || mentions(text, "lut") {
+        names.push("import_cube");
+        names.push("set_grade");
+    }
+    if mentions(text, "generator")
+        || mentions(text, "slate")
+        || mentions(text, "countdown")
+        || mentions(text, "bars")
+    {
+        names.push("add_generator");
+    }
+    if mentions(text, "multicam") {
+        names.push("multicam_cut");
+    }
+    if mentions(text, "marker") || mentions(text, "markers") {
+        names.push("add_marker");
+    }
+    if text.contains("frame rate") || mentions(text, "fps") {
+        names.push("set_frame_rate");
+    }
+    if mentions(text, "letterbox")
+        || text.contains("background color")
+        || (mentions(text, "background") && !mentions(text, "music"))
+    {
+        names.push("set_background");
+    }
+    if text.contains("b-roll")
+        || text.contains("broll")
+        || mentions(text, "generate")
+        || mentions(text, "imagine")
+    {
+        names.push("generate_broll");
+    }
+    if mentions(text, "title") || mentions(text, "titles") {
+        names.push("add_title");
+    }
+    if mentions(text, "trim") {
+        names.push("trim");
+        names.push("trim_end");
+        names.push("place_clip");
+    }
+    if mentions(text, "split") {
+        names.push("split");
+    }
+    if mentions(text, "excerpt") || text.contains("place_clip") {
+        names.push("place_clip");
+    }
+    names
+}
+
+fn mentions(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == word)
 }
 
 pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
@@ -1389,6 +1496,7 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
         }
         "generate_broll" => Err("generate_broll is handled by the host".into()),
         "add_motion" => Err("add_motion is handled by the host".into()),
+        "edit_skill" => Err("edit_skill is handled by the host".into()),
         other => Err(format!("unknown tool {other}")),
     }
 }
@@ -1427,48 +1535,11 @@ fn mcp_for_id(id: crate::ToolId, label: &'static str, tip: &'static str) -> Opti
                 ("duration", num_prop("New duration in seconds"), true),
             ]),
         ),
-        SplitAll => (
-            "split_all",
-            object(&[("at", num_prop("Timeline time in seconds"), true)]),
-        ),
-        MarkIn => (
-            "set_mark_in",
-            object(&[("time", num_prop("Time in seconds"), true)]),
-        ),
-        MarkOut => (
-            "set_mark_out",
-            object(&[("time", num_prop("Time in seconds"), true)]),
-        ),
-        InsertSpace => (
-            "insert_space",
-            object(&[
-                ("at", num_prop("Timeline time in seconds"), true),
-                ("amount", num_prop("Gap in seconds"), true),
-            ]),
-        ),
-        DeleteSpace => (
-            "delete_space",
-            object(&[("at", num_prop("Timeline time in seconds"), true)]),
-        ),
-        DetachAudio => (
-            "detach_audio",
-            object(&[("clip_id", str_prop("Video clip id"), true)]),
-        ),
-        Group => return None,
-        Ungroup => (
-            "ungroup",
-            object(&[("clip_id", str_prop("Any clip in the group"), true)]),
-        ),
-        Link => return None,
-        Unlink => ("unlink", object(&[("clip_id", str_prop("Clip id"), true)])),
-        AddMarker => (
-            "add_marker",
-            object(&[
-                ("time", num_prop("Time in seconds"), true),
-                ("name", str_prop("Label"), false),
-            ]),
-        ),
-        InsertAt | OverwriteAt | AddVideo | AddAudio | AddCaption => return None,
+        // These ids are listed once in `mcp_tools`, with the model-facing schema.
+        SplitAll | MarkIn | MarkOut | InsertSpace | DeleteSpace | DetachAudio | Group | Ungroup
+        | Link | Unlink | AddMarker | InsertAt | OverwriteAt | AddVideo | AddAudio | AddCaption => {
+            return None;
+        }
         Select | Razor | Spacer | Slip | Ripple | Roll | Slide | RateStretch | Multicam => {
             return None;
         }
@@ -1820,6 +1891,14 @@ mod parse_tests {
         assert!(
             matches!(rate, Op::SetFrameRate { frame_rate } if frame_rate == oc_time::FrameRate::FPS_24)
         );
+        let mut seen = std::collections::HashSet::new();
+        for tool in mcp_tools() {
+            assert!(
+                seen.insert(tool.name.clone()),
+                "duplicate tool {}",
+                tool.name
+            );
+        }
         assert!(mcp_tools().iter().any(|tool| tool.name == "generate_broll"));
         assert!(!mcp_tools().iter().any(|tool| tool.name == "add_design"));
         assert!(
@@ -1845,7 +1924,12 @@ mod parse_tests {
             motion.description
         );
         assert!(
-            motion.description.contains("design page"),
+            motion.description.contains("Do not write HTML"),
+            "{}",
+            motion.description
+        );
+        assert!(
+            !motion.description.contains("design page"),
             "{}",
             motion.description
         );
@@ -1862,6 +1946,82 @@ mod parse_tests {
                     "text": "47%",
                     "at": 2.0
                 }),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn piece_tools_are_the_plan_not_the_catalog() {
+        let names = |request: &str| {
+            tools_for_request(request)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>()
+        };
+        let piece = names("make a vlog");
+        for need in [
+            "list_bin",
+            "list_timeline",
+            "see",
+            "watch",
+            "list_gaps",
+            "get_media",
+            "list_cues",
+            "edit_skill",
+            "submit_edit",
+            "revise_edit",
+            "add_motion",
+        ] {
+            assert!(
+                piece.iter().any(|name| name == need),
+                "missing {need} in {piece:?}"
+            );
+        }
+        for hidden in [
+            "set_mask",
+            "add_title",
+            "assemble",
+            "place_clip",
+            "set_curves",
+            "import_cube",
+            "multicam_cut",
+            "add_generator",
+        ] {
+            assert!(
+                !piece.iter().any(|name| name == hidden),
+                "{hidden} leaked into {piece:?}"
+            );
+        }
+        assert_eq!(piece.len(), 11, "{piece:?}");
+        let masked = names("make a vlog and mask the face");
+        assert!(masked.iter().any(|name| name == "set_mask"), "{masked:?}");
+        let titled = names("make a vlog with a title");
+        assert!(titled.iter().any(|name| name == "add_title"), "{titled:?}");
+        let curves = names("make a vlog and bend the curves");
+        assert!(curves.iter().any(|name| name == "set_curves"), "{curves:?}");
+        let trim = names("trim the start");
+        assert!(trim.len() > piece.len(), "{}", trim.len());
+        assert!(trim.iter().any(|name| name == "split"), "{trim:?}");
+        let bed = names("make a vlog with background music");
+        assert!(!bed.iter().any(|name| name == "set_background"), "{bed:?}");
+        let trimmed = names("make a vlog and trim the open");
+        assert!(
+            trimmed.iter().any(|name| name == "place_clip"),
+            "{trimmed:?}"
+        );
+        assert!(trimmed.iter().any(|name| name == "trim"), "{trimmed:?}");
+        assert!(!call_changes_timeline("watch"));
+        assert!(!call_changes_timeline("list_bin"));
+        assert!(!call_changes_timeline("get_media"));
+        assert!(call_changes_timeline("submit_edit"));
+        assert!(call_changes_timeline("place_clip"));
+        assert!(call_changes_timeline("add_motion"));
+        assert!(!call_changes_timeline("edit_skill"));
+        assert!(
+            op_from_mcp(&McpCall {
+                name: "edit_skill".into(),
+                arguments: json!({ "page": "color" }),
             })
             .is_err()
         );

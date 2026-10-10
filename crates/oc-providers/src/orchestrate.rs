@@ -473,7 +473,8 @@ fn build_prompt(system: &str, turns: &[ChatTurn], tools: &[McpTool], mcp_attache
             out.push_str(&format!("- {}: {}\n", tool.name, tool.description));
         }
         out.push_str(
-            "Call the tools. Do not print TOOL lines when MCP works. \
+            "Call a tool only when the cut needs it. The inventory above is already loaded. \
+             Do not print TOOL lines when MCP works. \
              After edits, reply in 2–4 short sentences.\n",
         );
     } else if !tools.is_empty() {

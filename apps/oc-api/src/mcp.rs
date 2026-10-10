@@ -1,7 +1,7 @@
 //! Stdio MCP: every OpenCut edit/inspect tool. Spawned as `oc-api mcp`
 //! with OPENCUT_PROJECT_ID set. ACP `session/new` gets this as `mcpServers`.
 
-use oc_core::mcp_tools;
+use oc_core::{McpTool, mcp_tools};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
@@ -46,7 +46,8 @@ pub async fn serve() -> anyhow::Result<()> {
 }
 
 /// ACP `mcpServers` entry so Grok / Claude / Codex get the OpenCut tools.
-pub fn builtin_mcp_acp(project_id: &str) -> Option<Value> {
+/// `tool_allow` is a comma-separated name list. Empty or missing keeps the full catalog.
+pub fn builtin_mcp_acp(project_id: &str, tool_allow: Option<&str>) -> Option<Value> {
     let exe = std::env::current_exe().ok()?;
     if !exe.is_file() {
         return None;
@@ -74,6 +75,9 @@ pub fn builtin_mcp_acp(project_id: &str) -> Option<Value> {
                 env.push(json!({ "name": key, "value": value }));
             }
         }
+    }
+    if let Some(allow) = tool_allow.map(str::trim).filter(|allow| !allow.is_empty()) {
+        env.push(json!({ "name": "OPENCUT_TOOL_ALLOW", "value": allow }));
     }
     Some(json!({
         "name": "opencut",
@@ -152,7 +156,28 @@ async fn handle_rpc(msg: &Value) -> Option<Value> {
 }
 
 fn tools_list() -> Value {
-    json!({ "tools": mcp_tools() })
+    let allow = std::env::var("OPENCUT_TOOL_ALLOW").ok();
+    let allow = allow
+        .as_deref()
+        .map(str::trim)
+        .filter(|allow| !allow.is_empty());
+    json!({ "tools": filter_advertised(mcp_tools(), allow) })
+}
+
+fn filter_advertised(mut tools: Vec<McpTool>, allow: Option<&str>) -> Vec<McpTool> {
+    let Some(allow) = allow.map(str::trim).filter(|allow| !allow.is_empty()) else {
+        return tools;
+    };
+    let names: Vec<&str> = allow
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return tools;
+    }
+    tools.retain(|tool| names.iter().any(|name| *name == tool.name));
+    tools
 }
 
 async fn see_result(id: Option<Value>, args: Value) -> Value {
@@ -333,12 +358,40 @@ mod tests {
 
     #[test]
     fn builtin_acp_entry() {
-        let Some(mcp) = builtin_mcp_acp("11111111-1111-1111-1111-111111111111") else {
+        let Some(mcp) = builtin_mcp_acp("11111111-1111-1111-1111-111111111111", None) else {
             return;
         };
         assert_eq!(mcp["name"], "opencut");
         assert_eq!(mcp["args"][0], "mcp");
         let env = mcp["env"].as_array().unwrap();
         assert!(env.iter().any(|e| e["name"] == "OPENCUT_PROJECT_ID"));
+        assert!(!env.iter().any(|e| e["name"] == "OPENCUT_TOOL_ALLOW"));
+        let Some(limited) = builtin_mcp_acp(
+            "11111111-1111-1111-1111-111111111111",
+            Some("watch,submit_edit"),
+        ) else {
+            return;
+        };
+        let limited_env = limited["env"].as_array().unwrap();
+        assert!(
+            limited_env.iter().any(|e| {
+                e["name"] == "OPENCUT_TOOL_ALLOW" && e["value"] == "watch,submit_edit"
+            })
+        );
+    }
+
+    #[test]
+    fn an_allow_list_hides_the_rest_of_the_catalog() {
+        let all = mcp_tools();
+        assert_eq!(filter_advertised(all.clone(), None).len(), all.len());
+        assert_eq!(filter_advertised(all.clone(), Some("")).len(), all.len());
+        assert_eq!(filter_advertised(all.clone(), Some("  ")).len(), all.len());
+        let piece = filter_advertised(all, Some("watch,submit_edit,add_motion"));
+        let names: Vec<_> = piece.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"watch"), "{names:?}");
+        assert!(names.contains(&"submit_edit"), "{names:?}");
+        assert!(names.contains(&"add_motion"), "{names:?}");
+        assert!(!names.contains(&"set_mask"), "{names:?}");
     }
 }

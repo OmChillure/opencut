@@ -17,16 +17,70 @@ pub struct Spoken {
 pub struct CutReview {
     pub text: String,
     pub issues: bool,
-    /// Taste notes. They block "done" only in director mode, and only for two rounds.
+    /// Taste notes. Shown to the model. They do not start another round and they do not block export.
     pub notes: bool,
+}
+
+/// Host follow-up after a tool batch. An inspect-only batch does not attach the review.
+#[must_use]
+pub fn follow_after_tools(
+    logged: &str,
+    review: &str,
+    timeline_changed: bool,
+    piece: bool,
+) -> String {
+    if !timeline_changed {
+        if piece && logged.contains("edit_skill") {
+            return format!(
+                "{logged}\n\
+                 The timeline is unchanged. Write that page's On the plan lines onto the slots. \
+                 Do not call edit_skill again. Call submit_edit when the piece is ready."
+            );
+        }
+        if piece {
+            return format!(
+                "{logged}\n\
+                 The timeline is unchanged. Use what you already have and call submit_edit when the piece is ready. \
+                 Watch only a span the shot list does not describe."
+            );
+        }
+        return format!(
+            "{logged}\n\
+             The timeline is unchanged. Use what you already have and call the tool this request names."
+        );
+    }
+    let next = if piece {
+        "If a line starts with \"fix:\", correct it with one revise_edit. \
+         A note: line is taste. It does not need another call. \
+         If the cut matches the request, reply in 2–4 sentences."
+    } else {
+        "If a line starts with \"fix:\", correct it with tools. \
+         A note: line is taste. It does not need another call. \
+         If the cut matches the request, reply in 2–4 sentences."
+    };
+    format!("{logged}\n{review}\n{next}")
+}
+
+/// Host follow-up when a finished reply still has a structural fix: line.
+#[must_use]
+pub fn follow_after_text(review: &str, piece: bool) -> String {
+    if piece {
+        format!(
+            "{review}\nThose fix: lines are still open. Correct them with one revise_edit. \
+             A note: line does not need a tool. Do not describe the cut as done."
+        )
+    } else {
+        format!(
+            "{review}\nThose fix: lines are still open. Correct them with tools. \
+             A note: line does not need a tool. Do not describe the cut as done."
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewFacts {
     pub beats: Vec<f64>,
     pub has_music: bool,
-    /// Target average shot length from the style guide, when one is loaded.
-    pub target_shot: Option<f64>,
     /// Shot scale in timeline order, when the vision card exists.
     pub scales: Vec<String>,
     pub qualities: Vec<u8>,
@@ -87,7 +141,6 @@ impl ReviewFacts {
         Self {
             beats,
             has_music,
-            target_shot: None,
             scales,
             qualities,
             motion_dirs,
@@ -225,17 +278,6 @@ fn taste_notes(timeline: &Timeline, videos: &[&Clip], facts: &ReviewFacts) -> Ve
         let pct = on as f64 / (videos.len() - 1) as f64;
         if pct < 0.70 {
             notes.push(format!("only {:.0}% of cuts land on a beat", pct * 100.0));
-        }
-    }
-    if let Some(target) = facts.target_shot {
-        if !videos.is_empty() {
-            let avg =
-                videos.iter().map(|c| c.duration.as_seconds()).sum::<f64>() / videos.len() as f64;
-            if (avg - target).abs() > target * 0.4 {
-                notes.push(format!(
-                    "average shot {avg:.1}s vs the style target {target:.1}s"
-                ));
-            }
         }
     }
     if facts.qualities.iter().any(|q| *q > 0 && *q < 5) {
@@ -882,7 +924,6 @@ mod tests {
         let facts = ReviewFacts {
             beats: vec![0.0, 10.0],
             has_music: true,
-            target_shot: Some(8.0),
             scales: vec!["CU".into(), "CU".into(), "CU".into()],
             qualities: vec![3],
             motion_dirs: vec!["l2r".into(), "r2l".into()],
@@ -893,7 +934,6 @@ mod tests {
             "same shot size",
             "same transition",
             "cuts land on a beat",
-            "average shot",
             "scored under 5",
             "motion direction reverses",
             "no grade",
@@ -911,6 +951,38 @@ mod tests {
             "{}",
             review.text
         );
+    }
+
+    #[test]
+    fn an_inspect_batch_does_not_order_a_fix() {
+        let text = follow_after_tools(
+            "tools\nlist_bin\n",
+            "fix: timeline has no picture",
+            false,
+            true,
+        );
+        assert!(!text.contains("fix:"), "{text}");
+        assert!(!text.contains("correct"), "{text}");
+        assert!(text.contains("unchanged"), "{text}");
+        assert!(text.contains("submit_edit"), "{text}");
+        let skill = follow_after_tools("tools\nedit_skill: # Ad\n", "", false, true);
+        assert!(skill.contains("On the plan"), "{skill}");
+        assert!(skill.contains("Do not call edit_skill again"), "{skill}");
+        let changed = follow_after_tools(
+            "tools\nsubmit_edit\n",
+            "fix: length\nnote: taste",
+            true,
+            true,
+        );
+        assert!(changed.contains("fix: length"), "{changed}");
+        assert!(changed.contains("one revise_edit"), "{changed}");
+        assert!(changed.contains("does not need another call"), "{changed}");
+        let trim = follow_after_text("fix: gap", false);
+        assert!(trim.contains("with tools"), "{trim}");
+        assert!(!trim.contains("revise_edit"), "{trim}");
+        let piece = follow_after_text("fix: gap\nnote: slow", true);
+        assert!(piece.contains("one revise_edit"), "{piece}");
+        assert!(piece.contains("does not need a tool"), "{piece}");
     }
 
     fn long_speech(media: MediaId) -> Vec<Spoken> {

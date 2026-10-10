@@ -15,25 +15,6 @@ pub fn shared_prompts() -> &'static str {
     CACHE.get_or_init(load)
 }
 
-/// One style guide, only when the request names it. The others stay on disk.
-#[must_use]
-pub fn style_guide(request: &str) -> Option<String> {
-    let lower = request.to_ascii_lowercase();
-    let name = if lower.contains("cinematic") {
-        "cinematic"
-    } else if lower.contains("hype") || lower.contains("tiktok") {
-        "hype"
-    } else if lower.contains("documentary") || lower.contains("doc ") {
-        "documentary"
-    } else if lower.contains("vlog") {
-        "vlog"
-    } else {
-        return None;
-    };
-    let path = prompts_dir().join("styles").join(format!("{name}.md"));
-    std::fs::read_to_string(path).ok()
-}
-
 /// Prepend director briefs to a per-request system string.
 #[must_use]
 pub fn with_shared_prompts(system: &str) -> String {
@@ -138,15 +119,38 @@ mod tests {
         assert!(text.contains("source_in"), "{text}");
         assert!(text.contains("one caption theme"), "{text}");
         assert!(text.contains("caption_mood"), "{text}");
+        assert!(
+            text.contains("vertical reel is not automatically hype"),
+            "{text}"
+        );
+        assert!(!text.contains("1.06 to 1.08"), "{text}");
         assert!(!text.contains("add_design"), "{text}");
         assert!(text.contains("shot list already has `motion`"), "{text}");
         assert!(text.contains("add_motion"), "{text}");
+        assert!(text.contains("edit_skill"), "{text}");
+        assert!(!text.contains("about 1.12"), "{text}");
+        assert!(!text.contains("about 1.06"), "{text}");
+        assert!(!text.contains("about 1.04"), "{text}");
+        assert!(!text.contains("`caption_mood` kinetic"), "{text}");
         assert!(text.contains("kinetic-slam"), "{text}");
         assert!(text.contains("chart-bars"), "{text}");
-        assert!(text.contains("design page"), "{text}");
+        assert!(text.contains("On the plan"), "{text}");
+        assert!(text.contains("Do not call `edit_skill` again"), "{text}");
+        assert!(text.contains("Do not write HTML"), "{text}");
+        assert!(!text.contains("design page"), "{text}");
         assert!(!text.contains("load_motion_skill"), "{text}");
         assert!(!text.contains("import_render"), "{text}");
         assert!(!text.to_ascii_lowercase().contains("only claude"));
         assert!(!text.contains("npx hyperframes init"), "{text}");
+        assert!(text.contains("already has the bin"), "{text}");
+        assert!(text.contains("A `note:` line is taste"), "{text}");
+        assert!(!text.contains("Repeat for each keep"), "{text}");
+        assert!(
+            !text.contains("Call `list_bin` and `list_timeline` first"),
+            "{text}"
+        );
+        assert!(!text.contains("call the tool each join needs"), "{text}");
+        assert!(!text.contains("See the start, middle, and end"), "{text}");
+        assert!(!text.contains("Call `watch` before you cut"), "{text}");
     }
 }

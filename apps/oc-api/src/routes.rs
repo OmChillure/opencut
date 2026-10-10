@@ -5,12 +5,12 @@ use axum::body::Body;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use oc_core::time::TICKS_PER_SECOND;
 use oc_core::{
-    MediaId, Op, Project, ProjectId, Timeline, UndoStack, apply, is_director_request, mcp_tools,
-    review_cut,
+    MediaId, Op, Project, ProjectId, Timeline, UndoStack, apply, call_changes_timeline,
+    follow_after_text, follow_after_tools, is_director_request, review_cut, tools_for_request,
 };
 use oc_media::{ObjectKind, object_key};
 use oc_providers::{ChatEvent, ChatTurn, LlmReply};
@@ -501,7 +501,7 @@ async fn run_chat(
             .iter()
             .any(|m| speech.contains_key(&m.id) || looks.contains_key(&m.id));
         let needs_scan = media.iter().any(|m| {
-            if m.content_type.starts_with("image/") {
+            if m.content_type.starts_with("image/") || !oc_db::is_r2_object_key(&m.r2_key) {
                 return false;
             }
             let stale = looks.get(&m.id).is_some_and(|l| {
@@ -555,24 +555,55 @@ async fn run_chat(
                     &tx,
                     serde_json::json!({
                         "type": "status",
-                        "text": "This clip is not on R2 yet. Import it again."
+                        "text": "This clip stays in the browser that imported it. The shot list runs for a file stored on the server."
                     }),
                 )
                 .await;
             }
         }
     }
-    let tools = mcp_tools();
-    let mut system = format!("Project '{}'.", project.name);
-    if let Some(guide) = oc_providers::style_guide(&last_user) {
-        system.push_str("\n\n");
-        system.push_str(&guide);
-    }
+    // Understand may have finished during the wait. Reload so the opening
+    // inventory is not the snapshot from before the shot list existed.
+    let speech = match oc_db::list_transcripts_for_project(&state.db, id).await {
+        Ok(rows) => speech_by_media(&rows),
+        Err(err) => {
+            tracing::warn!(project = %id, "opening inventory kept the earlier speech: {err}");
+            speech
+        }
+    };
+    let looks = match oc_db::list_analysis_for_project(&state.db, id).await {
+        Ok(rows) => look_by_media(&rows),
+        Err(err) => {
+            tracing::warn!(project = %id, "opening inventory kept the earlier shot list: {err}");
+            looks
+        }
+    };
+    let tools = tools_for_request(&last_user);
+    let piece = is_director_request(&last_user);
+    let mut system = format!("Project '{}'.\n\n", project.name);
+    system.push_str(&edit::opening_inventory(
+        &project.timeline,
+        &media,
+        &speech,
+        &looks,
+    ));
     let mut turns = body.messages;
     let mut text = String::new();
+    let mut queued_export: Option<(String, bool)> = None;
     let (ev_tx, ev_rx) = mpsc::channel::<ChatEvent>(64);
     let pump = tokio::spawn(forward_events(ev_rx, tx.clone(), state.db.clone(), id));
-    let mcp_servers = crate::mcp::builtin_mcp_acp(&id.to_string())
+    let tool_allow = if piece {
+        Some(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    } else {
+        None
+    };
+    let mcp_servers = crate::mcp::builtin_mcp_acp(&id.to_string(), tool_allow.as_deref())
         .into_iter()
         .collect::<Vec<_>>();
     tracing::info!(
@@ -594,7 +625,6 @@ async fn run_chat(
     .map_err(|e| e.to_string())?;
     let mut message =
         oc_providers::opening_prompt(&system, &turns, &tools, !mcp_servers.is_empty());
-    let mut note_rounds = 0_u32;
     let mut seen: Vec<oc_providers::PromptImage> = Vec::new();
     for turn_i in 0..8 {
         if tx.is_closed() {
@@ -640,18 +670,10 @@ async fn run_chat(
         match reply {
             LlmReply::Text(t) => {
                 let review = fresh_review(&state, id, &last_user).await;
-                let director = oc_core::is_director_request(&last_user);
-                let note_blocks = review.notes && director && note_rounds < 2;
-                if (review.issues || note_blocks) && turn_i + 1 < 8 {
-                    if note_blocks {
-                        note_rounds += 1;
-                    }
+                let director = is_director_request(&last_user);
+                if review.issues && turn_i + 1 < 8 {
                     tracing::info!(project = %id, "cut review rejected a finished reply");
-                    let follow = format!(
-                        "{}\nThose fix: lines are still open. note: lines matter for two rounds. \
-                         Correct them with tools. Do not describe the cut as done.",
-                        review.text
-                    );
+                    let follow = follow_after_text(&review.text, director);
                     turns.push(ChatTurn {
                         role: "assistant".into(),
                         content: t,
@@ -667,10 +689,25 @@ async fn run_chat(
                 if director && !review.issues {
                     if let Ok(fresh) = oc_db::get_project(&state.db, id).await {
                         let preset = export_preset(&fresh.timeline);
-                        match edit::queue_export(&state.db, id, preset).await {
-                            Ok(()) => notes.push(format!("export queued {}", preset.label())),
-                            Err(err) => {
-                                tracing::error!(project = %id, "export queue failed: {err}")
+                        let rows = oc_db::list_media(&state.db, id).await.unwrap_or_default();
+                        if sources_need_browser(&fresh.timeline, &rows) {
+                            queued_export = Some((preset.label().to_string(), true));
+                            notes.push(
+                                "This browser sends the clips, then the finished video is stored on Cloudflare."
+                                    .into(),
+                            );
+                        } else {
+                            match edit::queue_export(&state.db, id, preset).await {
+                                Ok(()) => {
+                                    queued_export = Some((preset.label().to_string(), false));
+                                    notes.push(format!(
+                                        "export queued {}. The finished video is stored on Cloudflare.",
+                                        preset.label()
+                                    ));
+                                }
+                                Err(err) => {
+                                    tracing::error!(project = %id, "export queue failed: {err}")
+                                }
                             }
                         }
                     }
@@ -679,7 +716,11 @@ async fn run_chat(
             }
             LlmReply::Tools(calls) => {
                 let mut batch = String::new();
+                let mut changed = false;
                 for (i, call) in calls.into_iter().enumerate() {
+                    if call_changes_timeline(&call.name) {
+                        changed = true;
+                    }
                     let tool_id = format!("host-{turn_i}-{i}-{}", call.name);
                     emit_host_tool(
                         &tx,
@@ -701,7 +742,8 @@ async fn run_chat(
                             .await
                         {
                             Ok(out) => {
-                                if !out.starts_with("bin:")
+                                if call.name != "edit_skill"
+                                    && !out.starts_with("bin:")
                                     && !out.starts_with("Current timeline")
                                     && !out.starts_with("media ")
                                 {
@@ -746,14 +788,12 @@ async fn run_chat(
                     role: "assistant".into(),
                     content: logged.clone(),
                 });
-                let review = fresh_review(&state, id, &last_user).await;
-                let follow = format!(
-                    "{logged}\n{review}\n\
-                     If a line starts with \"fix:\", correct it with tools. \
-                     note: lines matter for two rounds in a full edit. \
-                     If the cut matches the request, reply in 2–4 sentences.",
-                    review = review.text
-                );
+                let follow = if changed {
+                    let review = fresh_review(&state, id, &last_user).await;
+                    follow_after_tools(&logged, &review.text, true, piece)
+                } else {
+                    follow_after_tools(&logged, "", false, piece)
+                };
                 turns.push(ChatTurn {
                     role: "user".into(),
                     content: follow.clone(),
@@ -777,7 +817,17 @@ async fn run_chat(
         chars = text.len(),
         "chat done"
     );
-    finish_chat(&tx, &text, &notes, &project.timeline).await;
+    let export_preset = queued_export.as_ref().map(|(name, _)| name.as_str());
+    let export_handoff = queued_export.as_ref().is_some_and(|(_, handoff)| *handoff);
+    finish_chat(
+        &tx,
+        &text,
+        &notes,
+        &project.timeline,
+        export_preset,
+        export_handoff,
+    )
+    .await;
     Ok(())
 }
 
@@ -865,6 +915,9 @@ fn export_preset(timeline: &Timeline) -> oc_core::ExportPreset {
 }
 
 fn compact_tool(name: &str, result: &str) -> String {
+    if name == "edit_skill" {
+        return format!("{name}: {result}");
+    }
     let short: String = result
         .lines()
         .find(|line| !line.trim().is_empty())
@@ -899,17 +952,34 @@ async fn emit_host_tool(
     .await;
 }
 
-async fn finish_chat(tx: &mpsc::Sender<String>, text: &str, notes: &[String], timeline: &Timeline) {
-    push(
-        tx,
-        serde_json::json!({
-            "type": "done",
-            "text": text,
-            "notes": notes,
-            "timeline": timeline,
-        }),
-    )
-    .await;
+async fn finish_chat(
+    tx: &mpsc::Sender<String>,
+    text: &str,
+    notes: &[String],
+    timeline: &Timeline,
+    export_preset: Option<&str>,
+    export_handoff: bool,
+) {
+    let mut body = serde_json::json!({
+        "type": "done",
+        "text": text,
+        "notes": notes,
+        "timeline": timeline,
+    });
+    if let Some(preset) = export_preset {
+        body["export_preset"] = serde_json::Value::String(preset.to_string());
+        body["export_handoff"] = serde_json::Value::Bool(export_handoff);
+    }
+    push(tx, body).await;
+}
+
+/// True when a queued render would skip a clip because its bytes are not on Cloudflare.
+fn sources_need_browser(timeline: &Timeline, rows: &[oc_db::MediaRow]) -> bool {
+    timeline.source_media_ids().into_iter().any(|id| {
+        rows.iter()
+            .find(|row| row.id == id.as_uuid())
+            .is_none_or(|row| !oc_db::is_r2_object_key(&row.r2_key))
+    })
 }
 
 #[derive(Deserialize)]
@@ -966,6 +1036,34 @@ pub async fn put_media_bytes(
         oc_db::set_media_status(&state.db, media_id, "transcribing").await?;
     }
     Ok(Json(serde_json::json!({ "ok": true, "key": key })))
+}
+
+/// Hold source bytes for one render. The media row stays a browser clip: no R2 key,
+/// no status change, and no transcript job.
+pub async fn put_media_spool(
+    State(state): State<AppState>,
+    Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    owned(&state, id, &email).await?;
+    if body.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty clip"));
+    }
+    let media = oc_db::get_media(&state.db, media_id).await?;
+    if media.project_id != id {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
+    }
+    oc_db::write_render_spool(id, media_id, &media.filename, &body)
+        .await
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not hold the clip for render: {err}"),
+            )
+        })?;
+    tracing::info!(project = %id, media = %media_id, bytes = body.len(), "spooled for render");
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn register_media(
@@ -1135,7 +1233,7 @@ pub async fn get_media_file(
     }
     Err(ApiError::new(
         StatusCode::NOT_FOUND,
-        "media file is not on R2 — import the clip again",
+        "this clip stays in the browser that imported it",
     ))
 }
 
@@ -1146,6 +1244,12 @@ const EXPORT_CLOCK_SLACK_MS: u64 = 5_000;
 pub(crate) struct ExportQuery {
     #[serde(default)]
     preset: String,
+    #[serde(default)]
+    probe: String,
+}
+
+fn export_probe_requested(raw: &str) -> bool {
+    matches!(raw, "1" | "true" | "yes")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1188,13 +1292,19 @@ fn export_preset_wire(preset: oc_core::ExportPreset) -> String {
 }
 
 fn parse_export_preset(raw: &str) -> Option<oc_core::ExportPreset> {
-    match raw.trim() {
-        "youtube-1080" | "youtube_1080" | "youtube1080" => Some(oc_core::ExportPreset::Youtube1080),
-        "vertical-1080" | "vertical_1080" | "vertical1080" => {
-            Some(oc_core::ExportPreset::Vertical1080)
-        }
-        "square-1080" | "square_1080" | "square1080" => Some(oc_core::ExportPreset::Square1080),
-        _ => None,
+    oc_core::ExportPreset::parse(raw)
+}
+
+/// What the export page should do before the file exists.
+fn export_probe_state(file_ready: bool, job_status: Option<&str>) -> &'static str {
+    if file_ready {
+        "ready"
+    } else if job_status == Some("failed") {
+        "failed"
+    } else if matches!(job_status, Some("queued" | "running" | "done")) {
+        "pending"
+    } else {
+        "idle"
     }
 }
 
@@ -1344,6 +1454,9 @@ pub async fn get_export(
 ) -> ApiResult<Response> {
     owned(&state, id, &email).await?;
     let preset = requested_preset(&state, id, &query.preset).await?;
+    if export_probe_requested(&query.probe) {
+        return export_probe(&state, id, preset).await;
+    }
     match locate_export(&state, id, preset).await? {
         LocatedExport::Local(path) => {
             serve_local_file(&path, "video/mp4", headers.get(header::RANGE))
@@ -1366,6 +1479,35 @@ pub async fn get_export(
                 .unwrap_or_else(|_| Response::new(Body::empty())))
         }
     }
+}
+
+async fn export_probe(
+    state: &AppState,
+    id: Uuid,
+    preset: oc_core::ExportPreset,
+) -> ApiResult<Response> {
+    let located = locate_export(state, id, preset).await;
+    let file_ready = located.is_ok();
+    if let Err(err) = located {
+        if err.status != StatusCode::NOT_FOUND {
+            return Err(err);
+        }
+    }
+    let wire = export_preset_wire(preset);
+    let job = oc_db::latest_export_status(&state.db, id, &wire).await?;
+    let status = job.as_ref().map(|(status, _)| status.as_str());
+    let state_name = export_probe_state(file_ready, status);
+    let error = if state_name == "failed" {
+        job.and_then(|(_, error)| error.filter(|text| !text.is_empty()))
+            .unwrap_or_else(|| "render failed".into())
+    } else {
+        String::new()
+    };
+    Ok(Json(serde_json::json!({
+        "state": state_name,
+        "error": error,
+    }))
+    .into_response())
 }
 
 fn with_no_store(mut response: Response) -> Response {
@@ -1514,7 +1656,7 @@ pub(crate) fn upload_follow_up(
     content_type: &str,
 ) -> Result<UploadFollowUp, &'static str> {
     if !oc_db::is_r2_object_key(key) {
-        return Err("the file is not on R2 yet — import it again");
+        return Err("this clip stays in the browser that imported it");
     }
     if content_type.starts_with("image/") {
         Ok(UploadFollowUp::Ready)
@@ -1692,7 +1834,10 @@ mod tests {
 
     #[test]
     fn upload_complete_waits_for_an_r2_object() {
-        assert!(upload_follow_up("workspace/abc", "video/mp4").is_err());
+        assert_eq!(
+            upload_follow_up("workspace/abc", "video/mp4"),
+            Err("this clip stays in the browser that imported it")
+        );
         assert!(upload_follow_up("local/clip.mp4", "video/mp4").is_err());
         assert!(upload_follow_up("", "video/mp4").is_err());
         assert_eq!(
@@ -1703,6 +1848,72 @@ mod tests {
             upload_follow_up("raw/p/m/a.png", "image/png").unwrap(),
             UploadFollowUp::Ready
         );
+    }
+
+    #[test]
+    fn a_browser_clip_has_no_server_play_url() {
+        let project = Uuid::now_v7();
+        let media = Uuid::now_v7();
+        assert_eq!(media_play_url(project, media, "workspace/abc"), None);
+        assert_eq!(media_play_url(project, media, "local/clip.mp4"), None);
+        assert_eq!(media_play_url(project, media, ""), None);
+        let remote = media_play_url(project, media, "raw/p/m/a.mp4").expect("r2 url");
+        assert!(remote.contains(&media.to_string()), "{remote}");
+        assert!(!remote.starts_with("blob:"), "{remote}");
+    }
+
+    #[test]
+    fn a_browser_timeline_waits_for_this_browser_before_export() {
+        let project = Uuid::now_v7();
+        let media = Uuid::now_v7();
+        let row: oc_db::MediaRow = serde_json::from_value(serde_json::json!({
+            "id": media,
+            "project_id": project,
+            "r2_key": format!("workspace/{media}"),
+            "filename": "take.mp4",
+            "content_type": "video/mp4",
+            "status": "browser",
+            "created_at": "2026-10-08T00:00:00Z",
+        }))
+        .unwrap();
+        let mut timeline = Timeline::default();
+        let track = timeline.first_track(oc_core::TrackKind::Video).unwrap().id;
+        timeline
+            .add_clip(
+                track,
+                oc_core::Clip {
+                    id: oc_core::ClipId::new(),
+                    media_id: Some(oc_core::MediaId::from_uuid(media)),
+                    kind: oc_core::ClipKind::Video {
+                        transform: oc_core::Transform::default(),
+                    },
+                    start: oc_core::Time::ZERO,
+                    duration: oc_core::Duration::from_seconds(2.0),
+                    source_in: oc_core::Time::ZERO,
+                    speed: 1.0,
+                    group_id: None,
+                    link_id: None,
+                    disabled: false,
+                    look: oc_core::ClipLook::default(),
+                },
+            )
+            .unwrap();
+        assert!(sources_need_browser(&timeline, &[row.clone()]));
+        let mut remote = row;
+        remote.r2_key = format!("raw/{project}/{media}/take.mp4");
+        assert!(!sources_need_browser(&timeline, &[remote]));
+        assert!(sources_need_browser(&timeline, &[]));
+    }
+
+    #[test]
+    fn an_export_probe_stays_idle_until_a_job_exists() {
+        assert_eq!(export_probe_state(true, Some("failed")), "ready");
+        assert_eq!(export_probe_state(false, None), "idle");
+        assert_eq!(export_probe_state(false, Some("queued")), "pending");
+        assert_eq!(export_probe_state(false, Some("running")), "pending");
+        assert_eq!(export_probe_state(false, Some("failed")), "failed");
+        assert!(export_probe_requested("1"));
+        assert!(!export_probe_requested(""));
     }
 
     #[test]

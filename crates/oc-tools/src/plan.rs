@@ -500,13 +500,7 @@ fn finish_picture(
 }
 
 fn caption_mood(plan: &EditPlan) -> CaptionMood {
-    if let Some(mood) = plan.caption_mood {
-        return mood;
-    }
-    match plan.aspect.to_ascii_lowercase().as_str() {
-        "vertical" | "9:16" | "reel" | "portrait" => CaptionMood::Kinetic,
-        _ => CaptionMood::Clean,
-    }
+    CaptionMood::resolve(plan.caption_mood, &plan.style)
 }
 
 /// The mix for this cut. A composed look wins. A named mood only fills empty roles.
@@ -1151,12 +1145,90 @@ mod tests {
             .expect("captions");
         assert_eq!(cues.len(), 2, "{cues:?}");
         assert_eq!(cues[0].place, oc_timeline::CaptionPlace::Lower);
-        assert_eq!(cues[0].font, oc_timeline::CaptionFont::Display);
+        assert_eq!(cues[0].font, oc_timeline::CaptionFont::Sans);
         assert_eq!(cues[0].effect, oc_timeline::CaptionEffect::Pop);
         assert_eq!(cues[1].place, oc_timeline::CaptionPlace::Lower);
         assert_eq!(cues[1].font, cues[0].font);
         assert_eq!(cues[1].effect, cues[0].effect);
         assert_ne!(cues[1].place, oc_timeline::CaptionPlace::Middle);
+    }
+
+    #[test]
+    fn style_does_not_pick_the_caption_and_vertical_stays_clean() {
+        let picture = MediaId::new();
+        let lines = vec![SpokenLine {
+            media: picture,
+            start: 2.2,
+            end: 4.0,
+            text: "Go now".into(),
+        }];
+        let mut wide = window(picture, 0.0, 10.0, "bright-wide", false);
+        wide.subject = "street".into();
+
+        let mut hype = Timeline::default();
+        let hype_plan = EditPlan {
+            style: "hype".into(),
+            aspect: "vertical".into(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: true,
+            caption_mood: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![slot(picture, 2.0)],
+        };
+        let notes = build_plan(&mut hype, &hype_plan, &[wide.clone()], &[], &lines, &[]).unwrap();
+        assert!(notes.iter().any(|note| note == "captions clean"));
+        let cue = first_cue(&hype);
+        assert_eq!(cue.place, oc_timeline::CaptionPlace::Bottom);
+        assert_eq!(cue.font, oc_timeline::CaptionFont::Sans);
+        assert_eq!(cue.effect, oc_timeline::CaptionEffect::Fade);
+
+        let mut documentary = Timeline::default();
+        let doc_plan = EditPlan {
+            style: "documentary".into(),
+            ..hype_plan.clone()
+        };
+        let notes = build_plan(
+            &mut documentary,
+            &doc_plan,
+            &[wide.clone()],
+            &[],
+            &lines,
+            &[],
+        )
+        .unwrap();
+        assert!(notes.iter().any(|note| note == "captions clean"));
+        let cue = first_cue(&documentary);
+        assert_eq!(cue.place, oc_timeline::CaptionPlace::Bottom);
+        assert_eq!(cue.font, oc_timeline::CaptionFont::Sans);
+        assert_eq!(cue.effect, oc_timeline::CaptionEffect::Fade);
+
+        let mut vertical = Timeline::default();
+        let plain = EditPlan {
+            style: String::new(),
+            aspect: "vertical".into(),
+            ..hype_plan
+        };
+        let notes = build_plan(&mut vertical, &plain, &[wide], &[], &lines, &[]).unwrap();
+        assert!(notes.iter().any(|note| note == "captions clean"));
+        let cue = first_cue(&vertical);
+        assert_eq!(cue.font, oc_timeline::CaptionFont::Sans);
+        assert_eq!(cue.effect, oc_timeline::CaptionEffect::Fade);
+        assert_eq!(cue.place, oc_timeline::CaptionPlace::Bottom);
+    }
+
+    fn first_cue(timeline: &Timeline) -> oc_timeline::CaptionCue {
+        timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find_map(|clip| match &clip.kind {
+                ClipKind::Caption { cues, .. } => cues.first().cloned(),
+                _ => None,
+            })
+            .expect("caption")
     }
 
     #[test]

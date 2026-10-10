@@ -30,6 +30,10 @@ pub(crate) async fn call_tool(
     name: &str,
     arguments: Value,
 ) -> Result<String, String> {
+    if name == "edit_skill" {
+        let page = arguments.get("page").and_then(Value::as_str).unwrap_or("");
+        return crate::edit_skill::page(page);
+    }
     let mut project = oc_db::get_project(db, project_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -198,7 +202,7 @@ fn design_layout(raw: Option<&str>) -> oc_core::DesignLayout {
     }
 }
 
-/// One motion graphic. The host reads the design page, renders it, and places the clip.
+/// One motion graphic. The host renders the design and places the clip.
 async fn add_motion(
     db: &Db,
     project_id: Uuid,
@@ -247,8 +251,8 @@ async fn add_motion(
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!(
-        "placed {} media {media_id} ({:?}, {seconds:.1}s, {aspect}). The clip is on the timeline. Do not render a file. {}\n\n# {}\n{}\n\n{}\n\nThe clip is already placed. This page is the design. Do not run a renderer.",
-        ask.design, ask.layout, applied.note, ask.design, ask.page_path, ask.page
+        "placed {} media {media_id} ({:?}, {seconds:.1}s, {aspect}). The clip is on the timeline. {}. Do not write HTML. Do not render a file.",
+        ask.design, ask.layout, applied.note
     ))
 }
 
@@ -261,8 +265,6 @@ struct MotionAsk {
     layout: oc_core::DesignLayout,
     prompt: String,
     style: String,
-    page_path: String,
-    page: String,
 }
 
 fn motion_ask(arguments: &Value) -> Result<MotionAsk, String> {
@@ -317,7 +319,6 @@ fn motion_ask(arguments: &Value) -> Result<MotionAsk, String> {
         .map(str::trim)
         .unwrap_or("bold")
         .to_ascii_lowercase();
-    let page = crate::motion::design_page(spec)?;
     Ok(MotionAsk {
         design: spec.id.to_string(),
         text,
@@ -326,9 +327,59 @@ fn motion_ask(arguments: &Value) -> Result<MotionAsk, String> {
         layout,
         prompt,
         style,
-        page_path: spec.page.to_string(),
-        page,
     })
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::opening_inventory;
+    use oc_core::Timeline;
+    use std::collections::HashMap;
+
+    #[test]
+    fn opening_inventory_loads_an_empty_bin() {
+        let text = opening_inventory(&Timeline::default(), &[], &HashMap::new(), &HashMap::new());
+        assert!(text.contains("already loaded"), "{text}");
+        assert!(text.contains("bin: empty"), "{text}");
+        assert!(text.contains("Current timeline"), "{text}");
+        assert!(text.contains("no clips yet"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod browser_bin_tests {
+    use super::run_inspect;
+    use oc_core::{Inspect, Timeline};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_browser_clip_is_marked_so_see_does_not_expect_a_file() {
+        let row: oc_db::MediaRow = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-7000-8000-000000000001",
+                "project_id": "00000000-0000-7000-8000-000000000002",
+                "r2_key": "workspace/00000000-0000-7000-8000-000000000001",
+                "filename": "talk.mp4",
+                "content_type": "video/mp4",
+                "byte_size": null,
+                "duration_ticks": 240000,
+                "width": null,
+                "height": null,
+                "status": "browser",
+                "created_at": "2026-10-08T00:00:00Z"
+            }"#,
+        )
+        .expect("browser media row");
+        let text = run_inspect(
+            Inspect::ListBin,
+            &Timeline::default(),
+            std::slice::from_ref(&row),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(text.contains("hold=browser"), "{text}");
+        assert!(text.contains("see and watch cannot open them"), "{text}");
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +388,7 @@ mod design_prompt_tests {
     use serde_json::json;
 
     #[test]
-    fn a_motion_call_picks_a_design_and_returns_its_page() {
+    fn a_motion_call_picks_a_design() {
         let ask = motion_ask(&json!({
             "design": "stat-ring",
             "text": "47%",
@@ -348,7 +399,7 @@ mod design_prompt_tests {
         assert_eq!(ask.design, "stat-ring");
         assert_eq!(ask.text, "47%");
         assert_eq!(ask.duration, 6);
-        assert!(ask.page.contains("count"), "{}", ask.page_path);
+        assert!(ask.prompt.is_empty());
     }
 
     #[test]
@@ -361,7 +412,7 @@ mod design_prompt_tests {
         }))
         .unwrap();
         assert_eq!(ask.design, "map-route");
-        assert!(ask.page_path.contains("maps"), "{}", ask.page_path);
+        assert_eq!(ask.prompt, "a route across the campus");
         assert_eq!(ask.layout, oc_core::DesignLayout::Cutaway);
     }
 
@@ -510,7 +561,7 @@ pub(crate) async fn place_captions(
             .await
             .map_err(|e| e.to_string())?;
         let mut queued = 0;
-        for row in media {
+        for row in &media {
             if row.content_type.starts_with("image/") || !oc_db::is_r2_object_key(&row.r2_key) {
                 continue;
             }
@@ -527,10 +578,16 @@ pub(crate) async fn place_captions(
             .map_err(|e| e.to_string())?;
             queued += 1;
         }
-        return Ok((
-            project.timeline,
-            format!("no words yet — queued {queued} transcript(s). Try again when they finish."),
-        ));
+        let browser_only = queued == 0
+            && media.iter().any(|row| {
+                !row.content_type.starts_with("image/") && !oc_db::is_r2_object_key(&row.r2_key)
+            });
+        let note = if browser_only {
+            "no words yet. These clips stay in the browser that imported them, so a transcript cannot run.".to_string()
+        } else {
+            format!("no words yet — queued {queued} transcript(s). Try again when they finish.")
+        };
+        return Ok((project.timeline, note));
     }
     let clips = oc_core::program_clips(&project.timeline);
     let mut cues = oc_core::mapped_cues(&clips, &lines);
@@ -674,7 +731,9 @@ pub(crate) async fn watch_range(
     let opened = open_for_frames(row, r2, &mut temps).await;
     let Some(path) = opened else {
         clear_frame_temps(&mut temps).await;
-        return Err(format!("media {media_id} is not on R2"));
+        return Err(format!(
+            "media {media_id} stays in the browser that imported it"
+        ));
     };
     let mut frames = Vec::new();
     for at in &times {
@@ -899,7 +958,9 @@ pub(crate) async fn see_frame(
     let opened = open_for_frames(row, r2, &mut temps).await;
     let Some(path) = opened else {
         clear_frame_temps(&mut temps).await;
-        return Err(format!("media {media_id} is not on R2"));
+        return Err(format!(
+            "media {media_id} stays in the browser that imported it"
+        ));
     };
     let dest = std::env::temp_dir().join(format!("oc-see-{}-{}.jpg", media_id, Uuid::new_v4()));
     let grabbed = oc_media::grab_jpeg(&path, at, &dest).await;
@@ -955,6 +1016,76 @@ async fn clear_frame_temps(temps: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+/// Bin, timeline, shot list, and gaps for the opening message.
+/// The model calls get_media, list_cues, or list_gaps only when a line is missing.
+pub(crate) fn opening_inventory(
+    timeline: &Timeline,
+    media: &[oc_db::MediaRow],
+    speech: &HashMap<Uuid, Speech>,
+    looks: &HashMap<Uuid, oc_db::AnalysisRow>,
+) -> String {
+    let mut out = String::from(
+        "The bin, the timeline, the shot list, and the gaps are already loaded. \
+         Call get_media, list_cues, or list_gaps only when a line you need is missing. \
+         Call list_bin or list_timeline only after a tool changes them.\n\n",
+    );
+    out.push_str(&run_inspect(
+        Inspect::ListBin,
+        timeline,
+        media,
+        speech,
+        looks,
+    ));
+    out.push('\n');
+    out.push_str(&run_inspect(
+        Inspect::ListTimeline,
+        timeline,
+        media,
+        speech,
+        looks,
+    ));
+    for row in media {
+        let id = MediaId::from_uuid(row.id);
+        out.push('\n');
+        out.push_str(&run_inspect(
+            Inspect::GetMedia { media_id: id },
+            timeline,
+            media,
+            speech,
+            looks,
+        ));
+        if speech.get(&row.id).is_some_and(|s| !s.cues.is_empty()) {
+            out.push('\n');
+            out.push_str(&run_inspect(
+                Inspect::ListGaps {
+                    media_id: id,
+                    start: None,
+                    end: None,
+                },
+                timeline,
+                media,
+                speech,
+                looks,
+            ));
+        }
+        let (kind, _) = spec_from_row(row);
+        if kind == TrackKind::Audio {
+            let music = run_inspect(
+                Inspect::GetMusic { media_id: id },
+                timeline,
+                media,
+                speech,
+                looks,
+            );
+            if music.starts_with("bpm") {
+                out.push('\n');
+                out.push_str(&format!("music {}\n{music}", row.id));
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn run_inspect(
     inspect: Inspect,
     timeline: &Timeline,
@@ -968,17 +1099,29 @@ pub(crate) fn run_inspect(
                 return "bin: empty (nothing registered for this project yet)".into();
             }
             let mut out = format!("bin: {} items\n", media.len());
+            let mut browser_held = false;
             for row in media {
                 let (kind, dur) = spec_from_row(row);
                 let words = speech.get(&row.id).map(|s| s.words).unwrap_or(0);
                 let cues = speech.get(&row.id).map(|s| s.cues.len()).unwrap_or(0);
                 let look = looks.get(&row.id).map(|l| l.look.as_str()).unwrap_or("-");
+                let hold = if row.r2_key.starts_with("workspace/") {
+                    browser_held = true;
+                    " hold=browser"
+                } else {
+                    ""
+                };
                 out.push_str(&format!(
-                    "{id}  {kind:?}  {dur:.1}s  words={words}  cues={cues}  look={look}  {name}\n",
+                    "{id}  {kind:?}  {dur:.1}s  words={words}  cues={cues}  look={look}{hold}  {name}\n",
                     id = row.id,
                     dur = dur.as_seconds(),
                     name = row.filename
                 ));
+            }
+            if browser_held {
+                out.push_str(
+                    "These clips stay in the browser that imported them. see and watch cannot open them.\n",
+                );
             }
             out
         }
