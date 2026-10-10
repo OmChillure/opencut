@@ -107,6 +107,17 @@ impl ExportPreset {
         }
     }
 
+    /// Accepts the label (`youtube-1080`) and the serde name (`youtube_1080`).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "youtube-1080" | "youtube_1080" | "youtube1080" => Some(Self::Youtube1080),
+            "vertical-1080" | "vertical_1080" | "vertical1080" => Some(Self::Vertical1080),
+            "square-1080" | "square_1080" | "square1080" => Some(Self::Square1080),
+            _ => None,
+        }
+    }
+
     /// `{project}-{label}.mp4`. The worker writes this name and the API reads it.
     #[must_use]
     pub fn file_name(self, project_id: impl std::fmt::Display) -> String {
@@ -2211,6 +2222,19 @@ fn duck_audio(timeline: &mut Timeline, amount: f32) {
 mod tests {
     use super::*;
     use oc_timeline::{Clip, ClipKind, MediaId, Transform};
+
+    #[test]
+    fn export_preset_parses_the_label_and_the_wire_name() {
+        assert_eq!(
+            ExportPreset::parse("youtube-1080"),
+            Some(ExportPreset::Youtube1080)
+        );
+        assert_eq!(
+            ExportPreset::parse("vertical_1080"),
+            Some(ExportPreset::Vertical1080)
+        );
+        assert_eq!(ExportPreset::parse("nope"), None);
+    }
 
     #[test]
     fn cover_is_picture_only() {

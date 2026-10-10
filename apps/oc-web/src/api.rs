@@ -43,6 +43,12 @@ pub struct ChatReply {
     #[serde(default)]
     pub notes: Vec<String>,
     pub timeline: Timeline,
+    /// Set when a finished director cut should become a Cloudflare video.
+    #[serde(default)]
+    pub export_preset: String,
+    /// The browser must send its clips and then queue the export.
+    #[serde(default)]
+    pub export_handoff: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -65,6 +71,10 @@ pub struct ChatStreamEvent {
     pub notes: Vec<String>,
     #[serde(default)]
     pub timeline: Option<Timeline>,
+    #[serde(default)]
+    pub export_preset: String,
+    #[serde(default)]
+    pub export_handoff: bool,
 }
 
 pub async fn register_media(
@@ -89,7 +99,7 @@ pub async fn register_media(
     Ok(())
 }
 
-/// Register the editor id, then put the bytes on R2. The stored key is the object key.
+/// Register the clip, and keep the bytes in this browser. Nothing is sent to Cloudflare.
 pub async fn store_imported(
     project_id: &str,
     media_id: &str,
@@ -97,30 +107,27 @@ pub async fn store_imported(
     content_type: &str,
     bytes: Vec<u8>,
 ) -> Result<(), String> {
-    register_media(project_id, media_id, filename, content_type, 0.0).await?;
-    put_media_bytes(project_id, media_id, content_type, bytes).await
+    crate::hold::save_file(project_id, media_id, filename, content_type, &bytes).await?;
+    register_media(project_id, media_id, filename, content_type, 0.0).await
 }
 
-pub async fn put_media_bytes(
-    project_id: &str,
-    media_id: &str,
-    content_type: &str,
-    bytes: Vec<u8>,
-) -> Result<(), String> {
-    let res = authed(reqwest::Client::new().put(format!(
-        "{API}/v1/projects/{project_id}/media/{media_id}/bytes"
-    )))
-    .header("content-type", content_type)
-    .body(bytes)
-    .send()
-    .await
-    .map_err(|e| e.to_string())?;
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("upload {status}: {body}"));
+/// A server play URL. A blob, or an empty URL, is not one: the picture stays in the browser.
+#[must_use]
+pub fn remote_play_url(play_url: Option<String>) -> Option<String> {
+    play_url.filter(|url| !url.is_empty() && !url.starts_with("blob:"))
+}
+
+/// Keep a blob the browser already has. A server URL fills in only when this
+/// tab has no picture yet, which is an older clip that was stored on the server.
+#[must_use]
+pub fn keep_play_url(existing: &str, remote: &str) -> String {
+    if existing.starts_with("blob:") || remote.is_empty() {
+        return existing.to_string();
     }
-    Ok(())
+    if existing.is_empty() {
+        return remote.to_string();
+    }
+    existing.to_string()
 }
 
 thread_local! {
@@ -227,6 +234,8 @@ pub async fn chat_stream(
         text: String::new(),
         notes: Vec::new(),
         timeline: Timeline::default(),
+        export_preset: String::new(),
+        export_handoff: false,
     };
     let mut saw_done = false;
     let url = format!("{API}/v1/projects/{project_id}/chat");
@@ -238,6 +247,8 @@ pub async fn chat_stream(
         if ev.kind == "done" {
             reply.text = ev.text.clone();
             reply.notes = ev.notes.clone();
+            reply.export_preset = ev.export_preset.clone();
+            reply.export_handoff = ev.export_handoff;
             if let Some(tl) = ev.timeline.clone() {
                 reply.timeline = tl;
             }
@@ -340,13 +351,105 @@ fn export_query(project_id: &str, preset: &str) -> String {
     format!("/v1/projects/{project_id}/export?preset={preset}")
 }
 
-pub async fn export_is_ready(project_id: &str, preset: &str) -> bool {
-    let file = export_file_url(project_id, preset);
-    authed(reqwest::Client::new().head(file))
-        .send()
-        .await
-        .ok()
-        .is_some_and(|response| response.status().is_success())
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportWatch {
+    Ready,
+    Pending,
+    Idle,
+    Failed(String),
+}
+
+pub async fn watch_export(project_id: &str, preset: &str) -> Result<ExportWatch, String> {
+    #[derive(Deserialize)]
+    struct Body {
+        state: String,
+        #[serde(default)]
+        error: String,
+    }
+    let body: Body = get_json(&format!(
+        "{API}/v1/projects/{project_id}/export?preset={preset}&probe=1"
+    ))
+    .await?;
+    Ok(match body.state.as_str() {
+        "ready" => ExportWatch::Ready,
+        "pending" => ExportWatch::Pending,
+        "failed" => ExportWatch::Failed(if body.error.is_empty() {
+            "The render failed.".into()
+        } else {
+            body.error
+        }),
+        _ => ExportWatch::Idle,
+    })
+}
+
+/// Send this browser's timeline clips to the render spool. Server clips are left alone.
+/// Nothing is written to Cloudflare here.
+pub async fn send_browser_sources(project_id: &str) -> Result<(), String> {
+    let project = get_project(project_id).await?;
+    let media = list_media(project_id).await?;
+    let held = crate::hold::files_for_project(project_id).await?;
+    let clips = project
+        .timeline
+        .source_media_ids()
+        .into_iter()
+        .map(|id| {
+            let id = id.to_string();
+            let item = media.iter().find(|item| item.id == id);
+            oc_core::timeline::BrowserHold {
+                id: id.clone(),
+                name: item
+                    .map(|item| item.name.clone())
+                    .unwrap_or_else(|| id.clone()),
+                on_server: item.is_some_and(|item| !item.url.is_empty()),
+                in_browser: held.iter().any(|file| file.id == id),
+            }
+        })
+        .collect::<Vec<_>>();
+    let ids = oc_core::timeline::browser_spool_ids(&clips)?;
+    for id in ids {
+        let file = held
+            .iter()
+            .find(|file| file.id == id)
+            .ok_or_else(|| format!("These clips are not in this browser: {id}"))?;
+        spool_media(project_id, &file.id, file.bytes.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn spool_media(project_id: &str, media_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+    let res = authed(
+        reqwest::Client::new()
+            .put(format!(
+                "{API}/v1/projects/{project_id}/media/{media_id}/spool"
+            ))
+            .header("content-type", "application/octet-stream"),
+    )
+    .body(bytes)
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+    if res.status().is_success() {
+        return Ok(());
+    }
+    Err(api_error_message(res).await)
+}
+
+async fn api_error_message(res: reqwest::Response) -> String {
+    #[derive(Deserialize)]
+    struct ApiErr {
+        error: String,
+    }
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    serde_json::from_str::<ApiErr>(&text)
+        .map(|body| body.error)
+        .unwrap_or_else(|_| {
+            if text.trim().is_empty() {
+                format!("HTTP {}", status.as_u16())
+            } else {
+                text
+            }
+        })
 }
 
 pub async fn open_session(email: &str, password: &str) -> Result<(String, String), String> {
@@ -715,17 +818,13 @@ pub async fn list_media(project_id: &str) -> Result<Vec<MediaItem>, String> {
         .into_iter()
         .map(|row| {
             let id = value_to_id(row.id);
-            let play = with_token(
-                &row.play_url
-                    .filter(|u| !u.is_empty() && !u.starts_with("blob:"))
-                    .unwrap_or_else(|| media_file_url(project_id, &id)),
-            );
+            let play = remote_play_url(row.play_url).map(|url| with_token(&url));
             bind::media_from_api(
                 &id,
                 row.filename,
                 &row.content_type,
                 row.duration_ticks,
-                Some(play),
+                play,
             )
         })
         .collect())
@@ -769,12 +868,6 @@ pub async fn create_project(name: &str) -> Result<ProjectSummary, String> {
     Ok(row.into_summary())
 }
 
-pub fn media_file_url(project_id: &str, media_id: &str) -> String {
-    with_token(&format!(
-        "{API}/v1/projects/{project_id}/media/{media_id}/file"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +884,26 @@ mod tests {
         assert!(chat_current(second));
         assert!(!chat_current(first));
         assert!(!chat_stopped());
+    }
+
+    #[test]
+    fn a_browser_clip_has_no_server_play_url() {
+        assert_eq!(remote_play_url(None), None);
+        assert_eq!(remote_play_url(Some(String::new())), None);
+        assert_eq!(remote_play_url(Some("blob:http://local/1".into())), None);
+        assert_eq!(
+            remote_play_url(Some("https://cdn.example/a.mp4".into())).as_deref(),
+            Some("https://cdn.example/a.mp4")
+        );
+    }
+
+    #[test]
+    fn a_blob_is_not_replaced_by_a_server_url() {
+        assert_eq!(keep_play_url("blob:1", "https://cdn/a.mp4"), "blob:1");
+        assert_eq!(keep_play_url("blob:1", ""), "blob:1");
+        assert_eq!(keep_play_url("", "https://cdn/a.mp4"), "https://cdn/a.mp4");
+        assert_eq!(keep_play_url("", ""), "");
+        assert_eq!(keep_play_url("https://old", "https://new"), "https://old");
     }
 
     #[test]

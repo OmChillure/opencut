@@ -22,7 +22,9 @@ async fn main() -> anyhow::Result<()> {
     oc_db::migrate(&db).await.ok();
     let r2 = R2::from_env().await.ok();
     if r2.is_none() {
-        tracing::warn!("R2 is not configured — understand and export cannot read source clips");
+        tracing::warn!(
+            "R2 is not configured — understand cannot read server clips, and a finished video cannot be stored on Cloudflare"
+        );
     }
     if oc_voice::groq_stt_configured() {
         tracing::info!("understand = ffmpeg look + Groq Whisper");
@@ -429,6 +431,75 @@ async fn lay_captions(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceStage {
+    Remote,
+    Spool,
+    Missing,
+}
+
+/// An R2 key is fetched from Cloudflare. Anything else is the temporary spool,
+/// and only when that file is already complete.
+fn stage_source(key: &str, spool_ready: bool) -> SourceStage {
+    if oc_db::is_r2_object_key(key) {
+        SourceStage::Remote
+    } else if spool_ready {
+        SourceStage::Spool
+    } else {
+        SourceStage::Missing
+    }
+}
+
+fn staged_name(media_id: Uuid, filename: &str) -> String {
+    format!("{media_id}-{}", oc_db::object_file_name(filename))
+}
+
+fn missing_source_message(ids: &[oc_timeline::MediaId]) -> String {
+    let list = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("render needs the pictures from the browser that imported them: {list}")
+}
+
+struct SpoolUsed {
+    path: std::path::PathBuf,
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+/// Drop spool files this render copied. A newer write for the next render stays.
+fn release_used_spool(used: &[SpoolUsed]) {
+    for item in used {
+        let Ok(meta) = std::fs::metadata(&item.path) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified == item.modified && meta.len() == item.len {
+            let _ = std::fs::remove_file(&item.path);
+        }
+    }
+}
+
+struct SpoolGuard(Vec<SpoolUsed>);
+
+impl Drop for SpoolGuard {
+    fn drop(&mut self) {
+        release_used_spool(&self.0);
+    }
+}
+
+struct WorkDir(std::path::PathBuf);
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let mut project = oc_db::get_project(db, p.project_id).await?;
@@ -437,69 +508,93 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
         anyhow::bail!("timeline is empty");
     }
     lay_captions(db, p.project_id, &mut project.timeline).await?;
-    let work = std::env::temp_dir().join(format!("oc-export-{}", p.project_id));
+    let work = std::env::temp_dir().join(format!("oc-export-{}", Uuid::new_v4()));
+    let _work = WorkDir(work.clone());
     tokio::fs::create_dir_all(&work).await?;
     let mut media = std::collections::HashMap::new();
-    for row in &rows {
-        let dest = work.join(&row.filename);
-        if !oc_db::is_r2_object_key(&row.r2_key) {
-            tracing::warn!(media = %row.id, key = %row.r2_key, "skip source that is not on R2");
+    let mut missing = Vec::new();
+    let mut used_spool = SpoolGuard(Vec::new());
+    for id in project.timeline.source_media_ids() {
+        let Some(row) = rows.iter().find(|row| row.id == id.as_uuid()) else {
+            missing.push(id);
             continue;
+        };
+        let spool_path = oc_db::render_spool_file(p.project_id, row.id, &row.filename);
+        let spool_meta = tokio::fs::metadata(&spool_path).await.ok();
+        let spool_ready = spool_meta.as_ref().is_some_and(|meta| meta.is_file());
+        let dest = work.join(staged_name(row.id, &row.filename));
+        match stage_source(&row.r2_key, spool_ready) {
+            SourceStage::Remote => {
+                let r2 = r2.context("Cloudflare is required to store the finished video")?;
+                let bytes = r2.get_bytes(&row.r2_key).await?;
+                tokio::fs::write(&dest, &bytes).await?;
+            }
+            SourceStage::Spool => {
+                let meta = spool_meta.context("spool disappeared before the copy")?;
+                let modified = meta.modified()?;
+                tokio::fs::copy(&spool_path, &dest).await?;
+                used_spool.0.push(SpoolUsed {
+                    path: spool_path,
+                    modified,
+                    len: meta.len(),
+                });
+            }
+            SourceStage::Missing => {
+                tracing::warn!(media = %row.id, key = %row.r2_key, "source is not on R2 and has no spool");
+                missing.push(id);
+                continue;
+            }
         }
-        let r2 = r2.context("R2 required to fetch source clips")?;
-        let bytes = r2.get_bytes(&row.r2_key).await?;
-        tokio::fs::write(&dest, bytes).await?;
         let has_video =
             row.content_type.starts_with("video/") || row.content_type.starts_with("image/");
         let has_audio =
             row.content_type.starts_with("audio/") || row.content_type.starts_with("video/");
         media.insert(
-            oc_timeline::MediaId::from_uuid(row.id),
+            id,
             oc_render::MediaSource {
-                id: oc_timeline::MediaId::from_uuid(row.id),
+                id,
                 path: dest,
                 has_video,
                 has_audio,
             },
         );
     }
-    let out_dir = std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into());
-    tokio::fs::create_dir_all(&out_dir).await?;
+    if !missing.is_empty() {
+        anyhow::bail!(missing_source_message(&missing));
+    }
+    let r2 = r2.context("Cloudflare is required to store the finished video")?;
     let filename = p.preset.file_name(p.project_id);
-    let output = std::path::PathBuf::from(&out_dir).join(&filename);
+    let rendered_path = work.join(&filename);
     let req = oc_render::RenderRequest {
         timeline: project.timeline,
         media,
-        output: output.clone(),
+        output: rendered_path,
         preset: p.preset,
     };
     let rendered = tokio::task::spawn_blocking(move || oc_render::render(&req))
         .await
         .map_err(|e| anyhow::anyhow!("render join: {e}"))??;
-    if let Some(r2) = r2 {
-        let bytes = tokio::fs::read(&rendered.output).await?;
-        let key =
-            oc_media::export_object_key(oc_timeline::ProjectId::from_uuid(p.project_id), &filename);
-        // The editor plays the local file. A denied upload must not fail that render.
-        match r2.put_bytes(&key, bytes, "video/mp4").await {
-            Ok(()) => tracing::info!(
-                project = %p.project_id,
-                key,
-                ms = t0.elapsed().as_millis(),
-                "export uploaded"
-            ),
-            Err(err) => tracing::error!(
-                project = %p.project_id,
-                path = %rendered.output.display(),
-                "export file is local; R2 upload failed: {err}"
-            ),
-        }
-    } else {
-        tracing::info!(
+    let bytes = tokio::fs::read(&rendered.output).await?;
+    let key =
+        oc_media::export_object_key(oc_timeline::ProjectId::from_uuid(p.project_id), &filename);
+    r2.put_bytes(&key, bytes, "video/mp4")
+        .await
+        .map_err(|err| anyhow::anyhow!("the finished video was not stored on Cloudflare: {err}"))?;
+    tracing::info!(
+        project = %p.project_id,
+        key,
+        ms = t0.elapsed().as_millis(),
+        "export stored on Cloudflare"
+    );
+    let out_dir = std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into());
+    let output = std::path::PathBuf::from(&out_dir).join(&filename);
+    if let Err(err) = tokio::fs::create_dir_all(&out_dir).await {
+        tracing::warn!(project = %p.project_id, "local export cache was not written: {err}");
+    } else if let Err(err) = tokio::fs::copy(&rendered.output, &output).await {
+        tracing::warn!(
             project = %p.project_id,
-            path = %rendered.output.display(),
-            ms = t0.elapsed().as_millis(),
-            "export written locally"
+            path = %output.display(),
+            "finished video is on Cloudflare; local copy failed: {err}"
         );
     }
     Ok(())
@@ -516,7 +611,7 @@ mod tests {
     use super::{dress_safe, wants_beat_grid};
 
     #[test]
-    fn dress_safe_uses_the_vertical_theme() {
+    fn dress_safe_leaves_a_vertical_frame_clean() {
         let mut cues = vec![oc_core::CaptionCue {
             start: oc_core::Time::ZERO,
             end: oc_core::Time::from_seconds(2.0),
@@ -528,9 +623,9 @@ mod tests {
         }];
         let timeline = oc_core::Timeline::new(oc_core::FrameRate::FPS_30, 1080, 1920);
         dress_safe(&mut cues, &timeline);
-        assert_eq!(cues[0].font, oc_core::CaptionFont::Display);
-        assert_eq!(cues[0].effect, oc_core::CaptionEffect::Pop);
-        assert_eq!(cues[0].place, oc_core::CaptionPlace::Lower);
+        assert_eq!(cues[0].font, oc_core::CaptionFont::Sans);
+        assert_eq!(cues[0].effect, oc_core::CaptionEffect::Fade);
+        assert_eq!(cues[0].place, oc_core::CaptionPlace::Bottom);
     }
 
     #[test]
@@ -539,5 +634,52 @@ mod tests {
         assert!(wants_beat_grid(true, true));
         assert!(wants_beat_grid(false, false));
         assert!(wants_beat_grid(true, false));
+    }
+
+    #[test]
+    fn a_browser_clip_uses_the_spool_and_an_r2_clip_does_not() {
+        use super::{SourceStage, missing_source_message, stage_source, staged_name};
+        assert_eq!(stage_source("raw/p/m/a.mp4", false), SourceStage::Remote);
+        assert_eq!(stage_source("raw/p/m/a.mp4", true), SourceStage::Remote);
+        assert_eq!(stage_source("workspace/clip", true), SourceStage::Spool);
+        assert_eq!(stage_source("workspace/clip", false), SourceStage::Missing);
+        assert_eq!(stage_source("local/clip.mp4", false), SourceStage::Missing);
+        assert_eq!(stage_source("", true), SourceStage::Spool);
+        let id = uuid::Uuid::nil();
+        let name = staged_name(id, "../../etc/passwd");
+        assert!(!name.contains(".."));
+        assert!(name.ends_with("passwd"), "{name}");
+        let media = oc_timeline::MediaId::from_uuid(id);
+        assert_eq!(
+            missing_source_message(&[media]),
+            format!("render needs the pictures from the browser that imported them: {id}")
+        );
+    }
+
+    #[test]
+    fn a_finished_spool_is_removed_and_a_replacement_stays() {
+        use super::{SpoolUsed, release_used_spool};
+        let dir = std::env::temp_dir().join(format!("oc-spool-release-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.mp4");
+        let fresh = dir.join("fresh.mp4");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&fresh, b"fresh").unwrap();
+        let meta = std::fs::metadata(&old).unwrap();
+        release_used_spool(&[SpoolUsed {
+            path: old.clone(),
+            modified: meta.modified().unwrap(),
+            len: meta.len(),
+        }]);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        std::fs::write(&old, b"replacement-bytes").unwrap();
+        release_used_spool(&[SpoolUsed {
+            path: old.clone(),
+            modified: meta.modified().unwrap(),
+            len: meta.len(),
+        }]);
+        assert_eq!(std::fs::read(&old).unwrap(), b"replacement-bytes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

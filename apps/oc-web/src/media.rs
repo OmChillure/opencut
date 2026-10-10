@@ -1103,6 +1103,7 @@ thread_local! {
     static LAST_PLAY_MS: Cell<f64> = const { Cell::new(0.0) };
     static LAST_SEEK_MS: Cell<f64> = const { Cell::new(0.0) };
     static FRONT_IS_B: Cell<bool> = const { Cell::new(false) };
+    static HOLD_SINCE: Cell<f64> = const { Cell::new(0.0) };
 }
 
 pub fn playhead_now() -> f64 {
@@ -1273,12 +1274,45 @@ pub fn following_shot(
     shot_from(library, clip)
 }
 
+/// The next picture that starts after `time`, when the gap is at most `within` seconds.
+pub fn next_picture_after(
+    tracks: &[EditorTrack],
+    library: &[MediaItem],
+    time: f64,
+    within: f64,
+) -> Option<ProgramShot> {
+    let mut best: Option<ProgramShot> = None;
+    for track in tracks {
+        if track.hidden || track.kind != TrackKindUi::Video || is_overlay_track(&track.name) {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.disabled || clip.media_id.is_empty() {
+                continue;
+            }
+            if clip.start <= time + 1e-3 || clip.start - time > within {
+                continue;
+            }
+            let Some(shot) = shot_from(library, clip) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|kept| shot.start < kept.start) {
+                best = Some(shot);
+            }
+        }
+    }
+    best
+}
+
 fn is_join_ui(a_start: f64, a_end: f64, b_start: f64) -> bool {
     b_start > a_start + 0.05 && b_start < a_end + 0.2 && b_start > a_end - 1.2
 }
 
 fn shot_from(library: &[MediaItem], clip: &TimelineClip) -> Option<ProgramShot> {
     let item = library.iter().find(|item| item.id == clip.media_id)?;
+    if item.url.is_empty() {
+        return None;
+    }
     Some(ProgramShot {
         media_id: item.id.clone(),
         url: item.url.clone(),
@@ -1605,24 +1639,6 @@ fn caption_theme(
     }
 }
 
-fn caption_visible(text: &str, into: f64, span: f64) -> (String, f64, f64) {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() <= 7 {
-        return (words.join(" "), into, span);
-    }
-    let groups = words.len().div_ceil(6).max(1);
-    let idx = ((into / span.max(0.01)) * groups as f64).floor() as usize;
-    let idx = idx.min(groups - 1);
-    let step = span / groups as f64;
-    let local = (into - step * idx as f64).clamp(0.0, step);
-    let line = words
-        .chunks(6)
-        .nth(idx)
-        .map(|group| group.join(" "))
-        .unwrap_or_default();
-    (line, local, step.max(0.2))
-}
-
 pub fn apply_monitor_look(
     engine: &oc_core::Timeline,
     library: &[MediaItem],
@@ -1660,10 +1676,11 @@ pub fn apply_monitor_look(
             let local = (t - clip.start).as_seconds();
             let fade = clip.look.fade_gain(local, clip.duration.as_seconds());
             match &clip.kind {
-                oc_core::ClipKind::Video { transform } => {
-                    zoom = transform.scale;
-                    pan_x = transform.x;
-                    pan_y = transform.y;
+                oc_core::ClipKind::Video { .. } => {
+                    let pose = oc_core::compositor::clip_pose(clip, t);
+                    zoom = pose.scale;
+                    pan_x = pose.x;
+                    pan_y = pose.y;
                     filter = css_filter(clip.look.grade, clip.look.fx);
                     mask = clip.look.mask;
                     cube_id = clip.look.grade.cube;
@@ -1734,7 +1751,8 @@ pub fn apply_monitor_look(
                     if let Some(cue) = cues.iter().find(|c| local_t >= c.start && local_t < c.end) {
                         let span = (cue.end - cue.start).as_seconds().max(0.3);
                         let into = (local_t - cue.start).as_seconds().clamp(0.0, span);
-                        let (line, local, local_span) = caption_visible(&cue.text, into, span);
+                        let (line, local, local_span) =
+                            oc_core::caption_phrase(&cue.text, into, span);
                         let (place, font, effect) = caption_theme(engine, cue);
                         let shown = oc_core::caption_reveal(&line, effect, local, local_span);
                         let motion = oc_core::caption_motion(effect, local, local_span);
@@ -1761,10 +1779,11 @@ pub fn apply_monitor_look(
         mask = clip.look.mask;
         cube_id = clip.look.grade.cube;
         look_clip = clip.id.to_string();
-        if let oc_core::ClipKind::Video { transform } = &clip.kind {
-            zoom = transform.scale;
-            pan_x = transform.x;
-            pan_y = transform.y;
+        if matches!(clip.kind, oc_core::ClipKind::Video { .. }) {
+            let pose = oc_core::compositor::clip_pose(clip, t);
+            zoom = pose.scale;
+            pan_x = pose.x;
+            pan_y = pose.y;
         }
         vignette = clip.look.fx.vignette;
         grain = clip.look.fx.grain;
@@ -1970,6 +1989,10 @@ fn paint_design(
         hide_design();
         return;
     };
+    if item.url.is_empty() {
+        hide_design();
+        return;
+    }
     let style = if let Some(card) = clip.look.card {
         format!(
             "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;",
@@ -2106,22 +2129,52 @@ pub fn sync_monitor(
             set_class_off(".monitor-blank", true);
         }
         Some(shot) => {
-            let Some(video) = video else { return };
+            let Some(mut video) = video else { return };
+            let loaded = video.get_attribute("data-media").unwrap_or_default();
+            let mut media_changed = loaded != shot.media_id;
+            if media_changed {
+                let standby_ready =
+                    standby_video().is_some_and(|standby| preroll_ready(&standby, &shot));
+                if standby_ready {
+                    if let Some(standby) = standby_video() {
+                        standby.set_muted(false);
+                        let _ = standby.play();
+                    }
+                    let _ = video.pause();
+                    video.set_muted(true);
+                    swap_program();
+                    let Some(front) = preview_video() else {
+                        return;
+                    };
+                    video = front;
+                    media_changed = false;
+                    LAST_PLAY_MS.with(|cell| cell.set(js_sys::Date::now()));
+                    LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
+                } else if !loaded.is_empty() {
+                    // A visible set_src drops the decoded frame. Keep it until standby is ready.
+                    if let Some(standby) = standby_video() {
+                        preroll(&standby, &shot);
+                    }
+                    let a_front = !front_is_b();
+                    set_class_off(".preview-video", !a_front);
+                    set_class_off(".preview-video-b", a_front);
+                    set_class_off(".preview-image", true);
+                    set_class_off(".monitor-blank", true);
+                    return;
+                } else {
+                    let _ = video.set_attribute("data-media", &shot.media_id);
+                    video.set_src(&shot.url);
+                    video.set_muted(false);
+                    LAST_PLAY_MS.with(|cell| cell.set(0.0));
+                    LAST_SEEK_MS.with(|cell| cell.set(0.0));
+                }
+            }
             if let Some(standby) = standby_video() {
                 if let Some(next) = &next {
                     if next.kind == MediaKind::Video {
                         preroll(&standby, next);
                     }
                 }
-            }
-            let loaded = video.get_attribute("data-media").unwrap_or_default();
-            let media_changed = loaded != shot.media_id;
-            if media_changed {
-                let _ = video.set_attribute("data-media", &shot.media_id);
-                video.set_src(&shot.url);
-                video.set_muted(false);
-                LAST_PLAY_MS.with(|cell| cell.set(0.0));
-                LAST_SEEK_MS.with(|cell| cell.set(0.0));
             }
             let take = shot.duration.max(0.05);
             let (src_time, rate, wall) = frame_timing(engine, &shot, now);
@@ -2131,17 +2184,32 @@ pub fn sync_monitor(
             let drift = (video.current_time() - src_time).abs();
             let since_play = js_sys::Date::now() - LAST_PLAY_MS.with(Cell::get);
             let file_end = video.duration();
-            let near_end = now >= shot.start + take - 0.05
-                || (ready && file_end.is_finite() && video.current_time() >= file_end - 0.04);
+            // The shot ends on the timeline. The file's own end is not a cut.
+            let near_end = now >= shot.start + take - 0.05;
+            let past_file = ready
+                && file_end.is_finite()
+                && file_end > 0.25
+                && src_time > file_end - 0.02
+                && !near_end;
             let keep_rolling = !wall && next.as_ref().is_some_and(|n| contiguous_source(&shot, n));
 
             if !playing {
+                HOLD_SINCE.with(|cell| cell.set(0.0));
                 let _ = video.pause();
                 if ready && drift > 0.04 {
                     seek_video(&video, src_time, false);
                 }
+            } else if past_file {
+                // Hold the last decoded frame. Playing again seeks into a black tail.
+                HOLD_SINCE.with(|cell| cell.set(0.0));
+                let parked = (file_end - 0.08).max(0.0);
+                if (video.current_time() - parked).abs() > 0.04 {
+                    seek_video(&video, parked, true);
+                }
+                let _ = video.pause();
             } else if near_end && ready {
                 if keep_rolling {
+                    HOLD_SINCE.with(|cell| cell.set(0.0));
                     if let Some(n) = &next {
                         set_playhead(n.start.max(now) + 1e-3);
                         LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
@@ -2150,6 +2218,7 @@ pub fn sync_monitor(
                     n.kind == MediaKind::Video
                         && standby_video().is_some_and(|s| preroll_ready(&s, n))
                 }) {
+                    HOLD_SINCE.with(|cell| cell.set(0.0));
                     if let Some(n) = &next {
                         if let Some(standby) = standby_video() {
                             standby.set_muted(false);
@@ -2163,16 +2232,23 @@ pub fn sync_monitor(
                         LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                     }
                 } else if next.is_some() {
-                    // Hold the outgoing frame until the next shot is seeked.
-                    // Jumping the playhead first shows a blank or a frozen frame.
-                    set_playhead((shot.start + take - 0.04).max(shot.start));
-                    LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
+                    let now_ms = js_sys::Date::now();
+                    let since = HOLD_SINCE.with(Cell::get);
+                    if since <= 0.0 {
+                        HOLD_SINCE.with(|cell| cell.set(now_ms));
+                    }
+                    if now_ms - HOLD_SINCE.with(Cell::get) < 320.0 {
+                        set_playhead((shot.start + take - 0.04).max(shot.start));
+                        LAST_TICK_MS.with(|cell| cell.set(now_ms));
+                    }
                 } else {
+                    HOLD_SINCE.with(|cell| cell.set(0.0));
                     let _ = video.pause();
                     set_playhead(shot.start + take);
                     LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                 }
             } else if paused {
+                HOLD_SINCE.with(|cell| cell.set(0.0));
                 if ready && (media_changed || drift > 0.08) {
                     seek_video(&video, src_time, media_changed);
                 }
@@ -2182,13 +2258,17 @@ pub fn sync_monitor(
                     let _ = video.play();
                 }
             } else if ready && drift > 0.45 && since_play > 250.0 {
+                HOLD_SINCE.with(|cell| cell.set(0.0));
                 seek_video(&video, src_time, false);
+            } else {
+                HOLD_SINCE.with(|cell| cell.set(0.0));
             }
 
-            if playing && !paused && ready && !near_end && !wall {
+            // Wall clock owns the playhead. Catch up only when the picture is ahead.
+            if playing && !video.paused() && ready && !near_end && !wall && !past_file {
                 let derived = shot.start + (video.current_time() - shot.source_in) / rate;
-                if derived.is_finite() && derived + 0.02 >= now {
-                    set_playhead(derived.clamp(shot.start.max(now), shot.start + take - 1e-3));
+                if derived.is_finite() && derived > now + 0.15 {
+                    set_playhead(derived.clamp(shot.start, shot.start + take - 1e-3));
                     LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                 }
             }
@@ -2343,6 +2423,26 @@ mod tests {
         assert_eq!(next.media_id, "b");
         assert!((next.start - 4.0).abs() < 1e-6);
         assert!(following_shot(&tracks, &library, 5.0).is_none());
+    }
+
+    #[test]
+    fn a_short_hole_has_a_next_picture_and_a_long_one_does_not() {
+        let library = vec![item("a", "blob:a", 40.0)];
+        let tracks = vec![video_track(vec![
+            clip("c1", "a", 0.0, 2.0),
+            clip("c2", "a", 2.3, 4.0),
+        ])];
+        let next = next_picture_after(&tracks, &library, 2.05, 0.45).unwrap();
+        assert!((next.start - 2.3).abs() < 1e-6);
+        assert!(next_picture_after(&tracks, &library, 2.05, 0.2).is_none());
+    }
+
+    #[test]
+    fn a_black_grab_is_not_a_picture_and_a_bright_pixel_is() {
+        assert!(!frame_has_picture(&[0, 0, 0, 255, 2, 2, 2, 255]));
+        let mut bytes = vec![0u8; 16];
+        bytes[4] = 40;
+        assert!(frame_has_picture(&bytes));
     }
 
     #[test]
@@ -3244,8 +3344,33 @@ fn grab_item(item: &MediaItem, w: u32, h: u32, source_time: f64) -> Option<Vec<u
             return None;
         }
         let data = ctx.get_image_data(0.0, 0.0, w as f64, h as f64).ok()?;
-        Some(data.data().0)
+        let bytes = data.data().0;
+        // A black grab is an undecoded frame. Leave the video element up.
+        if !frame_has_picture(&bytes) {
+            return None;
+        }
+        Some(bytes)
     })
+}
+
+fn frame_has_picture(bytes: &[u8]) -> bool {
+    let pixels = bytes.len() / 4;
+    if pixels == 0 {
+        return false;
+    }
+    let step = (pixels / 48).max(1);
+    let mut i = 0;
+    while i < pixels {
+        let o = i * 4;
+        let r = bytes[o];
+        let g = bytes.get(o + 1).copied().unwrap_or(0);
+        let b = bytes.get(o + 2).copied().unwrap_or(0);
+        if r > 8 || g > 8 || b > 8 {
+            return true;
+        }
+        i += step;
+    }
+    false
 }
 
 fn video_for_time(id: &str, url: &str, source_time: f64) -> Option<HtmlVideoElement> {
@@ -3283,6 +3408,9 @@ fn video_near(id: &str, source_time: f64, slack: f64) -> Option<HtmlVideoElement
 }
 
 fn seek_extra(id: &str, url: &str, source_time: f64) -> Option<HtmlVideoElement> {
+    if url.is_empty() {
+        return None;
+    }
     let video = extra_decoder()?;
     let loaded = video.get_attribute("data-media").unwrap_or_default();
     if loaded != id {

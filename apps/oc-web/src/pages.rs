@@ -221,6 +221,47 @@ pub fn Projects() -> Element {
     }
 }
 
+fn show_export(project_id: &str, preset_name: &str, mut url: Signal<String>) {
+    let stamp = js_sys::Date::now() as u64;
+    let file = api::export_file_url(project_id, preset_name);
+    let join = if file.contains('?') { '&' } else { '?' };
+    url.set(format!("{file}{join}v={stamp}"));
+}
+
+fn follow_export(
+    pid: String,
+    preset_name: String,
+    mut note: Signal<String>,
+    url: Signal<String>,
+    mut busy: Signal<bool>,
+) {
+    spawn(async move {
+        for _ in 0..300 {
+            match api::watch_export(&pid, &preset_name).await {
+                Ok(api::ExportWatch::Ready) => {
+                    show_export(&pid, &preset_name, url);
+                    note.set("Ready to play. The finished video is stored on Cloudflare.".into());
+                    busy.set(false);
+                    return;
+                }
+                Ok(api::ExportWatch::Failed(err)) => {
+                    note.set(err);
+                    busy.set(false);
+                    return;
+                }
+                Ok(api::ExportWatch::Idle) => {
+                    busy.set(false);
+                    return;
+                }
+                Ok(api::ExportWatch::Pending) | Err(_) => {}
+            }
+            gloo_timers::future::TimeoutFuture::new(2000).await;
+        }
+        note.set("The render did not show up yet. Check the worker.".into());
+        busy.set(false);
+    });
+}
+
 #[component]
 pub fn Export(id: String) -> Element {
     let nav = navigator();
@@ -245,12 +286,26 @@ pub fn Export(id: String) -> Element {
             };
             name.set(project.name);
             let tl = &project.timeline;
-            if tl.height > tl.width {
-                preset.set(ExportPreset::Vertical1080);
+            let chosen = if tl.height > tl.width {
+                ExportPreset::Vertical1080
             } else if tl.width == tl.height {
-                preset.set(ExportPreset::Square1080);
+                ExportPreset::Square1080
             } else {
-                preset.set(ExportPreset::Youtube1080);
+                ExportPreset::Youtube1080
+            };
+            preset.set(chosen);
+            match api::watch_export(&project_id, chosen.label()).await {
+                Ok(api::ExportWatch::Ready) => {
+                    show_export(&project_id, chosen.label(), url);
+                    note.set("Ready to play. The finished video is stored on Cloudflare.".into());
+                }
+                Ok(api::ExportWatch::Pending) => {
+                    busy.set(true);
+                    note.set("Rendering. The finished video is stored on Cloudflare.".into());
+                    follow_export(project_id, chosen.label().into(), note, url, busy);
+                }
+                Ok(api::ExportWatch::Failed(err)) => note.set(err),
+                _ => {}
             }
         }
     });
@@ -280,7 +335,7 @@ pub fn Export(id: String) -> Element {
             div { class: "shell-body",
                 div { class: "export-page",
                     h1 { "Export" }
-                    p { class: "export-lead", "Render the current timeline. The file plays here when the worker finishes." }
+                    p { class: "export-lead", "Render the current timeline. The finished video is stored on Cloudflare and plays here." }
                     div { class: "export-options",
                         for (kind, label, size) in choices {
                             button {
@@ -298,29 +353,21 @@ pub fn Export(id: String) -> Element {
                             let kind = *preset.peek();
                             let pid = project_id.clone();
                             busy.set(true);
-                            note.set("Rendering. This page updates when the file is ready.".into());
+                            note.set("Sending this browser's clips for the render…".into());
                             url.set(String::new());
                             spawn(async move {
+                                if let Err(err) = api::send_browser_sources(&pid).await {
+                                    note.set(err);
+                                    busy.set(false);
+                                    return;
+                                }
+                                note.set("Rendering. The finished video is stored on Cloudflare.".into());
                                 if let Err(err) = api::apply_ops(&pid, vec![Op::Export { preset: kind }]).await {
                                     note.set(err);
                                     busy.set(false);
                                     return;
                                 }
-                                let preset_name = kind.label();
-                                for _ in 0..300 {
-                                    gloo_timers::future::TimeoutFuture::new(2000).await;
-                                    if api::export_is_ready(&pid, preset_name).await {
-                                        let stamp = js_sys::Date::now() as u64;
-                                        let file = api::export_file_url(&pid, preset_name);
-                                        let join = if file.contains('?') { '&' } else { '?' };
-                                        url.set(format!("{file}{join}v={stamp}"));
-                                        note.set("Ready to play.".into());
-                                        busy.set(false);
-                                        return;
-                                    }
-                                }
-                                note.set("The render did not show up yet. Check the worker.".into());
-                                busy.set(false);
+                                follow_export(pid, kind.label().into(), note, url, busy);
                             });
                         },
                         if *busy.read() { "Rendering…" } else { "Render" }

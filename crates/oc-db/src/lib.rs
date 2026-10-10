@@ -320,7 +320,7 @@ pub async fn insert_media(
     Ok(row)
 }
 
-/// Register a clip before its bytes are on R2. The key stays `workspace/{id}` until the put stores the object key.
+/// Register a clip whose bytes stay in the browser. The key stays `workspace/{id}`.
 pub async fn upsert_workspace_media(
     pool: &Db,
     project_id: Uuid,
@@ -332,7 +332,7 @@ pub async fn upsert_workspace_media(
     let key = format!("workspace/{media_id}");
     query(
         "insert into media (id, project_id, r2_key, filename, content_type, duration_ticks, status)
-         values ($1, $2, $3, $4, $5, $6, 'uploading')
+         values ($1, $2, $3, $4, $5, $6, 'browser')
          on conflict (id) do update set
             filename = excluded.filename,
             content_type = excluded.content_type,
@@ -360,6 +360,70 @@ pub async fn set_media_r2_key(pool: &Db, id: Uuid, r2_key: &str) -> Result<(), D
 
 pub fn is_r2_object_key(key: &str) -> bool {
     !key.is_empty() && !key.starts_with("workspace/") && !key.starts_with("local/")
+}
+
+/// Directory for source bytes that exist only for one render.
+/// `OPENCUT_SPOOL_DIR`, or the system temp dir. Not `OPENCUT_MEDIA_DIR`.
+#[must_use]
+pub fn spool_root() -> std::path::PathBuf {
+    match std::env::var("OPENCUT_SPOOL_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => std::path::PathBuf::from(dir),
+        _ => std::env::temp_dir().join("oc-spool"),
+    }
+}
+
+#[must_use]
+pub fn render_spool_dir(project_id: Uuid) -> std::path::PathBuf {
+    spool_root().join(project_id.to_string())
+}
+
+/// `{root}/{project}/{media}/{file}`. The file name cannot leave that directory.
+#[must_use]
+pub fn render_spool_file(project_id: Uuid, media_id: Uuid, filename: &str) -> std::path::PathBuf {
+    render_spool_file_under(&spool_root(), project_id, media_id, filename)
+}
+
+#[must_use]
+pub fn render_spool_file_under(
+    root: &std::path::Path,
+    project_id: Uuid,
+    media_id: Uuid,
+    filename: &str,
+) -> std::path::PathBuf {
+    root.join(project_id.to_string())
+        .join(media_id.to_string())
+        .join(object_file_name(filename))
+}
+
+/// Write the whole body, then rename it into place so a render never reads a partial file.
+pub async fn write_render_spool(
+    project_id: Uuid,
+    media_id: Uuid,
+    filename: &str,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    let dest = render_spool_file(project_id, media_id, filename);
+    write_spool_at(&dest, bytes).await?;
+    Ok(dest)
+}
+
+async fn write_spool_at(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| std::io::Error::other("spool path has no directory"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let mut partial_name = dest.as_os_str().to_owned();
+    partial_name.push(".partial");
+    let partial = std::path::PathBuf::from(partial_name);
+    if let Err(err) = tokio::fs::write(&partial, bytes).await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(err);
+    }
+    if let Err(err) = tokio::fs::rename(&partial, dest).await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Last path segment of an object key, safe to join onto a temp directory.
@@ -464,6 +528,13 @@ const LATEST_EXPORT_JOB: &str = "select created_at from jobs
          order by created_at desc
          limit 1";
 
+const LATEST_EXPORT_STATUS: &str = "select status, error from jobs
+         where kind = 'export'
+           and payload->>'project_id' = $1
+           and payload->>'preset' = $2
+         order by created_at desc
+         limit 1";
+
 pub async fn claim_job(pool: &Db) -> Result<Option<JobRow>, DbError> {
     let row = query_as::<JobRow>(CLAIM_JOB_SQL)
         .fetch_optional(pool)
@@ -492,6 +563,20 @@ pub async fn latest_export_job_ms(
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|(created,)| created.timestamp_millis()))
+}
+
+/// Newest export job for this preset: status, and the error when it failed.
+pub async fn latest_export_status(
+    pool: &Db,
+    project_id: Uuid,
+    preset: &str,
+) -> Result<Option<(String, Option<String>)>, DbError> {
+    let row = query_as::<(String, Option<String>)>(LATEST_EXPORT_STATUS)
+        .bind(project_id.to_string())
+        .bind(preset)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
 }
 
 pub async fn job_finished(pool: &Db, id: Uuid) -> Result<bool, DbError> {
@@ -1005,6 +1090,39 @@ mod tests {
         assert!(super::LATEST_EXPORT_JOB.contains("kind = 'export'"));
         assert!(super::LATEST_EXPORT_JOB.contains("payload->>'project_id'"));
         assert!(super::LATEST_EXPORT_JOB.contains("payload->>'preset'"));
+        assert!(super::LATEST_EXPORT_STATUS.contains("select status, error"));
+        assert!(super::LATEST_EXPORT_STATUS.contains("order by created_at desc"));
+    }
+
+    #[test]
+    fn a_spool_name_cannot_leave_its_directory() {
+        let root = std::path::Path::new("/tmp/oc-spool");
+        let project = uuid::Uuid::nil();
+        let media = uuid::Uuid::nil();
+        let path = super::render_spool_file_under(root, project, media, "../../etc/passwd");
+        assert!(path.starts_with(root), "{}", path.display());
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("passwd")
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str()),
+            Some(media.to_string().as_str())
+        );
+        assert!(!path.components().any(|part| part.as_os_str() == ".."));
+    }
+
+    #[tokio::test]
+    async fn a_spool_file_appears_only_after_the_body_is_complete() {
+        let dir = std::env::temp_dir().join(format!("oc-spool-test-{}", uuid::Uuid::new_v4()));
+        let dest = dir.join("clip.mp4");
+        super::write_spool_at(&dest, b"picture").await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"picture");
+        let partial = std::path::PathBuf::from(format!("{}.partial", dest.display()));
+        assert!(!partial.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

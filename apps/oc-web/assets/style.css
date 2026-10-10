@@ -538,8 +538,8 @@ button:disabled { opacity: 0.45; cursor: default; }
 .gfx.caption.place-bottom {
   align-self: end;
   margin: 0 6% 8%;
-  background: rgba(0, 0, 0, 0.55);
-  border-radius: 4px;
+  background: transparent;
+  text-shadow: 0 2px 0 #000, 0 0 14px rgba(0, 0, 0, 0.85);
 }
 .preview-gfx.letterboxed .gfx.caption.place-bottom { margin-bottom: 16%; }
 .gfx.caption.place-lower {
@@ -566,8 +566,8 @@ button:disabled { opacity: 0.45; cursor: default; }
   font-size: clamp(14px, 2.6cqh, 26px);
   font-weight: 800;
   letter-spacing: 0;
-  text-transform: uppercase;
-  color: #ffe56a;
+  text-transform: none;
+  color: #fff;
   background: transparent;
 }
 .gfx.caption.font-serif {

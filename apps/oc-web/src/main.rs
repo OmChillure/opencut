@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod bind;
+mod hold;
 mod media;
 mod pages;
 mod studio;
@@ -15,11 +16,12 @@ use media::{
     item_from_bytes_id, lane_height, max_timeline_h, next_track_name, paint_clock, paint_playhead,
     place_clip, playhead_now, preview_video, program_end, reset_tick_clock, ruler_marks_nle,
     scroll_left, seek_by, set_media_duration, set_playhead, sync_monitor, timeline_end,
-    timeline_viewport_h, timeline_viewport_w, update_drag, uses_wall_clock,
-    video_duration_from_src,
+    timeline_viewport_h, timeline_viewport_w, update_drag, video_duration_from_src,
 };
 use oc_core::TimelineEditMode;
-use oc_core::{Fx, Grade, Graphic, Op, Timeline as EngineTimeline, TrackKind, TransitionKind};
+use oc_core::{
+    ExportPreset, Fx, Grade, Graphic, Op, Timeline as EngineTimeline, TrackKind, TransitionKind,
+};
 use oc_tools::{ToolId, actions as cut_actions, modes as edit_tools, track_actions};
 use pages::{Export, Login, NewProject, Projects};
 use toast::{ToastProvider, show_toast};
@@ -157,8 +159,8 @@ fn note_upload(
 ) {
     uploading.write().retain(|row| row != id);
     match result {
-        Ok(()) => show_toast().success(format!("{name} uploaded")),
-        Err(err) => show_toast().error(format!("{name} did not upload: {err}")),
+        Ok(()) => show_toast().success(format!("{name} saved in this browser")),
+        Err(err) => show_toast().error(format!("{name} was not saved in this browser: {err}")),
     }
 }
 
@@ -364,7 +366,7 @@ fn Workspace(id: String) -> Element {
                 }
                 event.prevent_default();
                 event.set_return_value(
-                    "Imported files have not reached R2 and will be removed from this project.",
+                    "Imported files are only in this tab. Leave and a refresh will not have them.",
                 );
             },
         )
@@ -405,9 +407,17 @@ fn Workspace(id: String) -> Element {
                 }
             }
         }
-        if let Ok(remote) = api::list_media(&pid).await {
+        let remote_ids = if let Ok(remote) = api::list_media(&pid).await {
+            let ids = remote
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
             merge_library(library, active, remote);
-        }
+            ids
+        } else {
+            Vec::new()
+        };
+        restore_browser_media(&pid, library, active, &remote_ids).await;
     });
 
     use_future(move || async move {
@@ -423,12 +433,16 @@ fn Workspace(id: String) -> Element {
                 playing.set(false);
                 continue;
             }
-            let parked = playhead_now().min(end);
-            let before = if uses_wall_clock(&engine.peek(), parked) {
-                advance_playhead(end).min(end)
-            } else {
-                parked
-            };
+            // Wall clock owns the playhead so a stalled picture does not freeze the captions.
+            let mut before = advance_playhead(end).min(end);
+            if crate::media::clip_under(&tracks.peek(), &library.peek(), before).is_none() {
+                if let Some(next) =
+                    crate::media::next_picture_after(&tracks.peek(), &library.peek(), before, 0.45)
+                {
+                    before = next.start.min(end);
+                    set_playhead(before);
+                }
+            }
             if before >= end - 0.02 {
                 set_playhead(end);
                 paint_playhead(end);
@@ -586,10 +600,11 @@ fn drag_chip(drag: Signal<Option<DragSession>>) -> Element {
             class: "drag-chip",
             style: "left: {left}px; top: {top}px",
             div { class: "drag-chip-media",
-                match kind {
-                    MediaKind::Image => rsx! { img { src: "{url}", alt: "" } },
-                    MediaKind::Audio => rsx! { IconWave {} },
-                    MediaKind::Video => rsx! {
+                match (url.is_empty(), kind) {
+                    (true, _) => rsx! {},
+                    (false, MediaKind::Image) => rsx! { img { src: "{url}", alt: "" } },
+                    (false, MediaKind::Audio) => rsx! { IconWave {} },
+                    (false, MediaKind::Video) => rsx! {
                         video { src: "{url}", muted: true, preload: "metadata" }
                     },
                 }
@@ -639,9 +654,9 @@ fn Header(name: Signal<String>) -> Element {
                 button {
                     class: if unsaved { "btn btn-primary" } else { "btn btn-ghost" },
                     disabled: !unsaved,
-                    title: "Send imported files that have not reached R2",
+                    title: "Keep imported files in this browser",
                     onclick: move |_| save_held_imports(held, uploading, save),
-                    "Retry upload"
+                    "Save here"
                 }
                 button {
                     class: "btn btn-primary",
@@ -1163,7 +1178,9 @@ fn MediaPanel() -> Element {
                             div {
                                 class: "{tile_class}",
                                 title: if uploading_now {
-                                    "Uploading..."
+                                    "Saving in this browser..."
+                                } else if url.is_empty() {
+                                    "This file is only in the browser that imported it"
                                 } else {
                                     "Drag onto a track, or press + at the playhead"
                                 },
@@ -1221,9 +1238,10 @@ fn MediaPanel() -> Element {
                                     },
                                     onclick: move |_| active.set(Some(pick_url.clone())),
                                     div { class: "media-icon",
-                                        match kind {
-                                            MediaKind::Image => rsx! { img { src: "{url}", alt: "" } },
-                                            MediaKind::Video => {
+                                        match (url.is_empty(), kind) {
+                                            (true, _) => rsx! { span { class: "media-missing", "Not in this browser" } },
+                                            (false, MediaKind::Image) => rsx! { img { src: "{url}", alt: "" } },
+                                            (false, MediaKind::Video) => {
                                                 let probe_url = url.clone();
                                                 rsx! {
                                                     video {
@@ -1262,13 +1280,15 @@ fn MediaPanel() -> Element {
                                                     }
                                                 }
                                             }
-                                            MediaKind::Audio => rsx! { IconWave {} },
+                                            (false, MediaKind::Audio) => rsx! { IconWave {} },
                                         }
                                     }
                                     span { class: "media-name", "{name}" }
                                 }
                                 if uploading_now {
-                                    div { class: "media-upload", "Uploading..." }
+                                    div { class: "media-upload", "Saving..." }
+                                } else if url.is_empty() {
+                                    div { class: "media-upload", "Not in this browser" }
                                 }
                                 button {
                                     class: "media-x",
@@ -2107,7 +2127,7 @@ fn Timeline() -> Element {
                                                         },
                                                         if is_audio {
                                                             studio::Waveform { url: url.clone(), bars: (tiles as usize * 5).max(12), seed: name.clone() }
-                                                        } else if is_image {
+                                                        } else if is_image && !url.is_empty() {
                                                             div { class: "nle-strip",
                                                                 img { src: "{url}", alt: "" }
                                                             }
@@ -2118,7 +2138,7 @@ fn Timeline() -> Element {
                                                         }
                                                         span {
                                                             class: "nle-name",
-                                                            if clip_uploading { "Uploading..." } else { "{name}" }
+                                                            if clip_uploading { "Saving..." } else { "{name}" }
                                                         }
                                                         if selected {
                                                             div {
@@ -2193,7 +2213,7 @@ fn confirm_leave(held: Signal<Vec<HeldImport>>) -> bool {
     }
     let n = held.peek().len();
     let msg = format!(
-        "{n} imported file(s) have not reached R2. Leave and they will be removed from this project."
+        "{n} imported file(s) are only in this tab. Leave and a refresh will not have them."
     );
     web_sys::window()
         .and_then(|w| w.confirm_with_message(&msg).ok())
@@ -3356,11 +3376,7 @@ fn merge_library(
     let mut merged = library.peek().clone();
     for item in remote {
         if let Some(existing) = merged.iter_mut().find(|m| m.id == item.id) {
-            if !item.url.is_empty()
-                && (existing.url.is_empty() || existing.url.starts_with("blob:"))
-            {
-                existing.url = item.url;
-            }
+            existing.url = crate::api::keep_play_url(&existing.url, &item.url);
             if existing.duration <= 0.05 && item.duration > 0.05 {
                 existing.duration = item.duration;
             }
@@ -3371,6 +3387,54 @@ fn merge_library(
     library.set(merged);
     if active.peek().is_none() {
         active.set(library.peek().first().map(|item| item.url.clone()));
+    }
+}
+
+async fn restore_browser_media(
+    project_id: &str,
+    mut library: Signal<Vec<MediaItem>>,
+    mut active: Signal<Option<String>>,
+    remote_ids: &[String],
+) {
+    let stored = match hold::files_for_project(project_id).await {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    let mut items = library.peek().clone();
+    let mut changed = false;
+    for file in stored {
+        if let Some(existing) = items.iter_mut().find(|item| item.id == file.id) {
+            if !existing.url.starts_with("blob:") {
+                if let Some(url) = crate::media::blob_url(&file.bytes, &file.content_type) {
+                    existing.url = url;
+                    if existing.content_type.is_empty() {
+                        existing.content_type = file.content_type.clone();
+                    }
+                    changed = true;
+                }
+            }
+        } else if let Some(item) =
+            item_from_bytes_id(file.name.clone(), &file.bytes, file.id.clone())
+        {
+            items.push(item);
+            changed = true;
+        }
+        if !remote_ids.iter().any(|id| id == &file.id) {
+            let _ = api::register_media(project_id, &file.id, &file.name, &file.content_type, 0.0)
+                .await;
+        }
+    }
+    if changed {
+        library.set(items);
+    }
+    if active.peek().is_none() || active.peek().as_deref().is_some_and(|url| url.is_empty()) {
+        active.set(library.peek().iter().find_map(|item| {
+            if item.url.is_empty() {
+                None
+            } else {
+                Some(item.url.clone())
+            }
+        }));
     }
 }
 
@@ -3703,6 +3767,43 @@ fn open_saved_chat(
     });
 }
 
+async fn store_finished_video(
+    pid: &str,
+    preset_name: &str,
+    handoff: bool,
+    mut messages: Signal<Vec<ChatMsg>>,
+) {
+    if !handoff {
+        messages.write().push(ChatMsg::status(
+            "Render queued. The finished video is stored on Cloudflare.".to_string(),
+        ));
+        return;
+    }
+    messages.write().push(ChatMsg::status(
+        "Sending this browser's clips. The finished video is stored on Cloudflare.".to_string(),
+    ));
+    if let Err(err) = api::send_browser_sources(pid).await {
+        messages.write().push(ChatMsg::status(err));
+        return;
+    }
+    let Some(preset) = ExportPreset::parse(preset_name) else {
+        messages.write().push(ChatMsg::status(
+            "The finished video was not queued.".to_string(),
+        ));
+        return;
+    };
+    if let Err(err) = api::apply_ops(pid, vec![Op::Export { preset }]).await {
+        messages.write().push(ChatMsg::status(format!(
+            "The finished video was not queued — {err}"
+        )));
+        return;
+    }
+    messages.write().push(ChatMsg::status(
+        "Render queued. Open Export to play it. The finished video is stored on Cloudflare."
+            .to_string(),
+    ));
+}
+
 fn send_prompt(
     mut draft: Signal<String>,
     mut messages: Signal<Vec<ChatMsg>>,
@@ -3780,7 +3881,7 @@ fn send_prompt(
             } else if api::chat_current(turn) {
                 let err = result.as_ref().err().map(String::as_str).unwrap_or("");
                 messages.write().push(ChatMsg::status(format!(
-                    "{} is not on R2 — {err}",
+                    "{} was not saved in this browser — {err}",
                     file.name
                 )));
             }
@@ -3822,9 +3923,17 @@ fn send_prompt(
                     Err(_) => resp.timeline.clone(),
                 };
                 show_timeline(&mut save, &clock, timeline);
-                if let Ok(remote) = api::list_media(&pid).await {
+                let remote_ids = if let Ok(remote) = api::list_media(&pid).await {
+                    let ids = remote
+                        .iter()
+                        .map(|item| item.id.clone())
+                        .collect::<Vec<_>>();
                     merge_library(library, active, remote);
-                }
+                    ids
+                } else {
+                    Vec::new()
+                };
+                restore_browser_media(&pid, library, active, &remote_ids).await;
                 finish_bot_text(
                     messages,
                     if resp.text.trim().is_empty() {
@@ -3833,6 +3942,10 @@ fn send_prompt(
                         resp.text
                     },
                 );
+                if api::chat_current(turn) && !resp.export_preset.is_empty() {
+                    store_finished_video(&pid, &resp.export_preset, resp.export_handoff, messages)
+                        .await;
+                }
             }
             Err(err) => {
                 clear_status(messages);

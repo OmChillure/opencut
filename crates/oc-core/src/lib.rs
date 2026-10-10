@@ -10,7 +10,8 @@ pub use oc_timeline::{
     Curves, DENOISE_NF_DB, DENOISE_NR_DB, Ease, EditPlan, EditSlot, FrameCard, Fx, Generator,
     Grade, Graphic, GraphicKind, GroupId, LineLook, LinkId, Lut, Marker, MarkerId, MaskShape,
     MediaId, Mix, PlaceMode, Project, ProjectId, SpeedKey, Timeline, Track, TrackId, TrackKind,
-    Transform, TransitionKind, UndoStack, canonical_color, caption_motion, caption_reveal,
+    Transform, TransitionKind, UndoStack, canonical_color, caption_beats, caption_motion,
+    caption_phrase, caption_reveal,
     denoise_curve, denoise_sample, dress_cues, ffmpeg_color, marked_place, parse_cube,
     shot_is_face,
 };
