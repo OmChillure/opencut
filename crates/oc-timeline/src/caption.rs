@@ -2,7 +2,8 @@
 //! so it stays off a close mouth and inside the frame.
 
 use crate::{
-    CaptionCue, CaptionEffect, CaptionFont, CaptionMood, CaptionPlace, CaptionRecipe, LineLook,
+    CaptionCue, CaptionEdge, CaptionEffect, CaptionFont, CaptionInk, CaptionMood, CaptionPaint,
+    CaptionPlace, CaptionPreset, CaptionRecipe, LineLook,
 };
 
 /// A tight shot of a person. Captions stay off the mouth.
@@ -61,6 +62,10 @@ pub fn look_for(
 }
 
 fn theme_of(recipe: &CaptionRecipe) -> (CaptionPlace, CaptionFont, CaptionEffect) {
+    if let Some(preset) = recipe.preset {
+        let paint = preset.paint();
+        return (paint.place, paint.font, paint.effect);
+    }
     let mood = recipe.base.unwrap_or(CaptionMood::Clean);
     let (mut place, mut font, mut effect) = mood_theme(mood);
     if let Some(look) = explicit_look(recipe) {
@@ -113,15 +118,30 @@ fn seat(place: CaptionPlace, face: bool, on_face: Option<CaptionPlace>) -> Capti
     }
 }
 
+/// Ink and edge for this recipe. No preset stays white with a dark edge.
+#[must_use]
+pub fn caption_colors(recipe: &CaptionRecipe) -> (CaptionInk, CaptionEdge) {
+    paint_of(recipe).map_or((CaptionInk::White, CaptionEdge::Dark), |paint| {
+        (paint.ink, paint.edge)
+    })
+}
+
+fn paint_of(recipe: &CaptionRecipe) -> Option<CaptionPaint> {
+    recipe.preset.map(CaptionPreset::paint)
+}
+
 /// Write a look onto each cue. `faces[i]` is true when that line sits on a close person.
-/// A missing entry stays off the mouth.
+/// A missing entry stays off the mouth. A preset sets the color too.
 pub fn dress_cues(cues: &mut [CaptionCue], recipe: &CaptionRecipe, faces: &[bool]) {
+    let (ink, edge) = caption_colors(recipe);
     for (i, cue) in cues.iter_mut().enumerate() {
         let face = faces.get(i).copied().unwrap_or(true);
         let (place, font, effect) = look_for(&cue.text, i, recipe, face);
         cue.place = place;
         cue.font = font;
         cue.effect = effect;
+        cue.ink = ink;
+        cue.edge = edge;
     }
 }
 
@@ -309,6 +329,43 @@ mod tests {
             look_for("why now?", 2, &recipe, false).1,
             CaptionFont::Display
         );
+    }
+
+    #[test]
+    fn a_preset_paints_every_line_and_a_face_drops_the_middle() {
+        let stomp = CaptionRecipe {
+            preset: Some(CaptionPreset::Stomp),
+            punch: Some(LineLook::parse("top serif fade")),
+            ..CaptionRecipe::default()
+        };
+        let (place, font, effect) = look_for("Go now", 0, &stomp, false);
+        assert_eq!(place, CaptionPlace::Middle);
+        assert_eq!(font, CaptionFont::Display);
+        assert_eq!(effect, CaptionEffect::Pop);
+        assert_eq!(look_for("Go now", 0, &stomp, true).0, CaptionPlace::Lower);
+        let mut cues = vec![CaptionCue {
+            start: oc_time::Time::ZERO,
+            end: oc_time::Time::from_seconds(1.0),
+            text: "Go now".into(),
+            speaker: None,
+            place: CaptionPlace::Bottom,
+            font: CaptionFont::Sans,
+            effect: CaptionEffect::None,
+            ink: CaptionInk::White,
+            edge: CaptionEdge::Dark,
+        }];
+        dress_cues(&mut cues, &stomp, &[false]);
+        assert_eq!(cues[0].place, CaptionPlace::Middle);
+        assert_eq!(cues[0].ink, CaptionInk::White);
+        let ink = CaptionRecipe {
+            preset: Some(CaptionPreset::Ink),
+            ..CaptionRecipe::default()
+        };
+        dress_cues(&mut cues, &ink, &[true]);
+        assert_eq!(cues[0].ink, CaptionInk::Black);
+        assert_eq!(cues[0].edge, CaptionEdge::Light);
+        assert_eq!(cues[0].place, CaptionPlace::Bottom);
+        assert_eq!(cues[0].font, CaptionFont::Serif);
     }
 
     #[test]

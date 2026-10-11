@@ -887,6 +887,9 @@ pub struct EditPlan {
     /// This video's caption mix. Any place, font, and effect per kind of line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption_look: Option<CaptionRecipe>,
+    /// One named look for every line. It wins over `caption_mood` and `caption_look`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_preset: Option<crate::CaptionPreset>,
     /// Applied to every slot that does not set its own grade.
     #[serde(default)]
     pub grade: Grade,
@@ -1210,6 +1213,9 @@ pub struct CaptionRecipe {
     /// Fills roles this recipe left empty. Not a menu the model has to pick from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<CaptionMood>,
+    /// A named preset. When set, every line uses that paint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<crate::CaptionPreset>,
 }
 
 impl CaptionRecipe {
@@ -1223,6 +1229,7 @@ impl CaptionRecipe {
             && self.number.is_none()
             && self.on_face.is_none()
             && self.base.is_none()
+            && self.preset.is_none()
     }
 
     /// A JSON object, or a short note such as `hook top display typewriter`.
@@ -1318,6 +1325,10 @@ pub struct CaptionCue {
     pub font: CaptionFont,
     #[serde(default, skip_serializing_if = "is_still")]
     pub effect: CaptionEffect,
+    #[serde(default, skip_serializing_if = "is_white")]
+    pub ink: crate::CaptionInk,
+    #[serde(default, skip_serializing_if = "is_dark_edge")]
+    pub edge: crate::CaptionEdge,
 }
 
 fn is_bottom(place: &CaptionPlace) -> bool {
@@ -1330,6 +1341,14 @@ fn is_sans(font: &CaptionFont) -> bool {
 
 fn is_still(effect: &CaptionEffect) -> bool {
     *effect == CaptionEffect::None
+}
+
+fn is_white(ink: &crate::CaptionInk) -> bool {
+    *ink == crate::CaptionInk::White
+}
+
+fn is_dark_edge(edge: &crate::CaptionEdge) -> bool {
+    *edge == crate::CaptionEdge::Dark
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1758,10 +1758,12 @@ pub fn apply_monitor_look(
                         let motion = oc_core::caption_motion(effect, local, local_span);
                         graphics.push((
                             format!(
-                                "caption place-{} font-{} effect-{}",
+                                "caption place-{} font-{} effect-{} ink-{} edge-{}",
                                 place.as_str(),
                                 font.as_str(),
-                                effect.as_str()
+                                effect.as_str(),
+                                cue.ink.as_str(),
+                                cue.edge.as_str()
                             ),
                             shown,
                             None,

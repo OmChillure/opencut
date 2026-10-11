@@ -37,6 +37,8 @@ impl Cue {
             place: oc_timeline::CaptionPlace::Bottom,
             font: oc_timeline::CaptionFont::Sans,
             effect: oc_timeline::CaptionEffect::None,
+            ink: Default::default(),
+            edge: Default::default(),
         }
     }
 }

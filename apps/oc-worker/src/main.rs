@@ -620,6 +620,8 @@ mod tests {
             place: oc_core::CaptionPlace::Bottom,
             font: oc_core::CaptionFont::Sans,
             effect: oc_core::CaptionEffect::None,
+            ink: Default::default(),
+            edge: Default::default(),
         }];
         let timeline = oc_core::Timeline::new(oc_core::FrameRate::FPS_30, 1080, 1920);
         dress_safe(&mut cues, &timeline);

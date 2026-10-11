@@ -1,4 +1,6 @@
-use oc_timeline::{CaptionEffect, CaptionFont, CaptionPlace, ClipKind, Timeline};
+use oc_timeline::{
+    CaptionEdge, CaptionEffect, CaptionFont, CaptionInk, CaptionPlace, ClipKind, Timeline,
+};
 use std::fmt::Write;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -9,6 +11,8 @@ pub struct BurnedCue {
     pub place: CaptionPlace,
     pub font: CaptionFont,
     pub effect: CaptionEffect,
+    pub ink: CaptionInk,
+    pub edge: CaptionEdge,
 }
 
 /// Map transcript-style cues (source seconds) onto the *cut*.
@@ -38,6 +42,8 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
                     place: cue.place,
                     font: cue.font,
                     effect: cue.effect,
+                    ink: cue.ink,
+                    edge: cue.edge,
                 });
             }
         }
@@ -80,6 +86,8 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
                 place: cue.place,
                 font: cue.font,
                 effect: cue.effect,
+                ink: cue.ink,
+                edge: cue.edge,
             });
             placed[i] = true;
         }
@@ -104,6 +112,8 @@ pub fn captions_for_cut(timeline: &Timeline) -> Vec<BurnedCue> {
                 place: cue.place,
                 font: cue.font,
                 effect: cue.effect,
+                ink: cue.ink,
+                edge: cue.edge,
             });
         }
     }
@@ -140,6 +150,8 @@ fn shorten_cues(cues: Vec<BurnedCue>) -> Vec<BurnedCue> {
                 place: cue.place,
                 font: cue.font,
                 effect: cue.effect,
+                ink: cue.ink,
+                edge: cue.edge,
             });
         }
     }
@@ -192,9 +204,10 @@ pub fn to_ass(cues: &[BurnedCue], width: u32, height: u32, letterbox: bool) -> S
     for cue in cues {
         let (x, y, an) = anchor(cue.place, width, height, letterbox);
         let effect = effect_prefix(cue.effect);
+        let color = format!("\\c{}&\\3c{}&\\bord3", cue.ink.ass(), cue.edge.ass());
         let _ = writeln!(
             out,
-            "Dialogue: 0,{},{},Default,,0,0,0,,{{\\an{an}\\pos({x},{y}){}{effect}}}{}",
+            "Dialogue: 0,{},{},Default,,0,0,0,,{{\\an{an}\\pos({x},{y}){}{color}{effect}}}{}",
             ass_time(cue.start),
             ass_time(cue.end),
             font_override(cue.font, short),
@@ -327,6 +340,8 @@ mod tests {
                 place: CaptionPlace::Bottom,
                 font: CaptionFont::Sans,
                 effect: CaptionEffect::None,
+                ink: CaptionInk::White,
+                edge: CaptionEdge::Dark,
             }],
             1080,
             1920,
@@ -334,9 +349,29 @@ mod tests {
         );
         assert!(ass.contains("PlayResX: 1080\nPlayResY: 1920"), "{ass}");
         assert!(
-            ass.contains("{\\an2\\pos(540,1612)\\fnDejaVu Sans\\fs49\\b1}something that matters."),
+            ass.contains("{\\an2\\pos(540,1612)\\fnDejaVu Sans\\fs49\\b1\\c&H00FFFFFF&\\3c&H00000000&\\bord3}something that matters."),
             "{ass}"
         );
+        let ink = to_ass(
+            &[BurnedCue {
+                start: 0.0,
+                end: 1.0,
+                text: "bright".into(),
+                place: CaptionPlace::Bottom,
+                font: CaptionFont::Serif,
+                effect: CaptionEffect::None,
+                ink: CaptionInk::Black,
+                edge: CaptionEdge::Light,
+            }],
+            1080,
+            1920,
+            false,
+        );
+        assert!(
+            ink.contains("\\c&H00141414&\\3c&H00FFFFFF&\\bord3"),
+            "{ink}"
+        );
+        assert!(ink.contains("DejaVu Serif"), "{ink}");
     }
 
     #[test]
@@ -349,6 +384,8 @@ mod tests {
                 place: CaptionPlace::Middle,
                 font: CaptionFont::Display,
                 effect: CaptionEffect::Pop,
+                ink: CaptionInk::White,
+                edge: CaptionEdge::Dark,
             }],
             1080,
             1920,
@@ -369,6 +406,8 @@ mod tests {
                 place: CaptionPlace::Lower,
                 font: CaptionFont::Mono,
                 effect: CaptionEffect::Typewriter,
+                ink: CaptionInk::White,
+                edge: CaptionEdge::Dark,
             }],
             1080,
             1920,
@@ -384,6 +423,8 @@ mod tests {
                 place: CaptionPlace::Bottom,
                 font: CaptionFont::Sans,
                 effect: CaptionEffect::Fade,
+                ink: CaptionInk::White,
+                edge: CaptionEdge::Dark,
             }],
             1080,
             1920,
@@ -432,6 +473,8 @@ mod tests {
                             place: Default::default(),
                             font: Default::default(),
                             effect: Default::default(),
+                            ink: Default::default(),
+                            edge: Default::default(),
                         },
                         CaptionCue {
                             start: Time::from_seconds(80.0),
@@ -441,6 +484,8 @@ mod tests {
                             place: Default::default(),
                             font: Default::default(),
                             effect: Default::default(),
+                            ink: Default::default(),
+                            edge: Default::default(),
                         },
                     ],
                 },
@@ -501,6 +546,8 @@ mod tests {
                         place: Default::default(),
                         font: Default::default(),
                         effect: Default::default(),
+                        ink: Default::default(),
+                        edge: Default::default(),
                     }],
                 },
                 start: Time::ZERO,
@@ -580,6 +627,8 @@ mod tests {
                         place: Default::default(),
                         font: Default::default(),
                         effect: Default::default(),
+                        ink: Default::default(),
+                        edge: Default::default(),
                     }],
                 },
                 start: Time::ZERO,
@@ -662,6 +711,8 @@ mod tests {
                             place: Default::default(),
                             font: Default::default(),
                             effect: Default::default(),
+                            ink: Default::default(),
+                            edge: Default::default(),
                         },
                         CaptionCue {
                             start: Time::from_seconds(52.2),
@@ -671,6 +722,8 @@ mod tests {
                             place: Default::default(),
                             font: Default::default(),
                             effect: Default::default(),
+                            ink: Default::default(),
+                            edge: Default::default(),
                         },
                     ],
                 },
@@ -687,7 +740,10 @@ mod tests {
         .unwrap();
         let burned = captions_for_cut(&tl);
         assert_eq!(
-            burned.iter().filter(|cue| cue.text == "be a bullish flag").count(),
+            burned
+                .iter()
+                .filter(|cue| cue.text == "be a bullish flag")
+                .count(),
             1,
             "{burned:?}"
         );

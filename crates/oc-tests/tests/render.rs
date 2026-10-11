@@ -232,6 +232,8 @@ fn caption_times_follow_the_dissolve_overlap() {
             place: oc_core::CaptionPlace::Bottom,
             font: oc_core::CaptionFont::Sans,
             effect: oc_core::CaptionEffect::None,
+            ink: Default::default(),
+            edge: Default::default(),
         }],
     )
     .unwrap();

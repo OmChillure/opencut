@@ -76,6 +76,10 @@ pub enum Layer {
         font: CaptionFont,
         #[serde(default)]
         effect: CaptionEffect,
+        #[serde(default)]
+        ink: oc_timeline::CaptionInk,
+        #[serde(default)]
+        edge: oc_timeline::CaptionEdge,
     },
     Graphic {
         graphic: Graphic,
@@ -190,6 +194,8 @@ pub fn plan_frame(timeline: &Timeline, time: Time) -> FramePlan {
                     place: cue.place,
                     font: cue.font,
                     effect: cue.effect,
+                    ink: cue.ink,
+                    edge: cue.edge,
                 });
             }
         }

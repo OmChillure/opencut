@@ -31,6 +31,7 @@ pub fn redress_unset_captions(timeline: &mut Timeline) -> bool {
     let recipe = recipe_for_timeline(timeline);
     let open = oc_timeline::look_for("", 0, &recipe, false);
     let seated = oc_timeline::look_for("", 0, &recipe, true);
+    let (ink, edge) = oc_timeline::caption_colors(&recipe);
     let mut changed = false;
     for track in &mut timeline.tracks {
         if track.kind != TrackKind::Caption || track.muted || track.hidden {
@@ -43,7 +44,7 @@ pub fn redress_unset_captions(timeline: &mut Timeline) -> bool {
             let ClipKind::Caption { cues, .. } = &mut clip.kind else {
                 continue;
             };
-            if cues.is_empty() || cues_share_theme(cues, open, seated) {
+            if cues.is_empty() || cues_share_theme(cues, open, seated, ink, edge) {
                 continue;
             }
             let faces = vec![true; cues.len()];
@@ -58,9 +59,15 @@ fn cues_share_theme(
     cues: &[CaptionCue],
     open: (CaptionPlace, CaptionFont, CaptionEffect),
     seated: (CaptionPlace, CaptionFont, CaptionEffect),
+    ink: oc_timeline::CaptionInk,
+    edge: oc_timeline::CaptionEdge,
 ) -> bool {
     cues.iter().all(|cue| {
-        cue.font == open.1 && cue.effect == open.2 && (cue.place == open.0 || cue.place == seated.0)
+        cue.font == open.1
+            && cue.effect == open.2
+            && (cue.place == open.0 || cue.place == seated.0)
+            && cue.ink == ink
+            && cue.edge == edge
     })
 }
 
@@ -72,6 +79,12 @@ pub fn caption_recipe_for(timeline: &Timeline) -> CaptionRecipe {
 
 fn recipe_for_timeline(timeline: &Timeline) -> CaptionRecipe {
     if let Some(plan) = &timeline.edit_plan {
+        if let Some(preset) = plan.caption_preset {
+            return CaptionRecipe {
+                preset: Some(preset),
+                ..CaptionRecipe::default()
+            };
+        }
         if let Some(look) = &plan.caption_look {
             let mut recipe = look.clone();
             if recipe.base.is_none() {
@@ -180,6 +193,8 @@ pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
                 place: Default::default(),
                 font: Default::default(),
                 effect: Default::default(),
+                ink: Default::default(),
+                edge: Default::default(),
             });
         }
     }
@@ -269,6 +284,8 @@ mod tests {
                     place: Default::default(),
                     font: Default::default(),
                     effect: Default::default(),
+                    ink: Default::default(),
+                    edge: Default::default(),
                 }],
             },
         )
@@ -347,6 +364,7 @@ mod tests {
             captions: true,
             caption_mood: None,
             caption_look: None,
+            caption_preset: None,
             grade: oc_timeline::Grade::default(),
             slots: Vec::new(),
         }
@@ -361,6 +379,8 @@ mod tests {
             place: CaptionPlace::Bottom,
             font: CaptionFont::Sans,
             effect: CaptionEffect::None,
+            ink: Default::default(),
+            edge: Default::default(),
         }
     }
 

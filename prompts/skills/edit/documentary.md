@@ -16,4 +16,4 @@ Cutaways relate to the sentence being said, or they show a true context. A cutaw
 
 Hold a face until it can be read. Cut on a change of thought or a breath, not on every sentence end. For action, cut just before or during the movement so the next angle completes it.
 
-On the plan: keep the order of the argument. `duration` includes the last word and a short tail, and does not run into the next sentence or into dead air. No speed ramp unless they asked. Fades only at the open and the close. `dissolve` only for a change of time or place. A talking piece stays `caption_mood` `clean` unless they asked for something else. Grade stays empty on a clear frame.
+On the plan: keep the order of the argument. `duration` includes the last word and a short tail, and does not run into the next sentence or into dead air. No speed ramp unless they asked. Fades only at the open and the close. `dissolve` only for a change of time or place. Leave `caption_mood` empty. One `caption_preset` comes from the captions page. Grade stays empty on a clear frame.

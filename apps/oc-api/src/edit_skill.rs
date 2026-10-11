@@ -52,6 +52,14 @@ const PAGES: &[Page] = &[
         id: "color",
         file: "color.md",
     },
+    Page {
+        id: "captions",
+        file: "captions.md",
+    },
+    Page {
+        id: "caption-looks",
+        file: "caption-looks.md",
+    },
 ];
 
 pub fn page_ids() -> String {
@@ -99,6 +107,10 @@ fn canonical(name: &str) -> String {
         "teaser" | "teasers" => "trailer".to_string(),
         "beat" | "beats" | "beat-sync" => "music".to_string(),
         "grade" | "grading" | "color-grade" | "color-grading" | "finishing" => "color".to_string(),
+        "caption" | "subtitle" | "subtitles" | "sdh" => "captions".to_string(),
+        "caption-look" | "caption-preset" | "caption-presets" | "presets" => {
+            "caption-looks".to_string()
+        }
         "cut" | "cutting" | "continuity" => "shot".to_string(),
         "pacing" | "camera" => "rhythm".to_string(),
         "revision" | "feedback" => "revise".to_string(),
@@ -131,11 +143,9 @@ mod tests {
         for page in PAGES {
             let text = super::page(page.id).unwrap_or_else(|err| panic!("{}: {err}", page.id));
             assert!(text.len() > 200, "{}", page.id);
-            assert!(
-                text.contains("Copyright (c) 2026 generative-media-skills contributors"),
-                "{}",
-                page.id
-            );
+            let credited = text.contains("Copyright (c) 2026 generative-media-skills contributors")
+                || text.contains("Apache-2.0") && text.contains("heygen-com/hyperframes");
+            assert!(credited, "{}", page.id);
             assert!(!text.contains("1.12"), "{}", page.id);
             assert!(!text.contains("1.06"), "{}", page.id);
             assert!(!text.contains("1.04"), "{}", page.id);
@@ -155,6 +165,16 @@ mod tests {
         let color = page("grade").unwrap();
         assert!(color.contains("# Color"), "{color}");
         assert!(page("doc").unwrap().contains("# Documentary"));
+        assert!(page("captions").unwrap().contains("# Captions"));
+        let looks = page("presets").unwrap();
+        assert!(looks.contains("# Caption looks"), "{looks}");
+        for preset in oc_core::CaptionPreset::all() {
+            assert!(
+                looks.contains(preset.as_str()),
+                "catalog missing {}",
+                preset.as_str()
+            );
+        }
         let err = page("cinematic").unwrap_err();
         assert!(err.contains("there is no cinematic page"), "{err}");
         assert!(err.contains("color"), "{err}");

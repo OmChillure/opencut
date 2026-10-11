@@ -27,8 +27,8 @@ Decide the shape from the ask. You choose the in-points. Do not walk the transcr
 - **One long source and they asked for a reel or a short** — several excerpts, not one short bite and not the whole file.
 - **Trim / split / delete / recut** — touch only what they named.
 - **Captions / silence / duck / reframe** — just that.
-- **Shape** — before `submit_edit`, call `edit_skill` once. The page is the spine this footage is: `explainer`, `product`, `ad`, `trailer`, `documentary`, or `music`. A vertical reel is not automatically hype. `promise` is that call only when you cannot name a spine. Write the page's **On the plan** lines onto the slots. Do not call `edit_skill` again.
-- **On the plan** — write that page onto the slots. Rust applies the fields you set and leaves every other shot alone. Rust seats a talking slot on the words. A clear frame's grade stays zero. Set one caption theme with `caption_mood` or one `caption_look`, as the director brief says.
+- **Shape** — before `submit_edit`, call `edit_skill` once. The page is the spine this footage is: `explainer`, `product`, `ad`, `trailer`, `documentary`, or `music`. A vertical reel is not automatically hype. `promise` is that call only when you cannot name a spine. Write the page's **On the plan** lines onto the slots. When the words should be on screen, call `edit_skill` `captions` and then `edit_skill` `caption-looks`. Do not call `edit_skill` again after that.
+- **On the plan** — write that page onto the slots. Rust applies the fields you set and leaves every other shot alone. Rust seats a talking slot on the words. A clear frame's grade stays zero. Set one caption theme with `caption_preset` from the looks page. Leave `caption_mood` empty.
 - **Louder, quieter, panned, solo** — `set_mix` on the audio track (or omit `track_id` for the master). Not a new cut.
 - **A curve, a mask, a speed change in the middle** — `set_curves`, `set_mask`, `set_speed_keys` on the clip they named.
 - **A slate, bars, snow, or a countdown** — `add_generator`. Not a substitute for their footage.
@@ -36,7 +36,7 @@ Decide the shape from the ask. You choose the in-points. Do not walk the transcr
 
 ## 3. Execute
 
-For a reel, short, vlog, documentary, or any "make a piece" ask: call `edit_skill` once, then `submit_edit` once. The slots carry that page's **On the plan** lines. Read the review. A `fix:` line gets `revise_edit`, at most twice. A `note:` line is taste and does not need a tool. Do not rebuild the timeline with a string of `place_clip` calls. Do not call `edit_skill` again.
+For a reel, short, vlog, documentary, or any "make a piece" ask: call `edit_skill` once for the spine, then `captions` and `caption-looks` when the words should be on screen, then `submit_edit` once. The slots carry that page's **On the plan** lines, and `caption_preset` carries the look. Read the review. A `fix:` line gets `revise_edit`, at most twice. A `note:` line is taste and does not need a tool. Do not rebuild the timeline with a string of `place_clip` calls. Do not call `edit_skill` again.
 
 For a trim, a title, a volume, or one clip's grade: use the low-level tool.
 

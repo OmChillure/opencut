@@ -581,6 +581,21 @@ button:disabled { opacity: 0.45; cursor: default; }
   letter-spacing: 0;
   text-transform: none;
 }
+.gfx.caption.ink-white { color: #fff; }
+.gfx.caption.ink-cream { color: #f4e4c8; }
+.gfx.caption.ink-bone { color: #e6e0d4; }
+.gfx.caption.ink-black { color: #141414; }
+.gfx.caption.ink-amber { color: #ffc14a; }
+.gfx.caption.ink-cyan { color: #7ef0ff; }
+.gfx.caption.ink-mint { color: #b6f25c; }
+.gfx.caption.ink-rose { color: #ff8ad4; }
+.gfx.caption.ink-violet { color: #c9a6ff; }
+.gfx.caption.edge-dark {
+  text-shadow: 0 2px 0 #000, 0 0 14px rgba(0, 0, 0, 0.85);
+}
+.gfx.caption.edge-light {
+  text-shadow: 0 0 2px #fff, 0 1px 0 #fff, 0 0 12px rgba(255, 255, 255, 0.9);
+}
 .monitor-blank {
   position: absolute;
   inset: 0;

@@ -5,14 +5,14 @@ pub use oc_tools as tools;
 
 pub use oc_time::{Duration, FrameRate, Time};
 pub use oc_timeline::{
-    AlphaShape, AudioFx, CaptionCue, CaptionEffect, CaptionFont, CaptionMood, CaptionPlace,
-    CaptionRecipe, CaptionStyle, Clip, ClipId, ClipKind, ClipLook, Crop, CubeLut, CurvePoint,
-    Curves, DENOISE_NF_DB, DENOISE_NR_DB, Ease, EditPlan, EditSlot, FrameCard, Fx, Generator,
-    Grade, Graphic, GraphicKind, GroupId, LineLook, LinkId, Lut, Marker, MarkerId, MaskShape,
-    MediaId, Mix, PlaceMode, Project, ProjectId, SpeedKey, Timeline, Track, TrackId, TrackKind,
-    Transform, TransitionKind, UndoStack, canonical_color, caption_beats, caption_motion,
-    caption_phrase, caption_reveal, denoise_curve, denoise_sample, dress_cues, ffmpeg_color,
-    marked_place, parse_cube, shot_is_face,
+    AlphaShape, AudioFx, CaptionCue, CaptionEdge, CaptionEffect, CaptionFont, CaptionInk,
+    CaptionMood, CaptionPlace, CaptionPreset, CaptionRecipe, CaptionStyle, Clip, ClipId, ClipKind,
+    ClipLook, Crop, CubeLut, CurvePoint, Curves, DENOISE_NF_DB, DENOISE_NR_DB, Ease, EditPlan,
+    EditSlot, FrameCard, Fx, Generator, Grade, Graphic, GraphicKind, GroupId, LineLook, LinkId,
+    Lut, Marker, MarkerId, MaskShape, MediaId, Mix, PlaceMode, Project, ProjectId, SpeedKey,
+    Timeline, Track, TrackId, TrackKind, Transform, TransitionKind, UndoStack, canonical_color,
+    caption_beats, caption_colors, caption_motion, caption_phrase, caption_reveal, denoise_curve,
+    denoise_sample, dress_cues, ffmpeg_color, marked_place, parse_cube, shot_is_face,
 };
 pub use oc_tools::{
     AppliedOp, AssembleItem, AssembleStyle, CoverShot, CutReview, DesignLayout, Excerpt,

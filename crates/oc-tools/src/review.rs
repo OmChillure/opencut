@@ -31,10 +31,25 @@ pub fn follow_after_tools(
 ) -> String {
     if !timeline_changed {
         if piece && logged.contains("edit_skill") {
+            if logged.contains("# Caption looks") {
+                return format!(
+                    "{logged}\n\
+                     The timeline is unchanged. Set caption_preset to the one id that page names. \
+                     Do not call edit_skill again. Call submit_edit when the piece is ready."
+                );
+            }
+            if logged.contains("# Captions") {
+                return format!(
+                    "{logged}\n\
+                     The timeline is unchanged. Call edit_skill caption-looks once. \
+                     Set caption_preset from that page. Do not call the spine page again."
+                );
+            }
             return format!(
                 "{logged}\n\
                  The timeline is unchanged. Write that page's On the plan lines onto the slots. \
-                 Do not call edit_skill again. Call submit_edit when the piece is ready."
+                 When the words should be on screen, call edit_skill captions once. \
+                 Do not call the spine page again."
             );
         }
         if piece {
@@ -967,7 +982,12 @@ mod tests {
         assert!(text.contains("submit_edit"), "{text}");
         let skill = follow_after_tools("tools\nedit_skill: # Ad\n", "", false, true);
         assert!(skill.contains("On the plan"), "{skill}");
-        assert!(skill.contains("Do not call edit_skill again"), "{skill}");
+        assert!(skill.contains("edit_skill captions"), "{skill}");
+        let decision = follow_after_tools("tools\nedit_skill: # Captions\n", "", false, true);
+        assert!(decision.contains("caption-looks"), "{decision}");
+        let looks = follow_after_tools("tools\nedit_skill: # Caption looks\n", "", false, true);
+        assert!(looks.contains("Do not call edit_skill again"), "{looks}");
+        assert!(looks.contains("caption_preset"), "{looks}");
         let changed = follow_after_tools(
             "tools\nsubmit_edit\n",
             "fix: length\nnote: taste",

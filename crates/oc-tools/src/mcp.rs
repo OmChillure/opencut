@@ -426,13 +426,14 @@ pub fn mcp_tools() -> Vec<McpTool> {
                  A slot grade you set after see replaces it. Shots still ungraded are shown to \
                  the model, which grades each frame. The piece grade covers only a shot the model \
                  could not see. Omit transition for a cut, and set a dissolve, wipe, or slide only \
-                 on the slot that needs it. Set caption_mood or one caption_look for the whole \
-                 video. Rust uses that same face and effect on every line and only moves a line \
-                 to stay off a close mouth. Slots must sit on a real shot or spoken line. \
+                 on the slot that needs it. Set caption_preset to one id from the caption-looks \
+                 page. Leave caption_mood empty. Rust uses that same face, color, and effect on \
+                 every line and only moves a line to stay off a close mouth. Slots must sit on a \
+                 real shot or spoken line. \
                  A clean review queues the export."
                 .into(),
             input_schema: object(&[
-                ("style", str_prop("Optional label for this piece, such as documentary or ad. It does not pick the camera or the caption. Call edit_skill for that, and set caption_mood yourself."), false),
+                ("style", str_prop("Optional label for this piece, such as documentary or ad. It does not pick the camera or the caption. Call edit_skill for that, and set caption_preset from the caption-looks page."), false),
                 ("aspect", str_prop("landscape, vertical, square — omit to keep the project frame"), false),
                 ("letterbox", str_prop("true only when the piece should be widescreen"), false),
                 ("music_id", str_prop("Imported music file, when the piece needs a bed"), false),
@@ -446,9 +447,16 @@ pub fn mcp_tools() -> Vec<McpTool> {
                     false,
                 ),
                 (
+                    "caption_preset",
+                    str_prop(
+                        "One id from the caption-looks page, such as anchor, ink, documentary, or loud. It sets color, edge, font, place, and effect for every line.",
+                    ),
+                    false,
+                ),
+                (
                     "caption_look",
                     str_prop(
-                        "One look for the whole video, such as bottom sans fade or lower display pop. Do not give each kind of line its own look.",
+                        "One look for the whole video, such as bottom sans fade or lower display pop. A caption_preset wins over this.",
                     ),
                     false,
                 ),
@@ -536,12 +544,17 @@ pub fn mcp_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "add_captions".into(),
-            description: "Replace caption cues. Set caption_mood or one caption_look for the whole video. Rust uses that same face and effect on every line and only moves a line to stay off a close mouth. Do not set place, font, or effect on each cue.".into(),
+            description: "Replace caption cues. Set caption_preset from the caption-looks page. Rust uses that same face, color, and effect on every line and only moves a line to stay off a close mouth. Do not set place, font, or effect on each cue.".into(),
             input_schema: object(&[
+                (
+                    "caption_preset",
+                    str_prop("One id from the caption-looks page."),
+                    false,
+                ),
                 (
                     "caption_look",
                     str_prop(
-                        "One look for the whole video, same as submit_edit caption_look.",
+                        "One look for the whole video, same as submit_edit caption_look. A caption_preset wins.",
                     ),
                     false,
                 ),
@@ -825,17 +838,19 @@ pub fn mcp_tools() -> Vec<McpTool> {
         McpTool {
             name: "edit_skill".into(),
             description: "Return one decision page. It does not change the timeline and it does not render. \
-                 Call it once before submit_edit. \
+                 Call it once before submit_edit for the spine. \
                  page is the spine: explainer, product, ad, trailer, documentary, or music. \
                  promise is that one call only when you cannot name a spine. \
-                 shot, rhythm, color, or revise is that one call only when that decision is the whole request. \
+                 shot, rhythm, color, revise, captions, or caption-looks is that one call only when that decision is the whole request. \
                  color only after see or watch showed a frame that needs a correction. \
-                 Do not call a second page. Write the page's On the plan lines onto the slots."
+                 When the words should be on screen, call captions once and then caption-looks once. \
+                 Do not call another page after caption-looks. Write the page's On the plan lines onto the slots. \
+                 Set caption_preset from caption-looks."
                 .into(),
             input_schema: object(&[(
                 "page",
                 str_prop(
-                    "promise, explainer, product, ad, trailer, documentary, music, shot, rhythm, revise, or color",
+                    "promise, explainer, product, ad, trailer, documentary, music, shot, rhythm, revise, color, captions, or caption-looks",
                 ),
                 true,
             )]),
@@ -1152,6 +1167,8 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                     place: oc_timeline::CaptionPlace::default(),
                     font: oc_timeline::CaptionFont::default(),
                     effect: oc_timeline::CaptionEffect::default(),
+                    ink: Default::default(),
+                    edge: Default::default(),
                 });
             }
             let faces = vec![true; cues.len()];
@@ -1552,6 +1569,16 @@ fn mcp_for_id(id: crate::ToolId, label: &'static str, tip: &'static str) -> Opti
 }
 
 fn caption_recipe(arguments: &Value) -> oc_timeline::CaptionRecipe {
+    if let Some(preset) = arguments
+        .get("caption_preset")
+        .and_then(Value::as_str)
+        .and_then(oc_timeline::CaptionPreset::parse)
+    {
+        return oc_timeline::CaptionRecipe {
+            preset: Some(preset),
+            ..oc_timeline::CaptionRecipe::default()
+        };
+    }
     let mood = oc_timeline::CaptionMood::parse(
         arguments
             .get("caption_mood")

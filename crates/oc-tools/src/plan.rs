@@ -37,6 +37,22 @@ pub fn plan_from_value(value: &serde_json::Value) -> Result<EditPlan, String> {
                 );
             }
         }
+        if let Some(raw) = obj.get("caption_preset").and_then(|v| v.as_str()) {
+            if raw.trim().is_empty() {
+                obj.remove("caption_preset");
+            } else {
+                let Some(preset) = oc_timeline::CaptionPreset::parse(raw) else {
+                    return Err(format!(
+                        "caption_preset is one of: {}",
+                        oc_timeline::CaptionPreset::list()
+                    ));
+                };
+                obj.insert(
+                    "caption_preset".into(),
+                    serde_json::Value::String(preset.as_str().into()),
+                );
+            }
+        }
         if let Some(raw) = obj.get("caption_look").cloned() {
             match stored_caption_look(&raw) {
                 Some(parsed) => {
@@ -479,7 +495,9 @@ fn finish_picture(
             )
             .map_err(err)?;
             notes.push(added.note);
-            let label = if plan.caption_look.is_some() {
+            let label = if let Some(preset) = plan.caption_preset {
+                preset.as_str()
+            } else if plan.caption_look.is_some() {
                 "custom"
             } else {
                 caption_mood(plan).as_str()
@@ -505,6 +523,12 @@ fn caption_mood(plan: &EditPlan) -> CaptionMood {
 
 /// The mix for this cut. A composed look wins. A named mood only fills empty roles.
 fn caption_recipe(plan: &EditPlan) -> oc_timeline::CaptionRecipe {
+    if let Some(preset) = plan.caption_preset {
+        return oc_timeline::CaptionRecipe {
+            preset: Some(preset),
+            ..oc_timeline::CaptionRecipe::default()
+        };
+    }
     if let Some(look) = &plan.caption_look {
         let mut recipe = look.clone();
         if recipe.base.is_none() {
@@ -623,6 +647,19 @@ pub fn revise_plan(plan: &EditPlan, changes: &[serde_json::Value]) -> Result<Edi
         }
         if let Some(v) = change.get("caption_mood").and_then(|v| v.as_str()) {
             next.caption_mood = Some(CaptionMood::parse(v));
+        }
+        if let Some(v) = change.get("caption_preset").and_then(|v| v.as_str()) {
+            if v.trim().is_empty() {
+                next.caption_preset = None;
+            } else {
+                next.caption_preset =
+                    Some(oc_timeline::CaptionPreset::parse(v).ok_or_else(|| {
+                        format!(
+                            "caption_preset is one of: {}",
+                            oc_timeline::CaptionPreset::list()
+                        )
+                    })?);
+            }
         }
         if let Some(v) = change.get("caption_look") {
             let recipe = if let Some(raw) = v.as_str() {
@@ -873,6 +910,7 @@ mod tests {
             music_volume: Some(0.4),
             captions: true,
             caption_mood: None,
+            caption_preset: None,
             caption_look: None,
             grade: Grade::default(),
             slots: vec![first, second],
@@ -950,6 +988,7 @@ mod tests {
             music_volume: None,
             captions: false,
             caption_mood: None,
+            caption_preset: None,
             caption_look: None,
             grade: Grade::default(),
             slots: vec![pushed, creep],
@@ -1036,6 +1075,7 @@ mod tests {
             music_volume: None,
             captions: false,
             caption_mood: None,
+            caption_preset: None,
             caption_look: None,
             grade: Grade::default(),
             slots: vec![slot(picture, 2.0)],
@@ -1078,6 +1118,7 @@ mod tests {
             music_volume: None,
             captions: false,
             caption_mood: None,
+            caption_preset: None,
             caption_look: None,
             grade: Grade::default(),
             slots: vec![slot(picture, 2.0)],
@@ -1111,6 +1152,7 @@ mod tests {
             music_volume: None,
             captions: true,
             caption_mood: Some(CaptionMood::Kinetic),
+            caption_preset: None,
             caption_look: None,
             grade: Grade::default(),
             slots: vec![slot(picture, 2.0), slot(picture, 40.0)],
@@ -1174,6 +1216,7 @@ mod tests {
             music_volume: None,
             captions: true,
             caption_mood: None,
+            caption_preset: None,
             caption_look: None,
             grade: Grade::default(),
             slots: vec![slot(picture, 2.0)],
@@ -1243,6 +1286,7 @@ mod tests {
             music_volume: None,
             captions: true,
             caption_mood: Some(CaptionMood::Clean),
+            caption_preset: None,
             caption_look: Some(oc_timeline::CaptionRecipe {
                 punch: Some(oc_timeline::LineLook::parse("top serif fade")),
                 on_face: Some(oc_timeline::CaptionPlace::Lower),
@@ -1298,6 +1342,69 @@ mod tests {
     }
 
     #[test]
+    fn an_ink_preset_paints_black_type_and_a_style_word_does_not() {
+        let media = MediaId::new();
+        let raw = serde_json::json!({
+            "style": "documentary",
+            "captions": true,
+            "caption_preset": "Ink",
+            "caption_mood": "kinetic",
+            "caption_look": "top display pop",
+            "slots": [{
+                "media_id": media.to_string(),
+                "source_in": 0.0,
+                "duration": 2.0
+            }]
+        });
+        let plan = plan_from_value(&raw).unwrap();
+        assert_eq!(plan.caption_preset, Some(oc_timeline::CaptionPreset::Ink));
+        assert_eq!(plan.style, "documentary");
+        let mut timeline = Timeline::default();
+        let lines = vec![SpokenLine {
+            media,
+            start: 0.2,
+            end: 1.6,
+            text: "Go now".into(),
+        }];
+        let mut wide = window(media, 0.0, 10.0, "bright-wide", false);
+        wide.subject = "street".into();
+        let notes = build_plan(&mut timeline, &plan, &[wide], &[], &lines, &[]).unwrap();
+        assert!(notes.iter().any(|note| note == "captions ink"));
+        let cue = first_cue(&timeline);
+        assert_eq!(cue.ink, oc_timeline::CaptionInk::Black);
+        assert_eq!(cue.edge, oc_timeline::CaptionEdge::Light);
+        assert_eq!(cue.font, oc_timeline::CaptionFont::Serif);
+        assert_eq!(cue.place, oc_timeline::CaptionPlace::Bottom);
+        assert_eq!(cue.effect, oc_timeline::CaptionEffect::None);
+
+        let bad = serde_json::json!({
+            "caption_preset": "hormozi",
+            "slots": [{
+                "media_id": media.to_string(),
+                "source_in": 0.0,
+                "duration": 2.0
+            }]
+        });
+        let err = plan_from_value(&bad).unwrap_err();
+        assert!(err.contains("anchor"), "{err}");
+        assert!(err.contains("inkwater"), "{err}");
+
+        let cleared = serde_json::json!({
+            "caption_preset": "  ",
+            "slots": [{
+                "media_id": media.to_string(),
+                "source_in": 0.0,
+                "duration": 2.0
+            }]
+        });
+        assert!(plan_from_value(&cleared).unwrap().caption_preset.is_none());
+
+        let change = serde_json::json!({ "slot": 0, "caption_preset": "" });
+        let next = revise_plan(&plan, &[change]).unwrap();
+        assert!(next.caption_preset.is_none());
+    }
+
+    #[test]
     fn revise_plan_accepts_a_caption_look_string() {
         let picture = MediaId::new();
         let plan = EditPlan {
@@ -1308,6 +1415,7 @@ mod tests {
             music_volume: None,
             captions: true,
             caption_mood: None,
+            caption_preset: None,
             caption_look: None,
             grade: Grade::default(),
             slots: vec![slot(picture, 2.0)],
@@ -1353,6 +1461,7 @@ mod tests {
             music_volume: None,
             captions: true,
             caption_mood: None,
+            caption_preset: None,
             caption_look: oc_timeline::CaptionRecipe::from_loose("hook top display typewriter"),
             grade: Grade::default(),
             slots: vec![slot(picture, 2.0), slot(picture, 40.0)],
@@ -1420,6 +1529,7 @@ mod tests {
             music_volume: None,
             captions: false,
             caption_mood: None,
+            caption_preset: None,
             caption_look: None,
             grade: Grade::default(),
             slots: vec![chopped, nibble, house, ending, silent],
@@ -1504,6 +1614,7 @@ mod tests {
             music_volume: None,
             captions: false,
             caption_mood: None,
+            caption_preset: None,
             caption_look: None,
             grade: shared,
             slots: vec![slot(picture, 1.0), own, slot(picture, 22.0), mono],

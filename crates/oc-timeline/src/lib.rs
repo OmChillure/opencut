@@ -1,4 +1,5 @@
 mod caption;
+mod caption_preset;
 mod edit;
 mod ids;
 mod lut;
@@ -7,9 +8,10 @@ mod project;
 mod undo;
 
 pub use caption::{
-    caption_beats, caption_motion, caption_phrase, caption_reveal, dress_cues, look_for,
-    shot_is_face,
+    caption_beats, caption_colors, caption_motion, caption_phrase, caption_reveal, dress_cues,
+    look_for, shot_is_face,
 };
+pub use caption_preset::{CaptionEdge, CaptionInk, CaptionPaint, CaptionPreset};
 pub use edit::{PlaceMode, marked_place};
 pub use ids::{ClipId, GroupId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
 pub use lut::{CubeLut, canonical_color, cube_text, ffmpeg_color, parse_cube};
