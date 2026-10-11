@@ -434,6 +434,24 @@ async fn spool_media(project_id: &str, media_id: &str, bytes: Vec<u8>) -> Result
     Err(api_error_message(res).await)
 }
 
+/// Ask for one JPEG of a clip this browser cannot decode. `source_url` is the
+/// blob already held here. The body is that blob, not a second copy in Rust.
+pub async fn request_poster(
+    project_id: &str,
+    media_id: &str,
+    source_url: &str,
+) -> Result<Vec<u8>, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        request_poster_blob(project_id, media_id, source_url).await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (project_id, media_id, source_url);
+        Err("a still is made in the browser".into())
+    }
+}
+
 async fn api_error_message(res: reqwest::Response) -> String {
     #[derive(Deserialize)]
     struct ApiErr {
@@ -667,6 +685,77 @@ async fn wasm_read_ndjson(
         on_line(&tail)?;
     }
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn request_poster_blob(
+    project_id: &str,
+    media_id: &str,
+    source_url: &str,
+) -> Result<Vec<u8>, String> {
+    use wasm_bindgen::JsCast;
+    if !source_url.starts_with("blob:") {
+        return Err("the clip is not in this browser".into());
+    }
+    let window = web_sys::window().ok_or_else(|| "no browser window".to_string())?;
+    let source = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(source_url))
+        .await
+        .map_err(js_err)?;
+    let source: web_sys::Response = source
+        .dyn_into()
+        .map_err(|_| "could not read the clip".to_string())?;
+    if !source.ok() {
+        return Err("could not read the clip".into());
+    }
+    let blob = wasm_bindgen_futures::JsFuture::from(source.blob().map_err(js_err)?)
+        .await
+        .map_err(js_err)?;
+    let token = signed_token().unwrap_or_default();
+    let url = format!(
+        "{API}/v1/projects/{project_id}/media/{media_id}/poster?token={}",
+        user_query(&token)
+    );
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_body(&blob);
+    let request = web_sys::Request::new_with_str_and_init(&url, &init).map_err(js_err)?;
+    let _ = request
+        .headers()
+        .set("content-type", "application/octet-stream");
+    if !token.is_empty() {
+        let _ = request.headers().set("x-opencut-token", &token);
+    }
+    let resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(js_err)?;
+    let resp: web_sys::Response = resp
+        .dyn_into()
+        .map_err(|_| "the still request failed".to_string())?;
+    if !resp.ok() {
+        let text = match resp.text() {
+            Ok(promise) => wasm_bindgen_futures::JsFuture::from(promise)
+                .await
+                .ok()
+                .and_then(|value| value.as_string())
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        return Err(if text.trim().is_empty() {
+            format!("HTTP {}", resp.status())
+        } else {
+            text
+        });
+    }
+    let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(js_err)?)
+        .await
+        .map_err(js_err)?;
+    let array = js_sys::Uint8Array::new(&buf);
+    let mut bytes = vec![0u8; array.length() as usize];
+    array.copy_to(&mut bytes);
+    if bytes.len() < 32 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return Err("poster was not a jpeg".into());
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -11,6 +11,7 @@ pub use label::{
 pub use shots::{ShotBrief, ShotRole, brief_shots, format_shot_list};
 pub use vision::{
     ShotCard, ShotLook, VisualDigest, analyze_local, analyze_path, grab_jpeg, picture_ranges,
+    poster_jpeg,
 };
 
 use oc_time::{Duration, FrameRate};

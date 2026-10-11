@@ -1145,8 +1145,25 @@ button:disabled { opacity: 0.45; cursor: default; }
 .nle-strip {
   display: flex;
   height: 100%;
+  width: 100%;
   overflow: hidden;
   pointer-events: none;
+  background: #111;
+}
+.nle-frame {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  background: #111;
+  display: block;
+  pointer-events: none;
+}
+.nle-frame.wait {
+  flex: 1 1 auto;
+  width: 100%;
 }
 .nle-cell {
   width: 48px;

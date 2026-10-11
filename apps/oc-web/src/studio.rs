@@ -7,13 +7,62 @@ use crate::tools;
 use dioxus::prelude::*;
 use oc_core::{AlphaShape, CurvePoint, Curves, Generator, MaskShape, Mix, SpeedKey, TrackKind};
 use oc_tools::ToolId;
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
-use web_sys::HtmlCanvasElement;
+use wasm_bindgen::closure::Closure;
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlVideoElement};
 
 thread_local! {
     static WAVES: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
+    static FILM: RefCell<FilmCache> = RefCell::new(FilmCache::default());
+}
+
+struct FilmCache {
+    frames: HashMap<String, Vec<(f64, String)>>,
+    tried: HashMap<String, Vec<f64>>,
+    failed: HashSet<String>,
+    /// One JPEG repeated across the clip. The browser could not decode the file.
+    stills: HashSet<String>,
+    /// Blob URL to the media id, so a still can be cached per clip.
+    media: HashMap<String, String>,
+    wishes: Vec<(String, f64)>,
+    decoding: bool,
+    listeners: HashMap<u64, Rc<RefCell<dyn FnMut()>>>,
+    next_listener: u64,
+}
+
+impl Default for FilmCache {
+    fn default() -> Self {
+        Self {
+            frames: HashMap::new(),
+            tried: HashMap::new(),
+            failed: HashSet::new(),
+            stills: HashSet::new(),
+            media: HashMap::new(),
+            wishes: Vec::new(),
+            decoding: false,
+            listeners: HashMap::new(),
+            next_listener: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Picture {
+    /// At least one frame was drawn from the video element.
+    Ready,
+    /// Metadata arrived and the element has no picture. Use a still.
+    Still,
+    /// No picture and no reason to upload the file.
+    Missing,
+}
+
+/// Chrome on this machine reports HEVC as `videoWidth == 0` even when duration is known.
+#[must_use]
+pub fn browser_needs_still(video_width: u32) -> bool {
+    video_width == 0
 }
 
 #[component]
@@ -807,83 +856,591 @@ pub fn MulticamBank() -> Element {
     }
 }
 
+/// Still frames for one timeline clip. The pictures are cached JPEGs, so a
+/// later render does not wipe them the way a canvas draw did. A file the
+/// browser cannot decode uses one still instead.
 #[component]
-pub fn Filmstrip(url: String, tiles: i32, ends_only: bool) -> Element {
-    let n = if ends_only { 2 } else { tiles.max(1) };
-    let host = use_signal(|| format!("film-{}", uuid::Uuid::now_v7().simple()));
-    let host_id = host.read().clone();
-    let src = url.clone();
-    use_effect(move || {
-        let src = src.clone();
-        let host_id = host_id.clone();
-        if src.is_empty() {
-            return;
-        }
-        spawn(async move {
-            paint_film(&src, n, &host_id).await;
-        });
-    });
+pub fn Filmstrip(
+    url: String,
+    media_id: String,
+    tiles: i32,
+    source_in: f64,
+    source_out: f64,
+) -> Element {
+    let rev = use_signal(|| 0u32);
+    dioxus_core::use_hook_with_cleanup(
+        move || {
+            let mut rev = rev;
+            FILM.with(|film| {
+                let mut film = film.borrow_mut();
+                let token = film.next_listener;
+                film.next_listener = token.wrapping_add(1);
+                film.listeners.insert(
+                    token,
+                    Rc::new(RefCell::new(move || {
+                        let next = rev.peek().wrapping_add(1);
+                        rev.set(next);
+                    })),
+                );
+                token
+            })
+        },
+        |token| {
+            FILM.with(|film| {
+                film.borrow_mut().listeners.remove(&token);
+            });
+        },
+    );
+    let _paint = *rev.read();
+    let still_src = if film_is_still(&url) {
+        film_picks_owned(&url, source_in, source_out, tiles)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let frames = if still_src.is_empty() {
+        film_picks_owned(&url, source_in, source_out, tiles)
+    } else {
+        Vec::new()
+    };
+    use_effect(use_reactive(
+        (&url, &media_id, &source_in, &source_out, &tiles),
+        |(url, media_id, source_in, source_out, tiles)| {
+            if url.is_empty() {
+                return;
+            }
+            film_request(
+                &url,
+                &media_id,
+                &film_sample_times(source_in, source_out, tiles),
+            );
+        },
+    ));
     rsx! {
-        div { class: "nle-strip", id: "{host}",
-            for _ in 0..n {
-                canvas { class: "nle-cell", width: "48", height: "36" }
+        div { class: "nle-strip",
+            if !still_src.is_empty() {
+                img {
+                    class: "nle-frame wait",
+                    src: "{still_src}",
+                    alt: "",
+                    draggable: "false",
+                }
+            } else if frames.is_empty() {
+                div { class: "nle-frame wait" }
+            } else {
+                for (i, src) in frames.into_iter().enumerate() {
+                    img {
+                        key: "{i}",
+                        class: "nle-frame",
+                        src: "{src}",
+                        alt: "",
+                        draggable: "false",
+                    }
+                }
             }
         }
     }
 }
 
-async fn paint_film(url: &str, tiles: i32, host: &str) {
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
-        return;
+/// Where to grab stills inside one clip. At most six, so a long clip does not
+/// decode a frame per column.
+pub fn film_sample_times(start: f64, end: f64, tiles: i32) -> Vec<f64> {
+    let start = if start.is_finite() {
+        start.max(0.0)
+    } else {
+        0.0
     };
-    let Ok(Some(root)) = doc.query_selector(&format!("#{host}")) else {
-        return;
+    let end = if end.is_finite() {
+        end.max(start + 0.05)
+    } else {
+        start + 0.05
     };
-    let Ok(list) = root.query_selector_all("canvas") else {
-        return;
+    let n = tiles.clamp(1, 6) as usize;
+    let span = end - start;
+    (0..n)
+        .map(|i| {
+            let at = if n == 1 {
+                start + span * 0.2
+            } else {
+                start + span * (i as f64 + 0.5) / n as f64
+            };
+            at.clamp(start, (end - 0.04).max(start))
+        })
+        .collect()
+}
+
+/// One JPEG per column. A single decoded frame fills every column until the
+/// rest of the strip is ready.
+pub fn film_picks(frames: &[(f64, &str)], start: f64, end: f64, tiles: i32) -> Vec<String> {
+    if frames.is_empty() {
+        return Vec::new();
+    }
+    film_sample_times(start, end, tiles)
+        .into_iter()
+        .filter_map(|at| nearest_frame(frames, at).map(str::to_string))
+        .collect()
+}
+
+fn nearest_frame<'a>(frames: &'a [(f64, &'a str)], at: f64) -> Option<&'a str> {
+    frames
+        .iter()
+        .min_by(|a, b| {
+            (a.0 - at)
+                .abs()
+                .partial_cmp(&(b.0 - at).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|frame| frame.1)
+}
+
+fn film_picks_owned(url: &str, start: f64, end: f64, tiles: i32) -> Vec<String> {
+    if url.is_empty() {
+        return Vec::new();
+    }
+    let frames = FILM.with(|film| film.borrow().frames.get(url).cloned());
+    let Some(frames) = frames else {
+        return Vec::new();
     };
-    let Ok(video) = doc.create_element("video") else {
+    let borrowed = frames
+        .iter()
+        .map(|(at, src)| (*at, src.as_str()))
+        .collect::<Vec<_>>();
+    film_picks(&borrowed, start, end, tiles)
+}
+
+fn film_request(url: &str, media_id: &str, times: &[f64]) {
+    if url.is_empty() || times.is_empty() {
         return;
-    };
-    let Ok(video) = video.dyn_into::<web_sys::HtmlVideoElement>() else {
+    }
+    if !media_id.is_empty() {
+        FILM.with(|film| {
+            film.borrow_mut()
+                .media
+                .insert(url.to_string(), media_id.to_string());
+        });
+    }
+    let missing = FILM.with(|film| {
+        let film = film.borrow();
+        if film.failed.contains(url) || film.stills.contains(url) {
+            return Vec::new();
+        }
+        let have = film.frames.get(url).map(Vec::as_slice).unwrap_or(&[]);
+        let tried = film.tried.get(url).map(Vec::as_slice).unwrap_or(&[]);
+        times
+            .iter()
+            .copied()
+            .filter(|at| {
+                !have.iter().any(|(got, _)| (got - at).abs() < 0.35)
+                    && !tried.iter().any(|got| (got - at).abs() < 0.35)
+            })
+            .collect::<Vec<_>>()
+    });
+    if missing.is_empty() {
         return;
+    }
+    let start = FILM.with(|film| {
+        let mut film = film.borrow_mut();
+        let unseen = !film
+            .frames
+            .get(url)
+            .is_some_and(|frames| !frames.is_empty());
+        if unseen {
+            if let Some(first) = missing.first().copied() {
+                film.wishes.insert(0, (url.to_string(), first));
+            }
+            for at in missing.into_iter().skip(1) {
+                film.wishes.push((url.to_string(), at));
+            }
+        } else {
+            for at in missing {
+                film.wishes.push((url.to_string(), at));
+            }
+        }
+        if film.decoding {
+            false
+        } else {
+            film.decoding = true;
+            true
+        }
+    });
+    if start {
+        spawn(async move {
+            film_pump().await;
+        });
+    }
+}
+
+async fn film_pump() {
+    loop {
+        let loaded = film_loaded_url();
+        let next = FILM.with(|film| take_next_wish(&mut film.borrow_mut(), loaded.as_deref()));
+        let Some((url, at)) = next else {
+            break;
+        };
+        if film_has_picture(&url) {
+            continue;
+        }
+        if remember_poster(&url).await {
+            continue;
+        }
+        match decode_url(&url, &[at]).await {
+            Picture::Ready => {}
+            Picture::Still => {
+                if !fetch_poster(&url).await && !film_has_picture(&url) {
+                    mark_undecoded(&url);
+                }
+            }
+            Picture::Missing => {
+                if !film_has_picture(&url) {
+                    mark_undecoded(&url);
+                }
+            }
+        }
+    }
+    FILM.with(|film| film.borrow_mut().decoding = false);
+}
+
+fn film_has_picture(url: &str) -> bool {
+    FILM.with(|film| {
+        let film = film.borrow();
+        film.stills.contains(url)
+            || film
+                .frames
+                .get(url)
+                .is_some_and(|frames| !frames.is_empty())
+    })
+}
+
+fn film_is_still(url: &str) -> bool {
+    FILM.with(|film| film.borrow().stills.contains(url))
+}
+
+fn mark_undecoded(url: &str) {
+    FILM.with(|film| {
+        let mut film = film.borrow_mut();
+        film.failed.insert(url.to_string());
+        film.wishes.retain(|(wish, _)| wish != url);
+    });
+    notify_film();
+}
+
+fn clip_ids(url: &str) -> Option<(String, String)> {
+    let media = FILM.with(|film| film.borrow().media.get(url).cloned())?;
+    if media.is_empty() {
+        return None;
+    }
+    let project = super::page_project_id()?;
+    if project.is_empty() {
+        return None;
+    }
+    Some((project, media))
+}
+
+fn store_still(url: &str, jpeg: &[u8]) -> bool {
+    let Some(src) = crate::media::blob_url(jpeg, "image/jpeg") else {
+        return false;
     };
-    video.set_src(url);
+    FILM.with(|film| {
+        let mut film = film.borrow_mut();
+        film.frames.insert(url.to_string(), vec![(0.0, src)]);
+        film.stills.insert(url.to_string());
+        film.failed.remove(url);
+        film.wishes.retain(|(wish, _)| wish != url);
+    });
+    notify_film();
+    true
+}
+
+async fn remember_poster(url: &str) -> bool {
+    let Some((project, media)) = clip_ids(url) else {
+        return false;
+    };
+    let Ok(Some(bytes)) = crate::hold::load_poster(&project, &media).await else {
+        return false;
+    };
+    store_still(url, &bytes)
+}
+
+async fn fetch_poster(url: &str) -> bool {
+    if !url.starts_with("blob:") {
+        return false;
+    }
+    let Some((project, media)) = clip_ids(url) else {
+        return false;
+    };
+    let Ok(bytes) = crate::api::request_poster(&project, &media, url).await else {
+        return false;
+    };
+    let _ = crate::hold::save_poster(&project, &media, &bytes).await;
+    store_still(url, &bytes)
+}
+
+/// One still at a time. A file with no picture yet goes before a second frame
+/// of a file that already has one, and one loaded file is not dropped to seek
+/// a different file.
+fn take_next_wish(film: &mut FilmCache, loaded: Option<&str>) -> Option<(String, f64)> {
+    if film.wishes.is_empty() {
+        return None;
+    }
+    let idx = film
+        .wishes
+        .iter()
+        .position(|(url, _)| Some(url.as_str()) == loaded)
+        .or_else(|| {
+            film.wishes.iter().position(|(url, _)| {
+                !film
+                    .frames
+                    .get(url)
+                    .is_some_and(|frames| !frames.is_empty())
+                    && !film.failed.contains(url)
+            })
+        })
+        .unwrap_or(0);
+    let (url, at) = film.wishes.remove(idx);
+    film.wishes
+        .retain(|(wish, other)| wish != &url || (other - at).abs() >= 0.05);
+    Some((url, at))
+}
+
+fn film_loaded_url() -> Option<String> {
+    let video = film_video()?;
+    let url = video.get_attribute("data-film-src")?;
+    if url.is_empty() || video.ready_state() < 1 {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+fn notify_film() {
+    let listeners = FILM.with(|film| {
+        film.borrow()
+            .listeners
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    for listener in listeners {
+        if let Ok(mut callback) = listener.try_borrow_mut() {
+            callback();
+        }
+    }
+}
+
+fn film_video() -> Option<HtmlVideoElement> {
+    let doc = web_sys::window()?.document()?;
+    if let Some(found) = doc.get_element_by_id("oc-film-decoder") {
+        return found.dyn_into().ok();
+    }
+    let video: HtmlVideoElement = doc.create_element("video").ok()?.dyn_into().ok()?;
+    video.set_id("oc-film-decoder");
     video.set_muted(true);
-    let mut dur = 0.0;
-    for _ in 0..30 {
-        gloo_timers::future::TimeoutFuture::new(100).await;
-        dur = video.duration();
-        if dur.is_finite() && dur > 0.0 {
+    let _ = video.set_attribute("muted", "true");
+    let _ = video.set_attribute("playsinline", "true");
+    video.set_preload("auto");
+    let _ = video.set_attribute(
+        "style",
+        "position:fixed;width:160px;height:90px;left:0;top:0;opacity:0;pointer-events:none;z-index:-1",
+    );
+    doc.body()?.append_child(&video).ok()?;
+    Some(video)
+}
+
+async fn decode_url(url: &str, times: &[f64]) -> Picture {
+    let Some(video) = film_video() else {
+        return Picture::Missing;
+    };
+    if video.get_attribute("data-film-src").as_deref() != Some(url) {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let _ = video.set_cross_origin(Some("anonymous"));
+        } else {
+            let _ = video.set_cross_origin(None);
+        }
+        let _ = video.set_attribute("data-film-src", url);
+        video.set_src(url);
+        video.load();
+        if !wait_ready(&video).await {
+            return if element_has_no_picture(&video) {
+                Picture::Still
+            } else {
+                Picture::Missing
+            };
+        }
+    } else if video.ready_state() < 1 && !wait_ready(&video).await {
+        return if element_has_no_picture(&video) {
+            Picture::Still
+        } else {
+            Picture::Missing
+        };
+    }
+    if browser_needs_still(video.video_width()) {
+        return Picture::Still;
+    }
+    let dur = video.duration();
+    let mut stored = false;
+    for at in times {
+        let mut at = *at;
+        if dur.is_finite() && dur > 0.05 {
+            at = at.clamp(0.0, dur - 0.05);
+        }
+        FILM.with(|film| {
+            film.borrow_mut()
+                .tried
+                .entry(url.to_string())
+                .or_default()
+                .push(at);
+        });
+        if !seek_to(&video, at).await {
+            continue;
+        }
+        if let Some(jpeg) = grab_jpeg(&video).await {
+            FILM.with(|film| {
+                let mut film = film.borrow_mut();
+                let frames = film.frames.entry(url.to_string()).or_default();
+                if !frames.iter().any(|(got, _)| (got - at).abs() < 0.2) {
+                    frames.push((at, jpeg));
+                    frames
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                }
+            });
+            stored = true;
+            notify_film();
+        }
+    }
+    if stored
+        || FILM.with(|film| {
+            film.borrow()
+                .frames
+                .get(url)
+                .is_some_and(|frames| !frames.is_empty())
+        })
+    {
+        Picture::Ready
+    } else {
+        Picture::Missing
+    }
+}
+
+fn element_has_no_picture(video: &HtmlVideoElement) -> bool {
+    // Duration with no dimensions is a file the element parsed and cannot decode.
+    browser_needs_still(video.video_width())
+        && video.duration().is_finite()
+        && video.duration() > 0.0
+}
+
+async fn wait_ready(video: &HtmlVideoElement) -> bool {
+    if video.ready_state() >= 1 && video.duration().is_finite() && video.duration() > 0.0 {
+        return true;
+    }
+    let hit = Rc::new(Cell::new(false));
+    let flag = hit.clone();
+    let closure = Closure::wrap(Box::new(move || flag.set(true)) as Box<dyn FnMut()>);
+    let _ = video.add_event_listener_with_callback("loadeddata", closure.as_ref().unchecked_ref());
+    for _ in 0..160 {
+        if hit.get()
+            || (video.ready_state() >= 1 && video.duration().is_finite() && video.duration() > 0.0)
+        {
             break;
         }
+        gloo_timers::future::TimeoutFuture::new(50).await;
     }
-    if !dur.is_finite() || dur <= 0.0 {
-        return;
+    let _ =
+        video.remove_event_listener_with_callback("loadeddata", closure.as_ref().unchecked_ref());
+    video.ready_state() >= 1 && video.duration().is_finite() && video.duration() > 0.0
+}
+
+async fn seek_to(video: &HtmlVideoElement, at: f64) -> bool {
+    if video.ready_state() >= 2 && (video.current_time() - at).abs() < 0.08 {
+        return true;
     }
-    let tiles = tiles.max(1) as u32;
-    for i in 0..tiles.min(list.length()) {
-        let Some(node) = list.item(i) else { continue };
-        let Ok(canvas) = node.dyn_into::<HtmlCanvasElement>() else {
-            continue;
-        };
-        let at = if tiles == 1 {
-            0.0
-        } else {
-            dur * f64::from(i) / f64::from(tiles - 1)
-        };
-        let _ = video.set_current_time(at.min(dur - 0.05).max(0.0));
-        gloo_timers::future::TimeoutFuture::new(40).await;
-        if let Some(ctx) = canvas
-            .get_context("2d")
-            .ok()
-            .flatten()
-            .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
-        {
-            let _ =
-                ctx.draw_image_with_html_video_element_and_dw_and_dh(&video, 0.0, 0.0, 48.0, 36.0);
+    let hit = Rc::new(Cell::new(false));
+    let flag = hit.clone();
+    let closure = Closure::wrap(Box::new(move || flag.set(true)) as Box<dyn FnMut()>);
+    let _ = video.add_event_listener_with_callback("seeked", closure.as_ref().unchecked_ref());
+    video.set_current_time(at);
+    for _ in 0..50 {
+        if hit.get() && video.ready_state() >= 2 {
+            break;
         }
+        gloo_timers::future::TimeoutFuture::new(50).await;
     }
+    let _ = video.remove_event_listener_with_callback("seeked", closure.as_ref().unchecked_ref());
+    gloo_timers::future::TimeoutFuture::new(80).await;
+    video.ready_state() >= 2
+}
+
+async fn grab_jpeg(video: &HtmlVideoElement) -> Option<String> {
+    let (w, h) = thumb_px(video);
+    let doc = web_sys::window()?.document()?;
+    let canvas: HtmlCanvasElement = doc.create_element("canvas").ok()?.dyn_into().ok()?;
+    canvas.set_width(w);
+    canvas.set_height(h);
+    let ctx = canvas
+        .get_context("2d")
+        .ok()
+        .flatten()?
+        .dyn_into::<CanvasRenderingContext2d>()
+        .ok()?;
+    ctx.draw_image_with_html_video_element_and_dw_and_dh(
+        video,
+        0.0,
+        0.0,
+        f64::from(w),
+        f64::from(h),
+    )
+    .ok()?;
+    if frame_luma(&ctx, w, h).is_some_and(|luma| luma < 12) {
+        gloo_timers::future::TimeoutFuture::new(220).await;
+        ctx.draw_image_with_html_video_element_and_dw_and_dh(
+            video,
+            0.0,
+            0.0,
+            f64::from(w),
+            f64::from(h),
+        )
+        .ok()?;
+    }
+    canvas.to_data_url_with_type("image/jpeg").ok()
+}
+
+fn thumb_px(video: &HtmlVideoElement) -> (u32, u32) {
+    let w = video.video_width().max(1);
+    let h = video.video_height().max(1);
+    if h > w {
+        let height = 160u32;
+        let width = ((160.0 * f64::from(w) / f64::from(h)).round() as u32).clamp(48, 160);
+        (width, height)
+    } else {
+        let width = 160u32;
+        let height = ((160.0 * f64::from(h) / f64::from(w)).round() as u32).clamp(48, 160);
+        (width, height)
+    }
+}
+
+fn frame_luma(ctx: &CanvasRenderingContext2d, w: u32, h: u32) -> Option<u32> {
+    let data = ctx
+        .get_image_data(
+            f64::from(w / 2).max(0.0),
+            f64::from(h / 2).max(0.0),
+            8.0,
+            8.0,
+        )
+        .ok()?;
+    let px = data.data();
+    if px.len() < 4 {
+        return None;
+    }
+    let mut sum = 0u32;
+    let mut n = 0u32;
+    let mut i = 0;
+    while i + 2 < px.len() {
+        sum += u32::from(px[i]) + u32::from(px[i + 1]) + u32::from(px[i + 2]);
+        n += 1;
+        i += 4;
+    }
+    Some(sum / n.max(1))
 }
 
 #[component]
@@ -1013,5 +1570,40 @@ mod tests {
         assert_eq!(shape_name(MaskShape::Ellipse), "Ellipse");
         assert_eq!(shape_name(MaskShape::Triangle), "Triangle");
         assert_eq!(shape_name(MaskShape::Diamond), "Diamond");
+    }
+
+    #[test]
+    fn a_clip_samples_a_few_frames_across_its_source() {
+        let one = super::film_sample_times(0.0, 10.0, 1);
+        assert_eq!(one.len(), 1);
+        assert!((one[0] - 2.0).abs() < 1e-6, "{one:?}");
+        let many = super::film_sample_times(1.0, 7.0, 40);
+        assert_eq!(many.len(), 6);
+        assert!(many[0] >= 1.0 && many[5] < 7.0, "{many:?}");
+        assert!(many.windows(2).all(|pair| pair[1] > pair[0]));
+        let flipped = super::film_sample_times(5.0, 1.0, 2);
+        assert!(flipped.iter().all(|at| *at >= 5.0), "{flipped:?}");
+    }
+
+    #[test]
+    fn a_clip_the_browser_cannot_decode_uses_one_still() {
+        assert!(super::browser_needs_still(0));
+        assert!(!super::browser_needs_still(1920));
+        let frames = [(0.4, "still")];
+        let picks = super::film_picks(&frames, 0.0, 12.0, 5);
+        assert_eq!(picks.len(), 5);
+        assert!(picks.iter().all(|src| src == "still"));
+    }
+
+    #[test]
+    fn one_decoded_frame_fills_the_strip_until_the_rest_arrive() {
+        let frames = [(1.5, "early"), (8.0, "late")];
+        let picks = super::film_picks(&frames, 0.0, 10.0, 2);
+        assert_eq!(picks, vec!["early".to_string(), "late".to_string()]);
+        let only = [(1.5, "early")];
+        let filled = super::film_picks(&only, 0.0, 10.0, 4);
+        assert_eq!(filled.len(), 4);
+        assert!(filled.iter().all(|src| src == "early"));
+        assert!(super::film_picks(&[], 0.0, 10.0, 3).is_empty());
     }
 }

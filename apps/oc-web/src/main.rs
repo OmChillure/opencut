@@ -2132,7 +2132,20 @@ fn Timeline() -> Element {
                                                                 img { src: "{url}", alt: "" }
                                                             }
                                                         } else if is_video {
-                                                            studio::Filmstrip { url: url.clone(), tiles, ends_only: *pps.read() < 24.0 }
+                                                            studio::Filmstrip {
+                                                                key: "{clip_id}",
+                                                                url: url.clone(),
+                                                                media_id: clip.media_id.clone(),
+                                                                tiles,
+                                                                source_in: clip.source_in,
+                                                                source_out: clip.source_in
+                                                                    + clip.duration
+                                                                        * if clip.speed.is_finite() && clip.speed > 0.0 {
+                                                                            clip.speed
+                                                                        } else {
+                                                                            1.0
+                                                                        },
+                                                            }
                                                         } else {
                                                             div { class: "nle-strip" }
                                                         }

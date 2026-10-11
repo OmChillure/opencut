@@ -403,6 +403,110 @@ pub async fn grab_jpeg(input: &Path, at: f64, dest: &Path) -> Result<(), crate::
     Ok(())
 }
 
+const POSTER_SDR: &str = "scale=320:-2,format=yuv420p";
+/// Phone clips are PQ HDR. A plain scale of those frames is a flat gray picture.
+const POSTER_HDR: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=320:-2";
+
+/// HDR transfers that look gray if they are scaled straight into a JPEG.
+fn poster_filter(color_transfer: &str) -> &'static str {
+    match color_transfer.trim() {
+        "smpte2084" | "arib-std-b67" => POSTER_HDR,
+        _ => POSTER_SDR,
+    }
+}
+
+fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.len() >= 32 && bytes[0] == 0xFF && bytes[1] == 0xD8
+}
+
+/// One timeline still. The source file stays. A `poster.jpg` written beside it is removed.
+///
+/// HDR is tonemapped. A short file that has no frame at 0.8s is tried again at the start.
+pub async fn poster_jpeg(input: &Path) -> Result<Vec<u8>, crate::MediaError> {
+    let filter = poster_filter(&color_transfer(input).await);
+    let mut error = None;
+    for at in [0.8_f64, 0.0] {
+        match grab_poster_at(input, at, filter).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => error = Some(err),
+        }
+    }
+    if filter != POSTER_SDR {
+        if let Ok(bytes) = grab_poster_at(input, 0.0, POSTER_SDR).await {
+            return Ok(bytes);
+        }
+    }
+    Err(error.unwrap_or_else(|| crate::MediaError::Ffmpeg("no jpeg".into())))
+}
+
+async fn color_transfer(input: &Path) -> String {
+    let Ok(out) = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=color_transfer",
+            "-of",
+            "default=nw=1:nk=1",
+            &path_str(input),
+        ])
+        .output()
+        .await
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+async fn grab_poster_at(input: &Path, at: f64, filter: &str) -> Result<Vec<u8>, crate::MediaError> {
+    let dest = input.with_file_name("poster.jpg");
+    let _ = tokio::fs::remove_file(&dest).await;
+    let out = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-ss",
+            &format!("{at:.3}"),
+            "-i",
+            &path_str(input),
+            "-an",
+            "-frames:v",
+            "1",
+            "-vf",
+            filter,
+            "-q:v",
+            "4",
+            &path_str(&dest),
+        ])
+        .output()
+        .await
+        .map_err(|err| crate::MediaError::Ffmpeg(err.to_string()))?;
+    let bytes = tokio::fs::read(&dest).await.ok();
+    let _ = tokio::fs::remove_file(&dest).await;
+    if !out.status.success() {
+        return Err(crate::MediaError::Ffmpeg(ffmpeg_tail(&out.stderr)));
+    }
+    match bytes {
+        Some(bytes) if is_jpeg(&bytes) => Ok(bytes),
+        _ => Err(crate::MediaError::Ffmpeg("no jpeg".into())),
+    }
+}
+
+fn ffmpeg_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("no jpeg")
+        .chars()
+        .take(180)
+        .collect()
+}
+
 async fn grab_rgb(input: &Path, at: f64, dest: &Path) -> Result<(), crate::MediaError> {
     let out = Command::new("ffmpeg")
         .args([
@@ -601,6 +705,118 @@ mod tests {
         assert_eq!(d.look, "wide");
         assert!(d.vision.is_none());
         assert!(!d.needs_cards());
+    }
+
+    #[test]
+    fn an_hdr_phone_clip_is_tonemapped_and_sdr_is_only_scaled() {
+        assert_eq!(poster_filter("smpte2084"), POSTER_HDR);
+        assert_eq!(poster_filter(" arib-std-b67 "), POSTER_HDR);
+        assert_eq!(poster_filter("bt709"), POSTER_SDR);
+        assert_eq!(poster_filter(""), POSTER_SDR);
+        let mut jpeg = vec![0u8; 32];
+        jpeg[0] = 0xFF;
+        jpeg[1] = 0xD8;
+        assert!(is_jpeg(&jpeg));
+        assert!(!is_jpeg(&[0xFF, 0xD8]));
+        assert!(!is_jpeg(&[0x00, 0x00, 0x00, 0x00]));
+    }
+
+    #[tokio::test]
+    async fn poster_jpeg_is_a_picture_and_does_not_keep_the_jpeg() {
+        if !ffmpeg_ready() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oc-poster-src-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let file = dir.join("sample.mp4");
+        let made = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=15:duration=1.2",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                &path_str(&file),
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let jpeg = poster_jpeg(&file).await.expect("poster");
+        assert!(is_jpeg(&jpeg), "len {}", jpeg.len());
+        assert!(jpeg.len() > 400, "len {}", jpeg.len());
+        assert!(!dir.join("poster.jpg").exists());
+        assert!(file.exists());
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn poster_of_a_phone_clip_keeps_the_color() {
+        let Ok(path) = std::env::var("OPENCUT_POSTER_SAMPLE") else {
+            return;
+        };
+        if !ffmpeg_ready() || !Path::new(&path).is_file() {
+            return;
+        }
+        let jpeg = poster_jpeg(Path::new(&path)).await.expect("phone poster");
+        assert!(is_jpeg(&jpeg));
+        let sat = mean_saturation(&jpeg).await.expect("saturation");
+        assert!(
+            sat > 18.0,
+            "the still is washed out (saturation {sat:.1}); HDR needs the tonemap"
+        );
+    }
+
+    fn ffmpeg_ready() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    async fn mean_saturation(jpeg: &[u8]) -> Result<f32, String> {
+        let path = std::env::temp_dir().join(format!("oc-poster-sat-{}.jpg", std::process::id()));
+        tokio::fs::write(&path, jpeg)
+            .await
+            .map_err(|err| err.to_string())?;
+        let out = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-i",
+                &path_str(&path),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
+            ])
+            .output()
+            .await
+            .map_err(|err| err.to_string())?;
+        let _ = tokio::fs::remove_file(&path).await;
+        if !out.status.success() || out.stdout.len() < 3 {
+            return Err("no rgb".into());
+        }
+        let mut sum = 0u64;
+        let mut n = 0u64;
+        for px in out.stdout.chunks_exact(3) {
+            let max = u64::from(px[0].max(px[1]).max(px[2]));
+            let min = u64::from(px[0].min(px[1]).min(px[2]));
+            sum += max - min;
+            n += 1;
+        }
+        Ok(sum as f32 / n.max(1) as f32)
     }
 
     #[test]

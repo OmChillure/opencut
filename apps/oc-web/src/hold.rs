@@ -23,6 +23,23 @@ pub fn hold_key(project_id: &str, media_id: &str) -> String {
     format!("{project_id}/{media_id}")
 }
 
+/// A still for one clip. Same store, different key, so a reload does not upload again.
+#[must_use]
+pub fn poster_id(media_id: &str) -> String {
+    format!("{media_id}:poster")
+}
+
+#[must_use]
+pub fn is_poster_id(id: &str) -> bool {
+    id.ends_with(":poster")
+}
+
+/// Library restore must not treat a cached still as another video.
+#[must_use]
+fn is_library_file(id: &str) -> bool {
+    !id.is_empty() && !is_poster_id(id)
+}
+
 #[must_use]
 pub fn project_of_key(key: &str) -> Option<&str> {
     let (project, media) = key.split_once('/')?;
@@ -58,6 +75,42 @@ pub async fn save_file(
         .map_err(js_err)?;
     await_request(req).await?;
     Ok(())
+}
+
+pub async fn save_poster(project_id: &str, media_id: &str, bytes: &[u8]) -> Result<(), String> {
+    if media_id.is_empty() || is_poster_id(media_id) || bytes.is_empty() {
+        return Err("no still to store".into());
+    }
+    save_file(
+        project_id,
+        &poster_id(media_id),
+        "poster.jpg",
+        "image/jpeg",
+        bytes,
+    )
+    .await
+}
+
+pub async fn load_poster(project_id: &str, media_id: &str) -> Result<Option<Vec<u8>>, String> {
+    if project_id.is_empty() || media_id.is_empty() || is_poster_id(media_id) {
+        return Ok(None);
+    }
+    let db = open_db().await?;
+    let tx = db
+        .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readonly)
+        .map_err(js_err)?;
+    let store = tx.object_store(STORE).map_err(js_err)?;
+    let req = store
+        .get(&JsValue::from_str(&hold_key(
+            project_id,
+            &poster_id(media_id),
+        )))
+        .map_err(js_err)?;
+    let value = await_request(req).await?;
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    Ok(bytes_field(&value, "bytes"))
 }
 
 pub async fn files_for_project(project_id: &str) -> Result<Vec<HeldFile>, String> {
@@ -148,6 +201,9 @@ fn files_in_project(value: &JsValue, project_id: &str) -> Vec<HeldFile> {
         let Some(id) = string_field(&record, "id") else {
             continue;
         };
+        if !is_library_file(&id) {
+            continue;
+        }
         let Some(name) = string_field(&record, "name") else {
             continue;
         };
@@ -262,5 +318,19 @@ mod tests {
         assert_eq!(project_of_key("project/clip"), Some("project"));
         assert_eq!(project_of_key("clip"), None);
         assert_eq!(project_of_key("/clip"), None);
+    }
+
+    #[test]
+    fn a_poster_stays_out_of_the_bin() {
+        assert_eq!(poster_id("clip"), "clip:poster");
+        assert!(is_poster_id("clip:poster"));
+        assert!(!is_poster_id("clip"));
+        assert!(!is_library_file("clip:poster"));
+        assert!(is_library_file("clip"));
+        assert!(!is_library_file(""));
+        assert_eq!(
+            hold_key("project", &poster_id("clip")),
+            "project/clip:poster"
+        );
     }
 }

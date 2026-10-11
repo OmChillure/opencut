@@ -19,8 +19,8 @@ use crate::routes::{
     apply_ops, chat, complete_upload, create_chat, create_project, delete_project,
     generate_captions, get_chat, get_export, get_media_file, get_project, head_export, health,
     list_ai_providers, list_chats, list_media, list_projects, open_session, patch_media,
-    put_media_bytes, put_media_spool, register_media, request_upload, save_chat_messages,
-    transcribe_media, update_project,
+    post_media_poster, put_media_bytes, put_media_spool, register_media, request_upload,
+    save_chat_messages, transcribe_media, update_project,
 };
 use crate::state::AppState;
 
@@ -97,6 +97,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/projects/{id}/media/{media_id}/spool",
             axum::routing::put(put_media_spool).layer(DefaultBodyLimit::max(max_upload_bytes())),
+        )
+        .route(
+            "/v1/projects/{id}/media/{media_id}/poster",
+            post(post_media_poster).layer(DefaultBodyLimit::max(max_upload_bytes())),
         )
         .route(
             "/v1/projects/{id}/media/{media_id}/file",

@@ -1066,6 +1066,79 @@ pub async fn put_media_spool(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// One JPEG for a clip this browser cannot decode. The upload is a temp file and
+/// is deleted before this returns. It is not a spool, not `OPENCUT_MEDIA_DIR`, and not R2.
+pub async fn post_media_poster(
+    State(state): State<AppState>,
+    Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
+    body: axum::body::Bytes,
+) -> ApiResult<Response> {
+    owned(&state, id, &email).await?;
+    if body.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty clip"));
+    }
+    let media = oc_db::get_media(&state.db, media_id).await?;
+    if media.project_id != id {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
+    }
+    let jpeg = poster_from_bytes(&body).await.map_err(|err| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not make a still: {err}"),
+        )
+    })?;
+    tracing::info!(
+        project = %id,
+        media = %media_id,
+        bytes = body.len(),
+        jpeg = jpeg.len(),
+        "poster"
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        jpeg,
+    )
+        .into_response())
+}
+
+async fn poster_from_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.is_empty() {
+        return Err("empty clip".into());
+    }
+    let dir = std::env::temp_dir().join(format!("oc-poster-{}", Uuid::now_v7()));
+    let _guard = PosterDir(dir.clone());
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|err| err.to_string())?;
+    let input = dir.join("source.bin");
+    tokio::fs::write(&input, bytes)
+        .await
+        .map_err(|err| err.to_string())?;
+    let jpeg =
+        match tokio::time::timeout(Duration::from_secs(60), oc_media::poster_jpeg(&input)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(err)) => return Err(err.to_string()),
+            Err(_) => return Err("still took too long".into()),
+        };
+    if jpeg.len() < 32 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return Err("poster was not a jpeg".into());
+    }
+    Ok(jpeg)
+}
+
+/// Deletes the temp upload when the request ends, including on error.
+struct PosterDir(std::path::PathBuf);
+
+impl Drop for PosterDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub async fn register_media(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1848,6 +1921,58 @@ mod tests {
             upload_follow_up("raw/p/m/a.png", "image/png").unwrap(),
             UploadFollowUp::Ready
         );
+    }
+
+    #[test]
+    fn a_poster_upload_is_deleted_with_the_request() {
+        let dir = std::env::temp_dir().join(format!("oc-poster-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("source.bin"), b"clip-bytes").unwrap();
+        {
+            let _guard = PosterDir(dir.clone());
+            assert!(dir.join("source.bin").exists());
+        }
+        assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn a_poster_of_an_uploaded_clip_is_a_jpeg_and_the_file_is_removed() {
+        let ready = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !ready {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oc-poster-src-{}", Uuid::now_v7()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let file = dir.join("sample.mp4");
+        let made = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=15:duration=1.2",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                &file.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let bytes = tokio::fs::read(&file).await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let jpeg = poster_from_bytes(&bytes).await.expect("poster");
+        assert!(jpeg.len() > 400 && jpeg[0] == 0xFF && jpeg[1] == 0xD8);
     }
 
     #[test]
