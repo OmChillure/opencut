@@ -361,6 +361,7 @@ fn Workspace(id: String) -> Element {
         };
         let closure = wasm_bindgen::closure::Closure::wrap(Box::new(
             move |event: web_sys::BeforeUnloadEvent| {
+                flush_chat_on_leave();
                 if held.peek().is_empty() {
                     return;
                 }
@@ -3665,6 +3666,143 @@ fn remember_summary(chats: &mut Signal<Vec<api::ChatSummary>>, chat: api::ChatSu
     chats.set(list);
 }
 
+fn chat_event_is_saved(kind: &str) -> bool {
+    matches!(kind, "text" | "thought" | "tool" | "done" | "error")
+}
+
+#[derive(Clone)]
+struct ChatFlush {
+    project_id: String,
+    chat_id: String,
+    body: String,
+}
+
+struct ChatSaveJob {
+    project_id: String,
+    snap: Vec<api::StoredMsg>,
+    bound: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    chat_id: Signal<Option<String>>,
+    chats: Signal<Vec<api::ChatSummary>>,
+}
+
+struct ChatSaveQueue {
+    latest: Option<ChatSaveJob>,
+    running: bool,
+}
+
+thread_local! {
+    static CHAT_SAVES: std::cell::RefCell<ChatSaveQueue> =
+        std::cell::RefCell::new(ChatSaveQueue {
+            latest: None,
+            running: false,
+        });
+    static CHAT_FLUSH: std::cell::RefCell<Option<ChatFlush>> = std::cell::RefCell::new(None);
+}
+
+fn note_flush(project_id: &str, chat_id: Option<&str>, snap: &[api::StoredMsg]) {
+    let Some(chat_id) = chat_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let body = serde_json::json!({ "messages": snap }).to_string();
+    CHAT_FLUSH.with(|slot| {
+        *slot.borrow_mut() = Some(ChatFlush {
+            project_id: project_id.to_string(),
+            chat_id: chat_id.to_string(),
+            body,
+        });
+    });
+}
+
+fn flush_chat_on_leave() {
+    let Some(pending) = CHAT_FLUSH.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    api::keepalive_chat_put(&pending.project_id, &pending.chat_id, &pending.body);
+}
+
+/// Coalesce streamed chunks into one save. A later snapshot replaces an older
+/// one that has not been written yet, so a slow PUT cannot put the user line
+/// back on top of the model's reply.
+fn queue_chat_save(
+    project_id: String,
+    bound: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    chat_id: Signal<Option<String>>,
+    chats: Signal<Vec<api::ChatSummary>>,
+    messages: Signal<Vec<ChatMsg>>,
+) {
+    let snap = persistable(&messages.read());
+    if snap.is_empty() {
+        return;
+    }
+    note_flush(&project_id, bound.borrow().as_deref(), &snap);
+    let start = CHAT_SAVES.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        queue.latest = Some(ChatSaveJob {
+            project_id,
+            snap,
+            bound,
+            chat_id,
+            chats,
+        });
+        if queue.running {
+            false
+        } else {
+            queue.running = true;
+            true
+        }
+    });
+    if start {
+        spawn(async move {
+            drive_chat_saves().await;
+        });
+    }
+}
+
+async fn drive_chat_saves() {
+    loop {
+        gloo_timers::future::TimeoutFuture::new(400).await;
+        let job = CHAT_SAVES.with(|queue| queue.borrow_mut().latest.take());
+        let Some(job) = job else {
+            CHAT_SAVES.with(|queue| queue.borrow_mut().running = false);
+            return;
+        };
+        let mut id = job.bound.borrow().clone();
+        if let Ok(saved) =
+            store_snap(&job.project_id, &mut id, job.chat_id, job.chats, job.snap).await
+        {
+            *job.bound.borrow_mut() = Some(saved);
+        }
+    }
+}
+
+async fn await_chat_saves() {
+    loop {
+        let busy = CHAT_SAVES.with(|queue| {
+            let queue = queue.borrow();
+            queue.running || queue.latest.is_some()
+        });
+        if !busy {
+            return;
+        }
+        gloo_timers::future::TimeoutFuture::new(40).await;
+    }
+}
+
+async fn save_chat_now(
+    project_id: &str,
+    bound: &std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    chat_id: Signal<Option<String>>,
+    chats: Signal<Vec<api::ChatSummary>>,
+    messages: Signal<Vec<ChatMsg>>,
+) -> Result<(), String> {
+    await_chat_saves().await;
+    let snap = persistable(&messages.read());
+    let mut id = bound.borrow().clone();
+    let saved = store_snap(project_id, &mut id, chat_id, chats, snap).await?;
+    *bound.borrow_mut() = Some(saved);
+    Ok(())
+}
+
 async fn store_snap(
     project_id: &str,
     bound: &mut Option<String>,
@@ -3688,6 +3826,7 @@ async fn store_snap(
         id
     };
     let chat = api::save_chat(project_id, &id, &snap).await?;
+    note_flush(project_id, Some(&id), &snap);
     remember_summary(&mut chats, chat);
     Ok(id)
 }
@@ -3869,13 +4008,11 @@ fn send_prompt(
     let mut held = use_context::<CtxHeld>().0;
     let uploading = use_context::<CtxUploading>().0;
     let batch = held.peek().clone();
-    let opening = persistable(&messages.read());
-    let mut bound = chat_id.peek().clone();
+    let bound = std::rc::Rc::new(std::cell::RefCell::new(chat_id.peek().clone()));
+    queue_chat_save(pid.clone(), bound.clone(), chat_id, chats, messages);
     spawn(async move {
-        if let Ok(id) = store_snap(&pid, &mut bound, chat_id, chats, opening).await {
-            bound = Some(id);
-        }
         if !api::chat_current(turn) {
+            let _ = save_chat_now(&pid, &bound, chat_id, chats, messages).await;
             if api::chat_generation() == turn {
                 busy.set(false);
             }
@@ -3901,11 +4038,14 @@ fn send_prompt(
             note_upload(uploading, &file.id, &file.name, result);
         }
         if !api::chat_current(turn) {
+            let _ = save_chat_now(&pid, &bound, chat_id, chats, messages).await;
             if api::chat_generation() == turn {
                 busy.set(false);
             }
             return;
         }
+        let save_bound = bound.clone();
+        let save_pid = pid.clone();
         let reply = api::chat_stream(&pid, &provider, &model, &history, turn, |ev| {
             if !api::chat_current(turn) {
                 return;
@@ -3913,16 +4053,25 @@ fn send_prompt(
             if let Some(tl) = ev.timeline.clone() {
                 show_timeline(&mut save, &clock, tl);
             }
+            let kind = ev.kind.clone();
             apply_chat_event(messages, ev);
+            if chat_event_is_saved(&kind) {
+                queue_chat_save(
+                    save_pid.clone(),
+                    save_bound.clone(),
+                    chat_id,
+                    chats,
+                    messages,
+                );
+            }
         })
         .await;
         if api::chat_generation() != turn {
             return;
         }
         if api::chat_stopped() {
-            let snap = persistable(&messages.read());
             if api::chat_generation() == turn {
-                let _ = store_snap(&pid, &mut bound, chat_id, chats, snap).await;
+                let _ = save_chat_now(&pid, &bound, chat_id, chats, messages).await;
             }
             if api::chat_generation() == turn {
                 busy.set(false);
@@ -3962,11 +4111,16 @@ fn send_prompt(
             }
             Err(err) => {
                 clear_status(messages);
-                messages.write().push(ChatMsg::bot(err));
+                let keep = messages.read().iter().any(|msg| {
+                    matches!(msg.role, ChatRole::Bot | ChatRole::Tool | ChatRole::Thought)
+                        && (!msg.text.trim().is_empty() || !msg.tool_name.is_empty())
+                });
+                if !(keep && err.contains("without a reply")) {
+                    messages.write().push(ChatMsg::bot(err));
+                }
             }
         }
-        let snap = persistable(&messages.read());
-        if let Err(err) = store_snap(&pid, &mut bound, chat_id, chats, snap).await {
+        if let Err(err) = save_chat_now(&pid, &bound, chat_id, chats, messages).await {
             messages.write().push(ChatMsg::status(format!(
                 "This chat was not saved — {}",
                 short_api_error(&err)
@@ -4713,6 +4867,56 @@ mod chat_tests {
                 .any(|m| m.role == ChatRole::Bot && m.text.contains("40 second"))
         );
         assert!(msgs.iter().any(|m| m.role == ChatRole::User));
+    }
+
+    #[test]
+    fn a_reload_keeps_the_model_reply_and_the_tools() {
+        let msgs = vec![
+            ChatMsg::user("make it cinematic"),
+            ChatMsg {
+                role: ChatRole::Tool,
+                text: "submit_edit".into(),
+                tool_id: "t1".into(),
+                tool_name: "submit_edit".into(),
+                tool_status: "done".into(),
+                tool_args: String::new(),
+                tool_result: "placed 8 clips".into(),
+                open: false,
+            },
+            ChatMsg::bot("Eight shots are reseated on the words."),
+        ];
+        let saved = persistable(&msgs);
+        assert!(saved.iter().any(|row| row.role == "user"));
+        assert!(saved.iter().any(|row| {
+            row.role == "tool"
+                && row.tool_name == "submit_edit"
+                && row.tool_result.contains("8 clips")
+        }));
+        assert!(
+            saved
+                .iter()
+                .any(|row| { row.role == "assistant" && row.text.contains("reseated") })
+        );
+        let restored = saved
+            .into_iter()
+            .enumerate()
+            .filter_map(|(n, row)| msg_from_stored(row, n))
+            .collect::<Vec<_>>();
+        assert!(restored.iter().any(|msg| msg.role == ChatRole::User));
+        assert!(
+            restored
+                .iter()
+                .any(|msg| { msg.role == ChatRole::Tool && msg.tool_name == "submit_edit" })
+        );
+        assert!(
+            restored
+                .iter()
+                .any(|msg| { msg.role == ChatRole::Bot && msg.text.contains("reseated") })
+        );
+        assert!(chat_event_is_saved("text"));
+        assert!(chat_event_is_saved("tool"));
+        assert!(chat_event_is_saved("done"));
+        assert!(!chat_event_is_saved("status"));
     }
 
     #[test]

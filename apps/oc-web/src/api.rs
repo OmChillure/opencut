@@ -243,28 +243,38 @@ pub async fn chat_stream(
         if !chat_current(turn) {
             return Err("stopped".into());
         }
-        let ev: ChatStreamEvent = serde_json::from_str(line).map_err(|e| e.to_string())?;
-        if ev.kind == "done" {
-            reply.text = ev.text.clone();
-            reply.notes = ev.notes.clone();
-            reply.export_preset = ev.export_preset.clone();
-            reply.export_handoff = ev.export_handoff;
-            if let Some(tl) = ev.timeline.clone() {
-                reply.timeline = tl;
-            }
+        let (ev, done) = take_stream_line(line, &mut reply)?;
+        on_event(ev);
+        if done {
             saw_done = true;
         }
-        if ev.kind == "error" && !ev.text.is_empty() {
-            return Err(ev.text.clone());
-        }
-        on_event(ev);
-        Ok(())
+        Ok(done)
     })
     .await?;
     if !saw_done && reply.text.is_empty() {
         return Err("chat stream ended without a reply".into());
     }
     Ok(reply)
+}
+
+/// One NDJSON line. `true` means the turn is finished and the socket can close
+/// even if the server never ends the body.
+fn take_stream_line(line: &str, reply: &mut ChatReply) -> Result<(ChatStreamEvent, bool), String> {
+    let ev: ChatStreamEvent = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    if ev.kind == "error" && !ev.text.is_empty() {
+        return Err(ev.text);
+    }
+    let done = ev.kind == "done";
+    if done {
+        reply.text = ev.text.clone();
+        reply.notes = ev.notes.clone();
+        reply.export_preset = ev.export_preset.clone();
+        reply.export_handoff = ev.export_handoff;
+        if let Some(timeline) = ev.timeline.clone() {
+            reply.timeline = timeline;
+        }
+    }
+    Ok((ev, done))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -551,7 +561,7 @@ async fn read_ndjson(
     url: &str,
     json_body: &str,
     turn: u32,
-    on_line: impl FnMut(&str) -> Result<(), String>,
+    on_line: impl FnMut(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -579,8 +589,8 @@ async fn read_ndjson(
         .map_err(|e| e.to_string())?;
         for line in raw.lines() {
             let line = line.trim();
-            if !line.is_empty() {
-                on_line(line)?;
+            if !line.is_empty() && on_line(line)? {
+                return Ok(());
             }
         }
         Ok(())
@@ -592,7 +602,7 @@ async fn wasm_read_ndjson(
     url: &str,
     json_body: &str,
     turn: u32,
-    mut on_line: impl FnMut(&str) -> Result<(), String>,
+    mut on_line: impl FnMut(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
@@ -672,8 +682,9 @@ async fn wasm_read_ndjson(
         while let Some(idx) = pending.find('\n') {
             let line = pending[..idx].trim().to_string();
             pending = pending[idx + 1..].to_string();
-            if !line.is_empty() {
-                on_line(&line)?;
+            if !line.is_empty() && on_line(&line)? {
+                let _ = reader.cancel();
+                return Ok(());
             }
         }
         if done {
@@ -681,8 +692,9 @@ async fn wasm_read_ndjson(
         }
     }
     let tail = pending.trim().to_string();
-    if !tail.is_empty() {
-        on_line(&tail)?;
+    if !tail.is_empty() && on_line(&tail)? {
+        let _ = reader.cancel();
+        return Ok(());
     }
     Ok(())
 }
@@ -756,6 +768,42 @@ async fn request_poster_blob(
         return Err("poster was not a jpeg".into());
     }
     Ok(bytes)
+}
+
+/// A reload can kill the page before the normal save returns. `keepalive`
+/// lets the browser finish the PUT.
+pub fn keepalive_chat_put(project_id: &str, chat_id: &str, body: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let token = signed_token().unwrap_or_default();
+        let url = format!(
+            "{API}/v1/projects/{project_id}/chats/{chat_id}/messages?token={}",
+            user_query(&token)
+        );
+        let init = web_sys::RequestInit::new();
+        init.set_method("PUT");
+        init.set_body(&wasm_bindgen::JsValue::from_str(body));
+        let _ = js_sys::Reflect::set(
+            init.as_ref(),
+            &wasm_bindgen::JsValue::from_str("keepalive"),
+            &wasm_bindgen::JsValue::TRUE,
+        );
+        let Ok(request) = web_sys::Request::new_with_str_and_init(&url, &init) else {
+            return;
+        };
+        let _ = request.headers().set("content-type", "application/json");
+        if !token.is_empty() {
+            let _ = request.headers().set("x-opencut-token", &token);
+        }
+        let _ = window.fetch_with_request(&request);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (project_id, chat_id, body);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -973,6 +1021,38 @@ mod tests {
         assert!(chat_current(second));
         assert!(!chat_current(first));
         assert!(!chat_stopped());
+    }
+
+    #[test]
+    fn a_done_line_ends_the_stream_and_keeps_the_reply() {
+        let mut reply = ChatReply {
+            text: String::new(),
+            notes: Vec::new(),
+            timeline: Timeline::default(),
+            export_preset: String::new(),
+            export_handoff: false,
+        };
+        let (ev, done) = take_stream_line(
+            r#"{"type":"text","text":"Eight shots are on the timeline."}"#,
+            &mut reply,
+        )
+        .unwrap();
+        assert!(!done);
+        assert_eq!(ev.kind, "text");
+        assert!(reply.text.is_empty());
+        let (ev, done) = take_stream_line(
+            r#"{"type":"done","text":"Eight shots are reseated.","notes":["grade kept"],"export_preset":"vertical-1080","export_handoff":true}"#,
+            &mut reply,
+        )
+        .unwrap();
+        assert!(done);
+        assert_eq!(ev.text, "Eight shots are reseated.");
+        assert_eq!(reply.text, "Eight shots are reseated.");
+        assert_eq!(reply.notes, vec!["grade kept".to_string()]);
+        assert_eq!(reply.export_preset, "vertical-1080");
+        assert!(reply.export_handoff);
+        let err = take_stream_line(r#"{"type":"error","text":"the model stopped"}"#, &mut reply);
+        assert_eq!(err.unwrap_err(), "the model stopped");
     }
 
     #[test]
