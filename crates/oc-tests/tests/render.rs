@@ -291,7 +291,11 @@ fn graph_draws_title_and_grade() {
     media.insert(mid, source(mid, path));
     let compiled = compile(&tl, &media, ExportPreset::Vertical1080, &dir).unwrap();
     assert!(compiled.filter.contains("drawtext"), "{}", compiled.filter);
-    assert!(compiled.filter.contains("eq="), "{}", compiled.filter);
+    assert!(
+        compiled.filter.contains("colorchannelmixer="),
+        "{}",
+        compiled.filter
+    );
     assert!(compiled.filter.contains("1080") && compiled.filter.contains("1920"));
 }
 
