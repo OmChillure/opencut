@@ -161,10 +161,16 @@ pub fn render(req: &RenderRequest) -> Result<RenderResult, RenderError> {
         .arg("-preset")
         .arg("veryfast")
         .arg("-crf")
-        .arg("20")
-        .arg("-movflags")
-        .arg("+faststart")
-        .arg(&partial);
+        .arg("20");
+    if compiled.filter.contains("tonemap=hable") {
+        cmd.arg("-colorspace")
+            .arg("bt709")
+            .arg("-color_primaries")
+            .arg("bt709")
+            .arg("-color_trc")
+            .arg("bt709");
+    }
+    cmd.arg("-movflags").arg("+faststart").arg(&partial);
     let out = cmd.output()?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&partial);

@@ -264,7 +264,7 @@ fn stitch_base(
     let mut acc: Option<(String, f64, f64)> = None;
     for clip in clips {
         let v = picture_branch(
-            fc, next_label, clip, media, index_of, video_pads, width, height, fps, cubes,
+            fc, next_label, clip, media, index_of, video_pads, width, height, fps, cubes, false,
         )?;
         let dur = clip.duration.as_seconds();
         let start = clip.start.as_seconds();
@@ -385,6 +385,7 @@ fn picture_branch(
     height: u32,
     fps: f64,
     cubes: &HashMap<u32, PathBuf>,
+    matte: bool,
 ) -> Result<String, RenderError> {
     let dur = clip.duration.as_seconds().max(0.04);
     let mut chain = if let Some(generated) = &clip.look.generator {
@@ -422,15 +423,20 @@ fn picture_branch(
             )
         })
         .unwrap_or((width, height));
-    if clip.look.card.is_some() {
-        chain.push_str(&format!(
-            ",scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},fps={fps},format=yuv420p"
-        ));
-    } else {
-        chain.push_str(&format!(
-            ",scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p"
-        ));
+    if clip.look.generator.is_none() {
+        if let Some(prefix) = clip.media_id.and_then(|id| media.get(&id)).and_then(|src| {
+            if crate::still_input(&src.path) {
+                return None;
+            }
+            let prefix = hdr_prefix(&src.path, out_w.max(out_h));
+            if prefix.is_empty() { None } else { Some(prefix) }
+        }) {
+            chain.push(',');
+            chain.push_str(&prefix);
+        }
     }
+    chain.push(',');
+    chain.push_str(&fit_chain(out_w, out_h, fps, clip.look.card.is_some(), matte));
     if let ClipKind::Video { transform } = &clip.kind {
         if let Some(end) = clip.look.move_to {
             let frames = (dur * fps).max(1.0);
@@ -499,6 +505,93 @@ fn picture_branch(
     let lab = next_label();
     fc.push_str(&format!("{chain}[{lab}];"));
     Ok(lab)
+}
+
+/// A design card is contained, then the plate is keyed out. A cover card is cropped.
+fn design_matte(timeline: &Timeline, clip: &Clip) -> bool {
+    clip.look.card.is_some()
+        && timeline.tracks.iter().any(|track| {
+            track.name == "Design" && track.clips.iter().any(|row| row.id == clip.id)
+        })
+}
+
+fn fit_chain(out_w: u32, out_h: u32, fps: f64, card: bool, matte: bool) -> String {
+    if matte {
+        // Plates from motion/render.mjs. The number stays; the slab does not.
+        format!(
+            "scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=0x111111,fps={fps},format=yuv420p,colorkey=0x111111:0.08:0.04,colorkey=0x1a1814:0.08:0.04,colorkey=0x0e0e0e:0.08:0.04,colorkey=0x0c1210:0.08:0.04,colorkey=0x120c18:0.08:0.04,colorkey=0x07070c:0.08:0.04,colorkey=0xf4f7fb:0.02:0.0,format=yuva420p"
+        )
+    } else if card {
+        format!(
+            "scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},fps={fps},format=yuv420p"
+        )
+    } else {
+        format!(
+            "scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p"
+        )
+    }
+}
+
+/// PQ and HLG look gray if they are scaled straight into 8-bit. Shrink in 10-bit, then tonemap.
+fn hdr_prefix(path: &Path, limit: u32) -> String {
+    tonemap_prefix(&color_transfer(path), limit)
+}
+
+fn tonemap_prefix(transfer: &str, limit: u32) -> String {
+    let chain = hdr_chain(transfer);
+    if chain.is_empty() {
+        return String::new();
+    }
+    let limit = limit.clamp(2, 1920);
+    format!("scale={limit}:{limit}:force_original_aspect_ratio=decrease:flags=lanczos,{chain}")
+}
+
+fn hdr_chain(transfer: &str) -> &'static str {
+    match transfer.trim() {
+        "smpte2084" => "zscale=tin=smpte2084:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p",
+        "arib-std-b67" => "zscale=tin=arib-std-b67:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p",
+        _ => "",
+    }
+}
+
+fn color_transfer(path: &Path) -> String {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = path.to_path_buf();
+    if let Ok(guard) = cache.lock() {
+        if let Some(found) = guard.get(&key) {
+            return found.clone();
+        }
+    }
+    let found = read_color_transfer(path);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, found.clone());
+    }
+    found
+}
+
+fn read_color_transfer(path: &Path) -> String {
+    let Ok(out) = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=color_transfer",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn source_span(clip: &Clip, dur: f64) -> f64 {
@@ -1088,8 +1181,9 @@ fn overlay_broll(
 ) -> Result<String, RenderError> {
     let mut cur = base.to_string();
     for clip in broll_clips(timeline) {
+        let matte = design_matte(timeline, clip);
         let v = picture_branch(
-            fc, next_label, clip, media, index_of, video_pads, width, height, fps, cubes,
+            fc, next_label, clip, media, index_of, video_pads, width, height, fps, cubes, matte,
         )?;
         cur = paste_overlay(fc, next_label, clip, &v, &cur, width, height, joins);
     }
@@ -1113,7 +1207,7 @@ fn overlay_front(
     let mut cur = base.to_string();
     for clip in front_clips(timeline) {
         let v = picture_branch(
-            fc, next_label, clip, media, index_of, video_pads, width, height, fps, cubes,
+            fc, next_label, clip, media, index_of, video_pads, width, height, fps, cubes, false,
         )?;
         cur = paste_overlay(fc, next_label, clip, &v, &cur, width, height, joins);
     }
@@ -1757,6 +1851,140 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn pq_is_tonemapped_and_a_plain_transfer_is_not() {
+        let pq = super::hdr_chain("smpte2084");
+        assert!(pq.contains("tin=smpte2084"), "{pq}");
+        assert!(pq.contains("tonemap=hable"), "{pq}");
+        assert!(super::hdr_chain("arib-std-b67").contains("tin=arib-std-b67"));
+        assert!(super::hdr_chain("bt709").is_empty());
+        let prefix = super::tonemap_prefix("smpte2084", 1920);
+        assert!(prefix.contains("scale=1920:1920"), "{prefix}");
+        assert!(prefix.contains("tonemap=hable"), "{prefix}");
+        assert!(super::tonemap_prefix("bt709", 1080).is_empty());
+    }
+
+    #[test]
+    fn a_design_card_is_contained_and_keyed_and_a_cover_card_is_cropped() {
+        use oc_timeline::{FrameCard, TrackKind};
+        use std::collections::HashMap;
+        let mut timeline = oc_timeline::Timeline::default();
+        let base_id = timeline.first_track(TrackKind::Video).unwrap().id;
+        let media_id = oc_timeline::MediaId::new();
+        timeline
+            .add_clip(base_id, clip_with(media_id, 0.0))
+            .unwrap();
+        let cover_track = timeline.add_track(TrackKind::Video, "Broll");
+        let mut cover = clip_with(media_id, 0.2);
+        cover.look.card = Some(FrameCard {
+            x: 0.1,
+            y: 0.1,
+            w: 0.4,
+            h: 0.4,
+        });
+        cover.look.overlay = true;
+        timeline.add_clip(cover_track, cover).unwrap();
+        let design_track = timeline.add_track(TrackKind::Video, "Design");
+        let mut design = clip_with(media_id, 0.4);
+        design.look.card = Some(FrameCard {
+            x: 0.52,
+            y: 0.1,
+            w: 0.44,
+            h: 0.8,
+        });
+        design.look.overlay = true;
+        timeline.add_clip(design_track, design).unwrap();
+        let dir = std::env::temp_dir().join("oc-design-matte");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("a.mp4");
+        std::fs::write(&path, b"x").unwrap();
+        let mut media = HashMap::new();
+        media.insert(
+            media_id,
+            crate::MediaSource {
+                id: media_id,
+                path,
+                has_video: true,
+                has_audio: false,
+            },
+        );
+        let compiled = super::compile(&timeline, &media, oc_tools::ExportPreset::Youtube1080, &dir)
+            .expect("compile");
+        let filter = compiled.filter;
+        assert!(
+            filter.contains("force_original_aspect_ratio=increase,crop="),
+            "{filter}"
+        );
+        let key_at = filter
+            .find("colorkey=0x111111")
+            .expect("design plate is keyed");
+        let before = &filter[..key_at];
+        let last = before
+            .rfind("force_original_aspect_ratio=")
+            .expect("scale before the key");
+        assert!(
+            before[last..].starts_with("force_original_aspect_ratio=decrease"),
+            "{before}"
+        );
+        assert!(filter.contains("format=yuva420p"), "{filter}");
+    }
+
+    #[test]
+    fn ffmpeg_accepts_the_design_key() {
+        let ready = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !ready {
+            return;
+        }
+        let chain = super::fit_chain(320, 180, 30.0, true, true);
+        let out = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x111111:s=640x360:d=0.1:r=30",
+                "-vf",
+                &chain,
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .expect("ffmpeg");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn clip_with(media_id: oc_timeline::MediaId, start: f64) -> oc_timeline::Clip {
+        oc_timeline::Clip {
+            id: oc_timeline::ClipId::new(),
+            media_id: Some(media_id),
+            kind: oc_timeline::ClipKind::Video {
+                transform: Default::default(),
+            },
+            start: oc_timeline::Time::from_seconds(start),
+            duration: oc_timeline::Duration::from_seconds(1.5),
+            source_in: oc_timeline::Time::ZERO,
+            speed: 1.0,
+            group_id: None,
+            link_id: None,
+            disabled: false,
+            look: oc_timeline::ClipLook::default(),
         }
     }
 }
