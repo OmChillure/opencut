@@ -286,13 +286,7 @@ pub fn Export(id: String) -> Element {
             };
             name.set(project.name);
             let tl = &project.timeline;
-            let chosen = if tl.height > tl.width {
-                ExportPreset::Vertical1080
-            } else if tl.width == tl.height {
-                ExportPreset::Square1080
-            } else {
-                ExportPreset::Youtube1080
-            };
+            let chosen = ExportPreset::for_frame(tl.width, tl.height);
             preset.set(chosen);
             match api::watch_export(&project_id, chosen.label()).await {
                 Ok(api::ExportWatch::Ready) => {
@@ -314,6 +308,7 @@ pub fn Export(id: String) -> Element {
         (ExportPreset::Youtube1080, "YouTube", "1920 × 1080"),
         (ExportPreset::Vertical1080, "Vertical", "1080 × 1920"),
         (ExportPreset::Square1080, "Square", "1080 × 1080"),
+        (ExportPreset::Classic1080, "4:3", "1440 × 1080"),
     ];
     let selected = *preset.read();
     let back = id.clone();

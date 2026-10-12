@@ -905,13 +905,7 @@ async fn see_host(
 }
 
 fn export_preset(timeline: &Timeline) -> oc_core::ExportPreset {
-    if timeline.height > timeline.width + 32 {
-        oc_core::ExportPreset::Vertical1080
-    } else if (timeline.width as i32 - timeline.height as i32).unsigned_abs() < 32 {
-        oc_core::ExportPreset::Square1080
-    } else {
-        oc_core::ExportPreset::Youtube1080
-    }
+    oc_core::ExportPreset::for_frame(timeline.width, timeline.height)
 }
 
 fn compact_tool(name: &str, result: &str) -> String {
@@ -1835,6 +1829,8 @@ fn parse_byte_range(raw: &str) -> Option<(u64, Option<u64>)> {
 #[derive(Deserialize)]
 pub struct PatchMediaBody {
     pub duration_seconds: Option<f64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
 }
 
 pub async fn patch_media(
@@ -1852,6 +1848,11 @@ pub async fn patch_media(
         if seconds.is_finite() && seconds > 0.0 {
             let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
             oc_db::set_media_duration(&state.db, media_id, ticks).await?;
+        }
+    }
+    if let (Some(width), Some(height)) = (body.width, body.height) {
+        if width > 1 && height > 1 {
+            oc_db::set_media_frame(&state.db, media_id, width, height).await?;
         }
     }
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -2297,6 +2298,21 @@ mod tests {
             Some(oc_core::ExportPreset::Square1080)
         );
         assert_eq!(parse_export_preset("nope"), None);
+        assert_eq!(
+            parse_export_preset("classic-1080"),
+            Some(oc_core::ExportPreset::Classic1080)
+        );
+        assert_eq!(
+            oc_core::ExportPreset::for_frame(1440, 1080),
+            oc_core::ExportPreset::Classic1080
+        );
+        let mut vertical = oc_core::Timeline::default();
+        vertical.width = 1080;
+        vertical.height = 1920;
+        assert_eq!(
+            export_preset(&vertical),
+            oc_core::ExportPreset::Vertical1080
+        );
         assert_eq!(
             local_export_path(id, oc_core::ExportPreset::Square1080),
             std::path::PathBuf::from(export_dir())

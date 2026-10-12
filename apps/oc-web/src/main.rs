@@ -246,6 +246,168 @@ fn persist(save: WorkspaceSave) {
     });
 }
 
+thread_local! {
+    static FRAME_CHOSEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FRAME_ADOPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn frame_chosen() -> bool {
+    FRAME_CHOSEN.with(std::cell::Cell::get)
+}
+
+fn frame_adopted() -> bool {
+    FRAME_ADOPTED.with(std::cell::Cell::get)
+}
+
+fn choose_frame() {
+    FRAME_CHOSEN.with(|flag| flag.set(true));
+}
+
+fn is_camera_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !name.starts_with("motion-") && !name.starts_with("broll-")
+}
+
+fn camera_item(tracks: &[EditorTrack], library: &[MediaItem], now: f64) -> Option<MediaItem> {
+    if let Some(shot) = crate::media::clip_under(tracks, library, now) {
+        if shot.kind == MediaKind::Video {
+            if let Some(item) = library.iter().find(|item| item.id == shot.media_id) {
+                if item.kind == MediaKind::Video && is_camera_name(&item.name) {
+                    return Some(item.clone());
+                }
+            }
+        }
+    }
+    library
+        .iter()
+        .find(|item| item.kind == MediaKind::Video && is_camera_name(&item.name))
+        .cloned()
+}
+
+fn measured_display(item: &MediaItem) -> Option<(u32, u32)> {
+    let doc = web_sys::window()?.document()?;
+    let list = doc.query_selector_all("video").ok()?;
+    for i in 0..list.length() {
+        let video = list.item(i)?.dyn_into::<web_sys::HtmlVideoElement>().ok()?;
+        if video.current_src() != item.url && video.src() != item.url {
+            continue;
+        }
+        let width = video.video_width();
+        let height = video.video_height();
+        if width > 1 && height > 1 {
+            return Some((width, height));
+        }
+    }
+    None
+}
+
+fn adopt_frame(mut save: WorkspaceSave, width: u32, height: u32, force: bool) {
+    if width <= 1 || height <= 1 {
+        return;
+    }
+    if !force && (frame_chosen() || frame_adopted()) {
+        return;
+    }
+    let (width, height) = oc_tools::frame_for_picture(width, height, 0);
+    let next = Aspect::from_pixels(width, height);
+    if *save.aspect.peek() != next {
+        save.aspect.set(next);
+        persist(save);
+    }
+    if force {
+        choose_frame();
+    } else {
+        FRAME_ADOPTED.with(|flag| flag.set(true));
+    }
+}
+
+fn store_frame(save: WorkspaceSave, media_id: &str, width: u32, height: u32, force: bool) {
+    let pid = save.project_id.peek().clone();
+    let media_id = media_id.to_string();
+    if !pid.is_empty() && width > 1 && height > 1 {
+        spawn(async move {
+            let _ = api::patch_media_frame(&pid, &media_id, width, height).await;
+        });
+    }
+    adopt_frame(save, width, height, force);
+}
+
+enum FrameMiss {
+    NoPicture,
+    Unmeasured,
+    Unreadable,
+}
+
+async fn probe_camera_frame(
+    save: WorkspaceSave,
+    library: Signal<Vec<MediaItem>>,
+    force: bool,
+) -> Result<(), FrameMiss> {
+    if !force && (frame_chosen() || frame_adopted()) {
+        return Ok(());
+    }
+    let Some(item) = camera_item(&save.tracks.peek(), &library.peek(), playhead_now()) else {
+        return Err(FrameMiss::NoPicture);
+    };
+    if let Some((width, height)) = measured_display(&item) {
+        store_frame(save, &item.id, width, height, force);
+        return Ok(());
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pid = save.project_id.peek().clone();
+        let id = item.id.clone();
+        let (width, height) = read_held_size(&pid, &id).await?;
+        store_frame(save, &id, width, height, force);
+        return Ok(());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = item;
+        Err(FrameMiss::Unmeasured)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn read_held_size(project_id: &str, media_id: &str) -> Result<(u32, u32), FrameMiss> {
+    if let Some(file) = held_file(media_id) {
+        return media::picture_size(&file).await.ok_or(FrameMiss::Unreadable);
+    }
+    let blob = hold::load_blob(project_id, media_id)
+        .await
+        .map_err(|_| FrameMiss::Unmeasured)?;
+    media::picture_size(&blob)
+        .await
+        .ok_or(FrameMiss::Unreadable)
+}
+
+fn note_loaded_picture(save: WorkspaceSave, library: &[MediaItem], video: &web_sys::HtmlVideoElement) {
+    let src = video.current_src();
+    let raw = video.src();
+    let Some(item) = library.iter().find(|item| item.url == src || item.url == raw) else {
+        return;
+    };
+    if item.kind != MediaKind::Video || !is_camera_name(&item.name) {
+        return;
+    }
+    let width = video.video_width();
+    let height = video.video_height();
+    if width > 1 && height > 1 {
+        store_frame(save, &item.id, width, height, false);
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pid = save.project_id.peek().clone();
+        let id = item.id.clone();
+        spawn(async move {
+            if let Ok((width, height)) = read_held_size(&pid, &id).await {
+                store_frame(save, &id, width, height, false);
+            }
+        });
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ChatRole {
     User,
@@ -461,6 +623,14 @@ fn Workspace(id: String) -> Element {
             Vec::new()
         };
         restore_browser_media(&pid, library, active, &remote_ids).await;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = probe_camera_frame(save, library, false).await;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = save;
+        }
     });
 
     use_future(move || async move {
@@ -1397,6 +1567,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                 button {
                     class: if current == Aspect::Landscape { "preset on" } else { "preset" },
                     onclick: move |_| {
+                        choose_frame();
                         aspect.set(Aspect::Landscape);
                         persist(save);
                     },
@@ -1405,6 +1576,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                 button {
                     class: if current == Aspect::Vertical { "preset on" } else { "preset" },
                     onclick: move |_| {
+                        choose_frame();
                         aspect.set(Aspect::Vertical);
                         persist(save);
                     },
@@ -1413,6 +1585,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                 button {
                     class: if current == Aspect::Square { "preset on" } else { "preset" },
                     onclick: move |_| {
+                        choose_frame();
                         aspect.set(Aspect::Square);
                         persist(save);
                     },
@@ -1421,10 +1594,30 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                 button {
                     class: if current == Aspect::Classic { "preset on" } else { "preset" },
                     onclick: move |_| {
+                        choose_frame();
                         aspect.set(Aspect::Classic);
                         persist(save);
                     },
                     "4:3"
+                }
+                button {
+                    class: "preset",
+                    title: "Match the picture under the playhead",
+                    onclick: move |_| {
+                        choose_frame();
+                        let library = library;
+                        spawn(async move {
+                            if let Err(miss) = probe_camera_frame(save, library, true).await {
+                                let message = match miss {
+                                    FrameMiss::NoPicture => "No picture under the playhead",
+                                    FrameMiss::Unmeasured => "This browser has not measured that picture",
+                                    FrameMiss::Unreadable => "Could not read the picture size",
+                                };
+                                show_toast().error(message);
+                            }
+                        });
+                    },
+                    "Match"
                 }
             }
             div { class: "monitor-wrap",
@@ -1464,6 +1657,7 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
                                             .max(0.0),
                                     );
                                 }
+                                note_loaded_picture(save, &library.peek(), &video);
                             }
                             if changed {
                                 persist(save);
@@ -2375,6 +2569,11 @@ async fn import_browser_file(
         }
         held.write().retain(|row| row.id != id);
         forget_import(&id);
+        if ctype.starts_with("video/") && is_camera_name(&name) {
+            if let Some((width, height)) = media::picture_size(&web_file).await {
+                store_frame(save, &id, width, height, false);
+            }
+        }
         let speech = api::transcribe_blob(&pid, &id, &ctype, &web_file).await;
         if let Err(err) = speech {
             uploading.write().retain(|row| row != &id);
@@ -3527,6 +3726,11 @@ fn show_timeline(save: &mut WorkspaceSave, clock: &Clock, timeline: EngineTimeli
     if end > 0.0 {
         let mut duration = clock.duration;
         duration.set(end);
+    }
+    let next = Aspect::from_pixels(timeline.width, timeline.height);
+    if *save.aspect.peek() != next {
+        save.aspect.set(next);
+        FRAME_ADOPTED.with(|flag| flag.set(true));
     }
 }
 

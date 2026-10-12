@@ -818,6 +818,19 @@ pub fn mcp_tools() -> Vec<McpTool> {
             ]),
         },
         McpTool {
+            name: "fit_frame".into(),
+            description: "Set the project frame from the picture: 16:9, 9:16, 1:1, or 4:3. Pass upright width and height from the bin. Omit them to use the largest camera clip. rotation is degrees, only when width and height are still the sideways coded size. A sideways phone file is vertical.".into(),
+            input_schema: object(&[
+                ("width", num_prop("Upright width in pixels"), false),
+                ("height", num_prop("Upright height in pixels"), false),
+                (
+                    "rotation",
+                    num_prop("Degrees. 90 or 270 swap width and height. Omit when the size is already upright"),
+                    false,
+                ),
+            ]),
+        },
+        McpTool {
             name: "set_frame_rate".into(),
             description: "Set the project frame rate. Existing clips stay put. fps is 23.976, 24, 25, 29.97, 30, 50, 59.94, or 60.".into(),
             input_schema: object(&[("fps", num_prop("Frames per second"), true)]),
@@ -905,6 +918,7 @@ const PIECE_TOOLS: &[&str] = &[
     "submit_edit",
     "revise_edit",
     "add_motion",
+    "fit_frame",
 ];
 
 /// Tools advertised on this turn. A piece sees the plan. A named trim sees the full catalog.
@@ -1499,6 +1513,21 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 color: color.to_string(),
             })
         }
+        "fit_frame" => {
+            let width = call.arguments.get("width").and_then(Value::as_f64);
+            let height = call.arguments.get("height").and_then(Value::as_f64);
+            let (Some(width), Some(height)) = (width, height) else {
+                return Err("the browser has not reported the frame yet".into());
+            };
+            let rotation = call
+                .arguments
+                .get("rotation")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as i32;
+            let (width, height) =
+                crate::frame_for_picture(width.round() as u32, height.round() as u32, rotation);
+            Ok(Op::SetFrame { width, height })
+        }
         "import_cube" => {
             let text = call
                 .arguments
@@ -1999,6 +2028,7 @@ mod parse_tests {
             "submit_edit",
             "revise_edit",
             "add_motion",
+            "fit_frame",
         ] {
             assert!(
                 piece.iter().any(|name| name == need),
@@ -2020,7 +2050,7 @@ mod parse_tests {
                 "{hidden} leaked into {piece:?}"
             );
         }
-        assert_eq!(piece.len(), 11, "{piece:?}");
+        assert_eq!(piece.len(), 12, "{piece:?}");
         let masked = names("make a vlog and mask the face");
         assert!(masked.iter().any(|name| name == "set_mask"), "{masked:?}");
         let titled = names("make a vlog with a title");

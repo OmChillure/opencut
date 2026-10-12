@@ -76,6 +76,9 @@ pub(crate) async fn call_tool(
     if name == "add_motion" {
         return add_motion(db, project_id, &mut project.timeline, &call.arguments).await;
     }
+    if name == "fit_frame" {
+        return fit_frame(db, project_id, &mut project.timeline, &media, &call.arguments).await;
+    }
     if name == "snap_cuts_to_beats" {
         let raw = call
             .arguments
@@ -379,6 +382,58 @@ mod browser_bin_tests {
         );
         assert!(text.contains("hold=browser"), "{text}");
         assert!(text.contains("see and watch cannot open them"), "{text}");
+        assert!(!text.contains("frame="), "{text}");
+    }
+
+    #[test]
+    fn picture_row_prefers_the_camera_over_a_larger_graphic() {
+        let talk = media_row("talk.mp4", "video/mp4", Some(1080), Some(1920));
+        let motion = media_row("motion-1.mp4", "video/mp4", Some(3840), Some(2160));
+        let broll = media_row("broll-1.mp4", "video/mp4", Some(4000), Some(4000));
+        let photo = media_row("still.jpg", "image/jpeg", Some(4000), Some(3000));
+        let rows = [motion, broll, photo, talk];
+        let picked = super::picture_row(&rows).unwrap();
+        assert_eq!(picked.filename, "talk.mp4");
+        let size = super::fit_frame_size(&serde_json::json!({}), &rows).unwrap();
+        assert_eq!(size, (1080, 1920));
+        let sideways = super::fit_frame_size(
+            &serde_json::json!({ "width": 3840, "height": 2160, "rotation": -90 }),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(sideways, (1080, 1920));
+        let err = super::fit_frame_size(&serde_json::json!({}), &[]).unwrap_err();
+        assert_eq!(err, "the browser has not reported the frame yet");
+        let listed = run_inspect(
+            Inspect::ListBin,
+            &Timeline::default(),
+            std::slice::from_ref(&rows[3]),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(listed.contains("frame=1080x1920"), "{listed}");
+    }
+
+    fn media_row(
+        filename: &str,
+        content_type: &str,
+        width: Option<i32>,
+        height: Option<i32>,
+    ) -> oc_db::MediaRow {
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-7000-8000-000000000001",
+            "project_id": "00000000-0000-7000-8000-000000000002",
+            "r2_key": "workspace/00000000-0000-7000-8000-000000000001",
+            "filename": filename,
+            "content_type": content_type,
+            "byte_size": null,
+            "duration_ticks": 240000,
+            "width": width,
+            "height": height,
+            "status": "browser",
+            "created_at": "2026-10-08T00:00:00Z"
+        }))
+        .expect("media row")
     }
 }
 
@@ -429,6 +484,66 @@ mod design_prompt_tests {
         let text = motion_ask(&json!({"design": "kinetic-slam", "at": 1})).unwrap_err();
         assert!(text.contains("text"), "{text}");
     }
+}
+
+async fn fit_frame(
+    db: &Db,
+    project_id: Uuid,
+    timeline: &mut Timeline,
+    media: &[oc_db::MediaRow],
+    arguments: &Value,
+) -> Result<String, String> {
+    let (width, height) = fit_frame_size(arguments, media)?;
+    let mut undo = UndoStack::new();
+    let applied = apply(timeline, &mut undo, Op::SetFrame { width, height }).map_err(|e| e.to_string())?;
+    oc_db::save_timeline(db, project_id, timeline)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(applied.note)
+}
+
+/// Explicit pixels win. Otherwise the largest camera clip in the bin.
+fn fit_frame_size(arguments: &Value, media: &[oc_db::MediaRow]) -> Result<(u32, u32), String> {
+    let width = arguments.get("width").and_then(Value::as_f64);
+    let height = arguments.get("height").and_then(Value::as_f64);
+    if let (Some(width), Some(height)) = (width, height) {
+        if width > 1.0 && height > 1.0 {
+            let rotation = arguments
+                .get("rotation")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as i32;
+            return Ok(oc_core::tools::frame_for_picture(
+                width.round() as u32,
+                height.round() as u32,
+                rotation,
+            ));
+        }
+    }
+    let Some(row) = picture_row(media) else {
+        return Err("the browser has not reported the frame yet".into());
+    };
+    Ok(oc_core::tools::frame_for_picture(
+        row.width.unwrap_or(0) as u32,
+        row.height.unwrap_or(0) as u32,
+        0,
+    ))
+}
+
+/// Camera picture only. Motion renders and generated b-roll do not set the frame.
+fn picture_row(media: &[oc_db::MediaRow]) -> Option<&oc_db::MediaRow> {
+    media
+        .iter()
+        .filter(|row| {
+            let name = row.filename.to_ascii_lowercase();
+            if name.starts_with("motion-") || name.starts_with("broll-") {
+                return false;
+            }
+            if !row.content_type.starts_with("video/") {
+                return false;
+            }
+            matches!((row.width, row.height), (Some(w), Some(h)) if w > 1 && h > 1)
+        })
+        .max_by_key(|row| i64::from(row.width.unwrap_or(0)) * i64::from(row.height.unwrap_or(0)))
 }
 
 fn broll_aspect(timeline: &Timeline, requested: Option<&str>) -> String {
@@ -1111,8 +1226,12 @@ pub(crate) fn run_inspect(
                 } else {
                     ""
                 };
+                let frame = match (row.width, row.height) {
+                    (Some(w), Some(h)) if w > 1 && h > 1 => format!(" frame={w}x{h}"),
+                    _ => String::new(),
+                };
                 out.push_str(&format!(
-                    "{id}  {kind:?}  {dur:.1}s  words={words}  cues={cues}  look={look}{hold}  {name}\n",
+                    "{id}  {kind:?}  {dur:.1}s  words={words}  cues={cues}  look={look}{hold}{frame}  {name}\n",
                     id = row.id,
                     dur = dur.as_seconds(),
                     name = row.filename
@@ -1137,6 +1256,11 @@ pub(crate) fn run_inspect(
                 row.filename,
                 dur = dur.as_seconds()
             );
+            if let (Some(w), Some(h)) = (row.width, row.height) {
+                if w > 1 && h > 1 {
+                    out.push_str(&format!("frame={w}x{h}\n"));
+                }
+            }
             if let Some(s) = speech.get(&id) {
                 out.push_str(&format!(
                     "speech words={} hook@{:.1}s cues={}\n",
@@ -1811,7 +1935,7 @@ fn format_cues(cues: &[CueBrief], limit: usize) -> String {
 }
 
 fn timeline_brief(tl: &Timeline) -> String {
-    let mut out = String::from("Current timeline:\n");
+    let mut out = format!("Current timeline:\nframe {}x{}\n", tl.width, tl.height);
     for track in &tl.tracks {
         out.push_str(&format!(
             "- track {} ({:?}) {}\n",

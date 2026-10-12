@@ -1133,6 +1133,44 @@ pub fn blob_url(bytes: &[u8], mime: &str) -> Option<String> {
     Url::create_object_url_with_blob(&blob).ok()
 }
 
+/// Display size from the file. A long clip is only the first 1MB and the last 8MB.
+pub async fn picture_size(blob: &Blob) -> Option<(u32, u32)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = blob;
+        None
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let size = blob.size();
+        if !(size.is_finite() && size > 32.0) {
+            return None;
+        }
+        let limit = 8_388_608.0;
+        let bytes = if size <= limit {
+            slice_bytes(blob, 0.0, size).await?
+        } else {
+            let mut head = slice_bytes(blob, 0.0, 1_048_576.0).await?;
+            let tail = slice_bytes(blob, (size - limit).max(0.0), size).await?;
+            head.extend(tail);
+            head
+        };
+        oc_tools::mp4_display_size(&bytes)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn slice_bytes(blob: &Blob, start: f64, end: f64) -> Option<Vec<u8>> {
+    let part = blob.slice_with_f64_and_f64(start, end).ok()?;
+    let buf = wasm_bindgen_futures::JsFuture::from(part.array_buffer())
+        .await
+        .ok()?;
+    let array = js_sys::Uint8Array::new(&buf);
+    let mut bytes = vec![0_u8; array.length() as usize];
+    array.copy_to(&mut bytes);
+    Some(bytes)
+}
+
 pub fn item_from_blob(name: String, blob: &Blob, id: String) -> Option<MediaItem> {
     let kind = MediaKind::from_name(&name);
     let content_type = MediaKind::mime(&name).to_string();

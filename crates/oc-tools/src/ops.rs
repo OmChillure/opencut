@@ -86,6 +86,7 @@ pub enum ExportPreset {
     Youtube1080,
     Vertical1080,
     Square1080,
+    Classic1080,
 }
 
 impl ExportPreset {
@@ -95,6 +96,18 @@ impl ExportPreset {
             Self::Youtube1080 => (1920, 1080),
             Self::Vertical1080 => (1080, 1920),
             Self::Square1080 => (1080, 1080),
+            Self::Classic1080 => (1440, 1080),
+        }
+    }
+
+    /// The preset whose shape matches this frame. 4:3 stays 1440×1080.
+    #[must_use]
+    pub fn for_frame(width: u32, height: u32) -> Self {
+        match crate::frame_for_picture(width, height, 0) {
+            (1080, 1920) => Self::Vertical1080,
+            (1080, 1080) => Self::Square1080,
+            (1440, 1080) => Self::Classic1080,
+            _ => Self::Youtube1080,
         }
     }
 
@@ -104,6 +117,7 @@ impl ExportPreset {
             Self::Youtube1080 => "youtube-1080",
             Self::Vertical1080 => "vertical-1080",
             Self::Square1080 => "square-1080",
+            Self::Classic1080 => "classic-1080",
         }
     }
 
@@ -114,6 +128,7 @@ impl ExportPreset {
             "youtube-1080" | "youtube_1080" | "youtube1080" => Some(Self::Youtube1080),
             "vertical-1080" | "vertical_1080" | "vertical1080" => Some(Self::Vertical1080),
             "square-1080" | "square_1080" | "square1080" => Some(Self::Square1080),
+            "classic-1080" | "classic_1080" | "classic1080" => Some(Self::Classic1080),
             _ => None,
         }
     }
@@ -432,6 +447,11 @@ pub enum Op {
         clip_id: ClipId,
         lead: Duration,
         tail: Duration,
+    },
+    /// Project frame in pixels. Values are clamped even, from 2 to 7680.
+    SetFrame {
+        width: u32,
+        height: u32,
     },
 }
 
@@ -1125,9 +1145,22 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
                 tail.as_seconds()
             )
         }
+        Op::SetFrame { width, height } => {
+            let width = even_frame(*width);
+            let height = even_frame(*height);
+            timeline.width = width;
+            timeline.height = height;
+            format!("frame {width}x{height}")
+        }
     };
     undo.label_last(&note);
     Ok(AppliedOp { op, note })
+}
+
+fn even_frame(value: u32) -> u32 {
+    let n = value.clamp(2, 7680);
+    let n = n - n % 2;
+    n.max(2)
 }
 
 fn snap_joins(timeline: &mut Timeline, tolerance_frames: u32, beats: &[f64]) -> usize {
@@ -2233,7 +2266,16 @@ mod tests {
             ExportPreset::parse("vertical_1080"),
             Some(ExportPreset::Vertical1080)
         );
+        assert_eq!(
+            ExportPreset::parse("classic-1080"),
+            Some(ExportPreset::Classic1080)
+        );
         assert_eq!(ExportPreset::parse("nope"), None);
+        assert_eq!(ExportPreset::for_frame(1920, 1080), ExportPreset::Youtube1080);
+        assert_eq!(ExportPreset::for_frame(1080, 1920), ExportPreset::Vertical1080);
+        assert_eq!(ExportPreset::for_frame(1080, 1080), ExportPreset::Square1080);
+        assert_eq!(ExportPreset::for_frame(1440, 1080), ExportPreset::Classic1080);
+        assert_eq!(ExportPreset::Classic1080.size(), (1440, 1080));
     }
 
     #[test]

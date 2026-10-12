@@ -489,6 +489,16 @@ pub async fn set_media_duration(pool: &Db, id: Uuid, duration_ticks: i64) -> Res
     Ok(())
 }
 
+pub async fn set_media_frame(pool: &Db, id: Uuid, width: i32, height: i32) -> Result<(), DbError> {
+    query("update media set width = $2, height = $3 where id = $1")
+        .bind(id)
+        .bind(width)
+        .bind(height)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn enqueue_job(
     pool: &Db,
     kind: &str,

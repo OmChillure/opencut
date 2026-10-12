@@ -1,6 +1,7 @@
 //! Timeline tools: UI catalog, ops the engine applies, MCP schemas for providers.
 
 mod finish;
+mod frame;
 mod intent;
 mod mcp;
 mod ops;
@@ -9,6 +10,7 @@ mod registry;
 mod review;
 mod watch;
 
+pub use frame::{frame_for_picture, mp4_display_size};
 pub use finish::{
     CoverShot, SpokenLine, caption_recipe_for, has_burnable_captions, mapped_cues, program_clips,
     redress_unset_captions,

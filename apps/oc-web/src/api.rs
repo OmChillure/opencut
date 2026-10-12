@@ -1058,6 +1058,24 @@ pub async fn save_timeline(id: &str, timeline: Timeline) -> Result<Timeline, Str
     apply_ops(id, vec![Op::SetTimeline { timeline }]).await
 }
 
+pub async fn patch_media_frame(
+    project_id: &str,
+    media_id: &str,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    authed(
+        reqwest::Client::new().patch(format!("{API}/v1/projects/{project_id}/media/{media_id}")),
+    )
+    .json(&serde_json::json!({ "width": width, "height": height }))
+    .send()
+    .await
+    .map_err(|e| e.to_string())?
+    .error_for_status()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub async fn patch_media_duration(
     project_id: &str,
     media_id: &str,
