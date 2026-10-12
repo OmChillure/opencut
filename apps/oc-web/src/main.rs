@@ -408,6 +408,33 @@ fn note_loaded_picture(save: WorkspaceSave, library: &[MediaItem], video: &web_s
     }
 }
 
+fn caption_under(timeline: &EngineTimeline, at: f64) -> Option<(oc_core::ClipId, usize, String)> {
+    for track in &timeline.tracks {
+        if track.hidden || track.kind != TrackKind::Caption {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.disabled {
+                continue;
+            }
+            let start = clip.start.as_seconds();
+            if at + 1e-4 < start || at >= start + clip.duration.as_seconds() {
+                continue;
+            }
+            let local = at - start;
+            let oc_core::ClipKind::Caption { cues, .. } = &clip.kind else {
+                continue;
+            };
+            for (index, cue) in cues.iter().enumerate() {
+                if local + 1e-4 >= cue.start.as_seconds() && local < cue.end.as_seconds() {
+                    return Some((clip.id, index, cue.text.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ChatRole {
     User,
@@ -1047,11 +1074,43 @@ fn AssetView(tab: AssetTab) -> Element {
                 }
             }
         },
-        AssetTab::Captions => rsx! {
+        AssetTab::Captions => {
+            let line = caption_under(&save.engine.read(), *clock.current.read());
+            let idle = line.is_none();
+            rsx! {
             div { class: "drop",
                 IconCaptions {}
                 strong { "Captions" }
-                small { "Transcribe speech and drop a caption track on the timeline." }
+                small { "The line under the playhead. Generate reads speech into a caption track." }
+                p { class: "caption-now",
+                    if let Some((_, _, text)) = &line {
+                        "{text}"
+                    } else {
+                        "No caption under the playhead"
+                    }
+                }
+                button {
+                    class: "btn caption-edit",
+                    disabled: idle,
+                    onclick: move |_| {
+                        let Some((clip_id, index, text)) = caption_under(&save.engine.peek(), playhead_now()) else {
+                            show_toast().error("No caption under the playhead");
+                            return;
+                        };
+                        let Some(next) = web_sys::window().and_then(|window| {
+                            window.prompt_with_message_and_default("Caption", &text).ok().flatten()
+                        }) else {
+                            return;
+                        };
+                        let next = next.trim().to_string();
+                        if next.is_empty() {
+                            show_toast().error("A caption line cannot be empty");
+                            return;
+                        }
+                        live_note(save, &library.peek(), tools::set_caption_text(save, clip_id, index, next));
+                    },
+                    "Edit caption"
+                }
                 button {
                     class: "btn btn-primary",
                     onclick: move |_| {
@@ -1075,6 +1134,7 @@ fn AssetView(tab: AssetTab) -> Element {
                     "Generate captions"
                 }
             }
+        }
         },
         AssetTab::Audio => rsx! {
             div { class: "card-list",

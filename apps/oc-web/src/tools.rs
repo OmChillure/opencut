@@ -609,6 +609,22 @@ pub fn set_mask_at(
     run_ops(save, vec![Op::SetMask { clip_id, mask }])
 }
 
+pub fn set_caption_text(
+    save: WorkspaceSave,
+    clip_id: ClipId,
+    index: usize,
+    text: String,
+) -> Result<Vec<String>, String> {
+    run_ops(
+        save,
+        vec![Op::SetCaptionText {
+            clip_id,
+            index,
+            text,
+        }],
+    )
+}
+
 pub fn set_frame_rate(
     save: WorkspaceSave,
     rate: oc_core::FrameRate,

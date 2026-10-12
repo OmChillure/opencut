@@ -453,6 +453,12 @@ pub enum Op {
         width: u32,
         height: u32,
     },
+    /// Replace one caption line. `index` is 0 for the first cue on that clip.
+    SetCaptionText {
+        clip_id: ClipId,
+        index: usize,
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1151,6 +1157,27 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             timeline.width = width;
             timeline.height = height;
             format!("frame {width}x{height}")
+        }
+        Op::SetCaptionText {
+            clip_id,
+            index,
+            text,
+        } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            let ClipKind::Caption { cues, .. } = &mut clip.kind else {
+                return Err(OpError::Message("that clip is not captions".into()));
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(OpError::Message("a caption line cannot be empty".into()));
+            }
+            let Some(cue) = cues.get_mut(*index) else {
+                return Err(OpError::Message("no caption on that line".into()));
+            };
+            cue.text = text.to_string();
+            format!("caption {} on {clip_id}", *index + 1)
         }
     };
     undo.label_last(&note);
@@ -2276,6 +2303,72 @@ mod tests {
         assert_eq!(ExportPreset::for_frame(1080, 1080), ExportPreset::Square1080);
         assert_eq!(ExportPreset::for_frame(1440, 1080), ExportPreset::Classic1080);
         assert_eq!(ExportPreset::Classic1080.size(), (1440, 1080));
+    }
+
+    #[test]
+    fn a_caption_line_can_be_rewritten_and_an_empty_line_cannot() {
+        let mut tl = Timeline::default();
+        let mut undo = UndoStack::new();
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::AddCaptions {
+                style: CaptionStyle::default(),
+                cues: vec![CaptionCue {
+                    start: Time::from_seconds(0.2),
+                    end: Time::from_seconds(1.4),
+                    text: "goodies and stickers for".into(),
+                    speaker: None,
+                    place: Default::default(),
+                    font: Default::default(),
+                    effect: Default::default(),
+                    ink: Default::default(),
+                    edge: Default::default(),
+                }],
+            },
+        )
+        .unwrap();
+        let clip_id = tl
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Caption)
+            .unwrap()
+            .clips[0]
+            .id;
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::SetCaptionText {
+                clip_id,
+                index: 0,
+                text: "  goodies and stickers  ".into(),
+            },
+        )
+        .unwrap();
+        match &tl.clip_mut(clip_id).unwrap().kind {
+            ClipKind::Caption { cues, .. } => assert_eq!(cues[0].text, "goodies and stickers"),
+            other => panic!("{other:?}"),
+        }
+        let empty = apply(
+            &mut tl,
+            &mut undo,
+            Op::SetCaptionText {
+                clip_id,
+                index: 0,
+                text: "   ".into(),
+            },
+        );
+        assert!(empty.is_err());
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::SetFrame {
+                width: 1919,
+                height: 1080,
+            },
+        )
+        .unwrap();
+        assert_eq!((tl.width, tl.height), (1918, 1080));
     }
 
     #[test]

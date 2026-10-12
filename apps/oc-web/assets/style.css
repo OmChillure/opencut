@@ -350,6 +350,13 @@ button:disabled { opacity: 0.45; cursor: default; }
 .card:hover { background: var(--hover); }
 .card b { display: block; font-weight: 500; font-size: 13px; }
 .card span { font-size: 11px; color: var(--muted); }
+.caption-now {
+  display: block;
+  margin: 10px 0 8px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+.caption-edit { display: flex; margin-bottom: 8px; }
 
 /* ——— preview ——— */
 .preview {

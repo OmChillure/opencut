@@ -831,6 +831,15 @@ pub fn mcp_tools() -> Vec<McpTool> {
             ]),
         },
         McpTool {
+            name: "set_caption_text".into(),
+            description: "Rewrite one caption line. clip_id is the caption clip. index starts at 0. text is the new line.".into(),
+            input_schema: object(&[
+                ("clip_id", str_prop("Caption clip id"), true),
+                ("index", num_prop("Line index, starting at 0"), true),
+                ("text", str_prop("New line"), true),
+            ]),
+        },
+        McpTool {
             name: "set_frame_rate".into(),
             description: "Set the project frame rate. Existing clips stay put. fps is 23.976, 24, 25, 29.97, 30, 50, 59.94, or 60.".into(),
             input_schema: object(&[("fps", num_prop("Frames per second"), true)]),
@@ -986,6 +995,9 @@ fn extra_piece_tools(text: &str) -> Vec<&'static str> {
         || (mentions(text, "background") && !mentions(text, "music"))
     {
         names.push("set_background");
+    }
+    if mentions(text, "caption") || mentions(text, "captions") {
+        names.push("set_caption_text");
     }
     if text.contains("b-roll")
         || text.contains("broll")
@@ -1528,6 +1540,18 @@ pub fn op_from_mcp(call: &McpCall) -> Result<Op, String> {
                 crate::frame_for_picture(width.round() as u32, height.round() as u32, rotation);
             Ok(Op::SetFrame { width, height })
         }
+        "set_caption_text" => {
+            let text = call
+                .arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing text".to_string())?;
+            Ok(Op::SetCaptionText {
+                clip_id: clip_id(&call.arguments, "clip_id")?,
+                index: number(&call.arguments, "index")? as usize,
+                text: text.to_string(),
+            })
+        }
         "import_cube" => {
             let text = call
                 .arguments
@@ -2051,6 +2075,11 @@ mod parse_tests {
             );
         }
         assert_eq!(piece.len(), 12, "{piece:?}");
+        let captions = names("make a vlog and edit the captions");
+        assert!(
+            captions.iter().any(|name| name == "set_caption_text"),
+            "{captions:?}"
+        );
         let masked = names("make a vlog and mask the face");
         assert!(masked.iter().any(|name| name == "set_mask"), "{masked:?}");
         let titled = names("make a vlog with a title");
