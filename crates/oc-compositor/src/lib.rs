@@ -212,6 +212,45 @@ pub fn plan_frame(timeline: &Timeline, time: Time) -> FramePlan {
     }
 }
 
+/// The monitor video elements already draw this frame.
+/// A push, a dissolve, a wipe, a slide, a fade, and a design clip stay there.
+/// Grabbing those frames onto the canvas stalls the playhead and skips the move.
+/// Grade, curves, a cube, a mask, a crop, blur, a generator, stabilize, rotation,
+/// and the pixelize mosaic still paint so the preview matches the export.
+#[must_use]
+pub fn video_element_can_show(plan: &FramePlan) -> bool {
+    plan.layers.iter().all(layer_on_video_element)
+}
+
+fn layer_on_video_element(layer: &Layer) -> bool {
+    match layer {
+        Layer::Video {
+            grade,
+            fx,
+            curves,
+            mask,
+            crop,
+            generator,
+            stabilize,
+            transform,
+            transition,
+            mix,
+            ..
+        } => {
+            grade.is_identity()
+                && curves.is_identity()
+                && mask.is_none()
+                && crop.is_none()
+                && generator.is_none()
+                && !*stabilize
+                && transform.rotation.abs() <= 0.4
+                && fx.blur <= 0.02
+                && !(*mix > 0.0 && *transition == TransitionKind::Pixelize)
+        }
+        Layer::Caption { .. } | Layer::Graphic { .. } => true,
+    }
+}
+
 fn is_picture_overlay(name: &str) -> bool {
     matches!(name, "Design" | "Front" | "GFX")
 }
@@ -714,5 +753,99 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec![(speaker, false), (design, true)]);
+    }
+
+    #[test]
+    fn a_push_a_dissolve_and_a_design_stay_on_the_video_element() {
+        let mut push = Timeline::default();
+        let track = push.first_track(TrackKind::Video).unwrap().id;
+        let mut look = ClipLook::default();
+        look.move_to = Some(Transform {
+            scale: 1.2,
+            ..Transform::default()
+        });
+        push.add_clip(track, plate(look)).unwrap();
+        let plan = plan_frame(&push, Time::from_seconds(1.0));
+        assert!(plan.needs_paint);
+        assert!(video_element_can_show(&plan));
+
+        let mut dissolve = Timeline::default();
+        let track = dissolve.first_track(TrackKind::Video).unwrap().id;
+        let mut outgoing = ClipLook::default();
+        outgoing.transition = TransitionKind::Dissolve;
+        dissolve.add_clip(track, plate(outgoing)).unwrap();
+        dissolve
+            .add_clip(
+                track,
+                Clip {
+                    start: Time::from_seconds(2.0),
+                    ..plate(ClipLook::default())
+                },
+            )
+            .unwrap();
+        let plan = plan_frame(&dissolve, Time::from_seconds(1.5));
+        assert!(plan.needs_paint);
+        assert!(video_element_can_show(&plan));
+
+        let mut design = Timeline::default();
+        let v1 = design.first_track(TrackKind::Video).unwrap().id;
+        design.add_clip(v1, plate(ClipLook::default())).unwrap();
+        let design_track = design.add_track(TrackKind::Video, "Design");
+        design
+            .add_clip(design_track, plate(ClipLook::default()))
+            .unwrap();
+        let plan = plan_frame(&design, Time::from_seconds(0.5));
+        assert!(plan.needs_paint);
+        assert!(video_element_can_show(&plan));
+    }
+
+    #[test]
+    fn grade_and_pixelize_still_paint() {
+        let mut graded = Timeline::default();
+        let track = graded.first_track(TrackKind::Video).unwrap().id;
+        let mut look = ClipLook::default();
+        look.grade.contrast = 0.2;
+        graded.add_clip(track, plate(look)).unwrap();
+        assert!(!video_element_can_show(&plan_frame(
+            &graded,
+            Time::from_seconds(0.4)
+        )));
+
+        let mut mosaic = Timeline::default();
+        let track = mosaic.first_track(TrackKind::Video).unwrap().id;
+        let mut outgoing = ClipLook::default();
+        outgoing.transition = TransitionKind::Pixelize;
+        mosaic.add_clip(track, plate(outgoing)).unwrap();
+        mosaic
+            .add_clip(
+                track,
+                Clip {
+                    start: Time::from_seconds(2.0),
+                    ..plate(ClipLook::default())
+                },
+            )
+            .unwrap();
+        assert!(!video_element_can_show(&plan_frame(
+            &mosaic,
+            Time::from_seconds(1.5)
+        )));
+    }
+
+    fn plate(look: ClipLook) -> Clip {
+        Clip {
+            id: ClipId::new(),
+            media_id: Some(MediaId::new()),
+            kind: ClipKind::Video {
+                transform: Transform::default(),
+            },
+            start: Time::ZERO,
+            duration: Duration::from_seconds(2.0),
+            source_in: Time::ZERO,
+            speed: 1.0,
+            group_id: None,
+            link_id: None,
+            disabled: false,
+            look,
+        }
     }
 }

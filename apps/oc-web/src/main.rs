@@ -1684,28 +1684,21 @@ fn Timeline() -> Element {
                     _ => {}
                 }
             },
-            onmousemove: move |evt| {
-                let Some((clip_id, is_out)) = trim.peek().clone() else { return };
-                let rows_now = display_tracks(&tracks.read());
-                let Some((time, _)) = crate::media::timeline_hit(
+            onpointermove: move |evt| {
+                drag_trim(
+                    tracks,
+                    library,
+                    *pps.peek(),
+                    *edit_tool.peek() == ToolId::Ripple,
+                    trim,
                     evt.client_coordinates().x,
                     evt.client_coordinates().y,
-                    *pps.peek(),
-                    &rows_now,
-                ) else {
-                    return;
-                };
-                let ripple = *edit_tool.peek() == ToolId::Ripple;
-                if is_out {
-                    crate::media::trim_out_mode(&mut tracks.write(), &clip_id, time, ripple);
-                } else {
-                    crate::media::trim_in_mode(&mut tracks.write(), &clip_id, time, ripple);
-                }
+                );
             },
-            onmouseup: move |_| {
+            onpointerup: move |_| {
                 commit_trim(save, tracks, trim);
             },
-            onmouseleave: move |_| {
+            onpointercancel: move |_| {
                 commit_trim(save, tracks, trim);
             },
             div {
@@ -2114,6 +2107,20 @@ fn Timeline() -> Element {
                                                             name.clone()
                                                         },
                                                         onmousedown: move |evt| {
+                                                            let edge_x = evt.element_coordinates().x;
+                                                            let edge_w = (clip_dur * *pps.peek()).max(24.0);
+                                                            if edge_x <= 12.0 || edge_x >= edge_w - 12.0 {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                studio::hold_film(true);
+                                                                suppress_seek.set(true);
+                                                                selected_clip.set(Some(clip_id.clone()));
+                                                                trim.set(Some((
+                                                                    clip_id.clone(),
+                                                                    edge_x >= edge_w - 12.0,
+                                                                )));
+                                                                return;
+                                                            }
                                                             evt.stop_propagation();
                                                             selected_clip.set(Some(clip_id.clone()));
                                                             target_track.set(from_track.clone());
@@ -2169,23 +2176,71 @@ fn Timeline() -> Element {
                                                             class: "nle-name",
                                                             if clip_uploading { "Saving..." } else { "{name}" }
                                                         }
-                                                        if selected {
-                                                            div {
-                                                                class: "nle-trim in",
-                                                                title: "Trim in",
-                                                                onmousedown: move |evt| {
-                                                                    evt.stop_propagation();
-                                                                    trim.set(Some((trim_in_id.clone(), false)));
-                                                                },
-                                                            }
-                                                            div {
-                                                                class: "nle-trim out",
-                                                                title: "Trim out",
-                                                                onmousedown: move |evt| {
-                                                                    evt.stop_propagation();
-                                                                    trim.set(Some((trim_out_id.clone(), true)));
-                                                                },
-                                                            }
+                                                        div {
+                                                            class: "nle-trim in",
+                                                            title: "Trim the start",
+                                                            onpointerdown: move |evt| {
+                                                                evt.stop_propagation();
+                                                                capture_pointer(&evt);
+                                                                studio::hold_film(true);
+                                                                suppress_seek.set(true);
+                                                                selected_clip.set(Some(trim_in_id.clone()));
+                                                                trim.set(Some((trim_in_id.clone(), false)));
+                                                            },
+                                                            onmousedown: move |evt| {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                            },
+                                                            onpointermove: move |evt| {
+                                                                drag_trim(
+                                                                    tracks,
+                                                                    library,
+                                                                    *pps.peek(),
+                                                                    *edit_tool.peek() == ToolId::Ripple,
+                                                                    trim,
+                                                                    evt.client_coordinates().x,
+                                                                    evt.client_coordinates().y,
+                                                                );
+                                                            },
+                                                            onpointerup: move |_| {
+                                                                commit_trim(save, tracks, trim);
+                                                            },
+                                                            onpointercancel: move |_| {
+                                                                commit_trim(save, tracks, trim);
+                                                            },
+                                                        }
+                                                        div {
+                                                            class: "nle-trim out",
+                                                            title: "Trim the end",
+                                                            onpointerdown: move |evt| {
+                                                                evt.stop_propagation();
+                                                                capture_pointer(&evt);
+                                                                studio::hold_film(true);
+                                                                suppress_seek.set(true);
+                                                                selected_clip.set(Some(trim_out_id.clone()));
+                                                                trim.set(Some((trim_out_id.clone(), true)));
+                                                            },
+                                                            onmousedown: move |evt| {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                            },
+                                                            onpointermove: move |evt| {
+                                                                drag_trim(
+                                                                    tracks,
+                                                                    library,
+                                                                    *pps.peek(),
+                                                                    *edit_tool.peek() == ToolId::Ripple,
+                                                                    trim,
+                                                                    evt.client_coordinates().x,
+                                                                    evt.client_coordinates().y,
+                                                                );
+                                                            },
+                                                            onpointerup: move |_| {
+                                                                commit_trim(save, tracks, trim);
+                                                            },
+                                                            onpointercancel: move |_| {
+                                                                commit_trim(save, tracks, trim);
+                                                            },
                                                         }
                                                     }
                                                 }
@@ -4257,11 +4312,36 @@ fn send_prompt(
     });
 }
 
+fn drag_trim(
+    mut tracks: Signal<Vec<EditorTrack>>,
+    library: Signal<Vec<MediaItem>>,
+    pps: f64,
+    ripple: bool,
+    trim: Signal<Option<(String, bool)>>,
+    client_x: f64,
+    client_y: f64,
+) {
+    let Some((clip_id, is_out)) = trim.peek().clone() else {
+        return;
+    };
+    let rows = display_tracks(&tracks.read());
+    let Some((time, _)) = crate::media::timeline_hit(client_x, client_y, pps, &rows) else {
+        return;
+    };
+    let media_len = crate::media::media_duration_for(&library.read(), &tracks.read(), &clip_id);
+    if is_out {
+        crate::media::trim_out_mode(&mut tracks.write(), &clip_id, time, ripple, media_len);
+    } else {
+        crate::media::trim_in_mode(&mut tracks.write(), &clip_id, time, ripple, media_len);
+    }
+}
+
 fn commit_trim(
     save: WorkspaceSave,
     tracks: Signal<Vec<EditorTrack>>,
     mut trim: Signal<Option<(String, bool)>>,
 ) {
+    studio::hold_film(false);
     let Some((clip_id, _)) = trim.peek().clone() else {
         return;
     };

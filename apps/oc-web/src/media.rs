@@ -104,11 +104,18 @@ pub fn format_tc_short(secs: f64) -> String {
     }
 }
 
-pub fn trim_in_mode(tracks: &mut [EditorTrack], clip_id: &str, new_start: f64, ripple: bool) {
+pub fn trim_in_mode(
+    tracks: &mut [EditorTrack],
+    clip_id: &str,
+    new_start: f64,
+    ripple: bool,
+    media_len: Option<f64>,
+) {
     let Some((ti, ci)) = locate_clip(tracks, clip_id) else {
         return;
     };
     let clip = &tracks[ti].clips[ci];
+    let speed = play_speed(clip.speed);
     let mut start = new_start.max(0.0);
     let max_start = clip.end() - 0.05;
     if start > max_start {
@@ -121,6 +128,16 @@ pub fn trim_in_mode(tracks: &mut [EditorTrack], clip_id: &str, new_start: f64, r
         .map(TimelineClip::end)
         .fold(0.0, f64::max);
     start = start.max(prev_end);
+    // The head can move back only through source that exists before source_in.
+    let earliest = clip.start - clip.source_in / speed;
+    start = start.max(earliest);
+    if let Some(media) = finite_media(media_len) {
+        let source_out = clip.source_in + clip.duration * speed;
+        if source_out > media + 0.02 {
+            // The tail is already past the file. Extending the head would invent more.
+            start = start.max(clip.start);
+        }
+    }
     let delta = start - clip.start;
     if delta.abs() < 1e-4 {
         return;
@@ -134,7 +151,13 @@ pub fn trim_in_mode(tracks: &mut [EditorTrack], clip_id: &str, new_start: f64, r
     }
 }
 
-pub fn trim_out_mode(tracks: &mut [EditorTrack], clip_id: &str, new_end: f64, ripple: bool) {
+pub fn trim_out_mode(
+    tracks: &mut [EditorTrack],
+    clip_id: &str,
+    new_end: f64,
+    ripple: bool,
+    media_len: Option<f64>,
+) {
     let Some((ti, ci)) = locate_clip(tracks, clip_id) else {
         return;
     };
@@ -152,10 +175,42 @@ pub fn trim_out_mode(tracks: &mut [EditorTrack], clip_id: &str, new_end: f64, ri
             end = end.min(next);
         }
     }
+    if let Some(media) = finite_media(media_len) {
+        let speed = play_speed(clip.speed);
+        let room = ((media - clip.source_in) / speed).max(0.05);
+        end = end.min(clip.start + room);
+    }
     tracks[ti].clips[ci].duration = (end - tracks[ti].clips[ci].start).max(0.05);
     if ripple {
         let delta = tracks[ti].clips[ci].end() - old_end;
         shift_after(&mut tracks[ti], clip_id, delta);
+    }
+}
+
+pub fn media_duration_for(
+    library: &[MediaItem],
+    tracks: &[EditorTrack],
+    clip_id: &str,
+) -> Option<f64> {
+    let media_id = tracks
+        .iter()
+        .flat_map(|track| track.clips.iter())
+        .find(|clip| clip.id == clip_id)?
+        .media_id
+        .as_str();
+    let duration = library.iter().find(|item| item.id == media_id)?.duration;
+    finite_media(Some(duration))
+}
+
+fn finite_media(len: Option<f64>) -> Option<f64> {
+    len.filter(|len| len.is_finite() && *len > 0.05)
+}
+
+fn play_speed(speed: f64) -> f64 {
+    if speed.is_finite() && speed > 0.05 {
+        speed.clamp(0.25, 4.0)
+    } else {
+        1.0
     }
 }
 
@@ -876,12 +931,7 @@ fn space_from(tracks: &mut [EditorTrack], delta: f64, origin: f64) {
 }
 
 fn scaled_source(speed: f64, timeline_delta: f64) -> f64 {
-    let speed = if speed.is_finite() && speed > 0.05 {
-        speed.clamp(0.25, 4.0)
-    } else {
-        1.0
-    };
-    timeline_delta * speed
+    timeline_delta * play_speed(speed)
 }
 
 fn push_clip(track: &mut EditorTrack, media_id: String, start: f64, duration: f64, source_in: f64) {
@@ -1677,6 +1727,11 @@ pub fn apply_monitor_look(
             let fade = clip.look.fade_gain(local, clip.duration.as_seconds());
             match &clip.kind {
                 oc_core::ClipKind::Video { .. } => {
+                    // Design and the corner window have their own elements.
+                    // Sampling them here would scale the speaker instead.
+                    if is_overlay_track(&track.name) {
+                        continue;
+                    }
                     let pose = oc_core::compositor::clip_pose(clip, t);
                     zoom = pose.scale;
                     pan_x = pose.x;
@@ -1995,16 +2050,27 @@ fn paint_design(
         hide_design();
         return;
     }
+    let pose = oc_core::compositor::clip_pose(clip, t);
+    let into = (now - clip.start.as_seconds()).max(0.0);
+    let faded = clip.look.fade_gain(into, clip.duration.as_seconds());
+    let motion = if (pose.scale - 1.0).abs() > 0.01 || pose.x.abs() > 0.5 || pose.y.abs() > 0.5 {
+        format!(
+            "transform:scale({:.3}) translate({:.1}px,{:.1}px);transform-origin:center center;",
+            pose.scale, pose.x, pose.y
+        )
+    } else {
+        String::new()
+    };
     let style = if let Some(card) = clip.look.card {
         format!(
-            "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;",
+            "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;opacity:{faded:.3};{motion}",
             card.x * 100.0,
             card.y * 100.0,
             card.w * 100.0,
             card.h * 100.0
         )
     } else {
-        "left:0;top:0;width:100%;height:100%;".to_string()
+        format!("left:0;top:0;width:100%;height:100%;opacity:{faded:.3};{motion}")
     };
     if item.kind == MediaKind::Video {
         set_class_off(".preview-design", true);
@@ -2082,12 +2148,18 @@ fn frame_timing(engine: &oc_core::Timeline, shot: &ProgramShot, now: f64) -> (f6
         })
     });
     if let Some(clip) = clip {
-        let src = clip
-            .source_time_at(t)
-            .map(|time| time.as_seconds())
-            .unwrap_or(shot.source_in);
-        let rate = f64::from(clip.speed_at(t)).clamp(0.25, 4.0);
-        return (src.max(0.0), rate, clip.ramps());
+        // A trim updates the editor shot before the engine copy is committed.
+        // Matching only the start would keep playing the old tail.
+        let same = (clip.duration.as_seconds() - shot.duration).abs() < 0.04
+            && (clip.source_in.as_seconds() - shot.source_in).abs() < 0.04;
+        if same {
+            let src = clip
+                .source_time_at(t)
+                .map(|time| time.as_seconds())
+                .unwrap_or(shot.source_in);
+            let rate = f64::from(clip.speed_at(t)).clamp(0.25, 4.0);
+            return (src.max(0.0), rate, clip.ramps());
+        }
     }
     let rate = shot.speed.clamp(0.25, 4.0);
     let src = shot.source_in + (now - shot.start).max(0.0) * rate;
@@ -2265,15 +2337,8 @@ pub fn sync_monitor(
             } else {
                 HOLD_SINCE.with(|cell| cell.set(0.0));
             }
-
-            // Wall clock owns the playhead. Catch up only when the picture is ahead.
-            if playing && !video.paused() && ready && !near_end && !wall && !past_file {
-                let derived = shot.start + (video.current_time() - shot.source_in) / rate;
-                if derived.is_finite() && derived > now + 0.15 {
-                    set_playhead(derived.clamp(shot.start, shot.start + take - 1e-3));
-                    LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
-                }
-            }
+            // The wall clock owns the playhead. Following the video clock here
+            // skips a push, a dissolve, or a caption pop when this tick stalled.
 
             let a_front = !front_is_b();
             set_class_off(".preview-video", !a_front);
@@ -2388,6 +2453,36 @@ mod tests {
             (tracks[0].clips[0].duration - 5.0).abs() < 1e-6,
             "must not cover the next clip"
         );
+    }
+
+    #[test]
+    fn trim_out_stops_at_the_end_of_the_file() {
+        let mut tracks = vec![video_track(vec![clip("c1", "a", 0.0, 4.0)])];
+        trim_out_mode(&mut tracks, "c1", 20.0, false, Some(5.0));
+        assert!((tracks[0].clips[0].duration - 5.0).abs() < 1e-6);
+        trim_out_mode(&mut tracks, "c1", 2.0, false, Some(5.0));
+        assert!((tracks[0].clips[0].duration - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trim_in_cannot_start_before_the_file() {
+        let mut tracks = vec![video_track(vec![clip("c1", "a", 2.0, 3.0)])];
+        tracks[0].clips[0].source_in = 0.4;
+        trim_in_mode(&mut tracks, "c1", 0.0, false, Some(10.0));
+        let clip = &tracks[0].clips[0];
+        assert!(clip.source_in.abs() < 1e-3, "{}", clip.source_in);
+        assert!((clip.start - 1.6).abs() < 1e-3, "{}", clip.start);
+        assert!((clip.duration - 3.4).abs() < 1e-3, "{}", clip.duration);
+    }
+
+    #[test]
+    fn trim_out_still_stops_at_the_next_clip() {
+        let mut tracks = vec![video_track(vec![
+            clip("c1", "a", 0.0, 4.0),
+            clip("c2", "b", 4.0, 4.0),
+        ])];
+        trim_out_mode(&mut tracks, "c1", 10.0, false, Some(30.0));
+        assert!((tracks[0].clips[0].duration - 4.0).abs() < 1e-6);
     }
 
     #[test]
@@ -3159,7 +3254,9 @@ fn paint_program(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
         return;
     };
     let plan = oc_core::compositor::plan_frame(engine, oc_core::Time::from_seconds(now));
-    if !plan.needs_paint {
+    // A move, a join, or a design clip is already on a video element. Painting it
+    // grabs a still, stalls this tick, and the playhead steps past the animation.
+    if oc_core::compositor::video_element_can_show(&plan) {
         set_class_off("#program-canvas", true);
         return;
     }

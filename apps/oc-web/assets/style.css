@@ -1248,13 +1248,15 @@ button:disabled { opacity: 0.45; cursor: default; }
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 7px;
-  z-index: 4;
+  width: 10px;
+  z-index: 5;
   cursor: col-resize;
+  touch-action: none;
 }
 .nle-trim.in { left: 0; }
 .nle-trim.out { right: 0; }
-.nle-trim:hover { background: rgba(240, 192, 0, 0.45); }
+.nle-clip:hover .nle-trim,
+.nle-clip.on .nle-trim { background: rgba(240, 192, 0, 0.55); }
 .nle-name {
   position: absolute;
   top: 2px;
@@ -1269,7 +1271,11 @@ button:disabled { opacity: 0.45; cursor: default; }
   background: rgba(0, 0, 0, 0.5);
   border-radius: 2px;
   pointer-events: none;
+  opacity: 0;
 }
+.nle-clip:hover .nle-name,
+.nle-clip.on .nle-name,
+.nle-clip.ghost .nle-name { opacity: 1; }
 .zoom {
   color: var(--muted);
   font-size: 11px;

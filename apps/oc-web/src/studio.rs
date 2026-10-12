@@ -17,6 +17,16 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlVideoElement};
 thread_local! {
     static WAVES: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
     static FILM: RefCell<FilmCache> = RefCell::new(FilmCache::default());
+    static FILM_HOLD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Pause filmstrip seeks while a trim is dragging or the monitor is playing.
+pub fn hold_film(on: bool) {
+    FILM_HOLD.with(|cell| cell.set(on));
+}
+
+fn film_held() -> bool {
+    FILM_HOLD.with(Cell::get)
 }
 
 struct FilmCache {
@@ -971,16 +981,22 @@ pub fn film_sample_times(start: f64, end: f64, tiles: i32) -> Vec<f64> {
         .collect()
 }
 
-/// One JPEG per column. A single decoded frame fills every column until the
-/// rest of the strip is ready.
+/// Distinct stills across the clip. The same JPEG is not copied into the next column.
 pub fn film_picks(frames: &[(f64, &str)], start: f64, end: f64, tiles: i32) -> Vec<String> {
     if frames.is_empty() {
         return Vec::new();
     }
-    film_sample_times(start, end, tiles)
-        .into_iter()
-        .filter_map(|at| nearest_frame(frames, at).map(str::to_string))
-        .collect()
+    let mut picks = Vec::new();
+    for at in film_sample_times(start, end, tiles) {
+        let Some(src) = nearest_frame(frames, at) else {
+            continue;
+        };
+        if picks.last().is_some_and(|prev: &String| prev == src) {
+            continue;
+        }
+        picks.push(src.to_string());
+    }
+    picks
 }
 
 fn nearest_frame<'a>(frames: &'a [(f64, &'a str)], at: f64) -> Option<&'a str> {
@@ -1072,18 +1088,38 @@ fn film_request(url: &str, media_id: &str, times: &[f64]) {
     }
 }
 
+const FILM_FRAMES: usize = 4;
+
 async fn film_pump() {
     loop {
+        if film_held() || monitor_is_playing() {
+            gloo_timers::future::TimeoutFuture::new(180).await;
+            let pending = FILM.with(|film| !film.borrow().wishes.is_empty());
+            if !pending {
+                break;
+            }
+            continue;
+        }
         let loaded = film_loaded_url();
         let next = FILM.with(|film| take_next_wish(&mut film.borrow_mut(), loaded.as_deref()));
         let Some((url, at)) = next else {
             break;
         };
-        if film_has_picture(&url) {
+        if film_is_still(&url) || film_failed(&url) {
             continue;
         }
-        if remember_poster(&url).await {
+        if frame_near(&url, at) {
             continue;
+        }
+        if stored_count(&url) >= FILM_FRAMES {
+            drop_wishes(&url);
+            continue;
+        }
+        if !film_has_picture(&url) {
+            let _ = remember_poster(&url).await;
+            if frame_near(&url, at) {
+                continue;
+            }
         }
         match decode_url(&url, &[at]).await {
             Picture::Ready => {}
@@ -1098,8 +1134,45 @@ async fn film_pump() {
                 }
             }
         }
+        // Yield so a seek does not freeze the monitor and the trim drag.
+        gloo_timers::future::TimeoutFuture::new(40).await;
     }
     FILM.with(|film| film.borrow_mut().decoding = false);
+}
+
+fn monitor_is_playing() -> bool {
+    crate::media::preview_video().is_some_and(|video| !video.paused() && !video.ended())
+}
+
+fn film_failed(url: &str) -> bool {
+    FILM.with(|film| film.borrow().failed.contains(url))
+}
+
+fn stored_count(url: &str) -> usize {
+    FILM.with(|film| {
+        film.borrow()
+            .frames
+            .get(url)
+            .map(Vec::len)
+            .unwrap_or(0)
+    })
+}
+
+fn frame_near(url: &str, at: f64) -> bool {
+    FILM.with(|film| {
+        film.borrow()
+            .frames
+            .get(url)
+            .is_some_and(|frames| frames.iter().any(|(got, _)| (got - at).abs() < 0.35))
+    })
+}
+
+fn drop_wishes(url: &str) {
+    FILM.with(|film| {
+        film.borrow_mut()
+            .wishes
+            .retain(|(wish, _)| wish != url);
+    });
 }
 
 fn film_has_picture(url: &str) -> bool {
@@ -1160,7 +1233,27 @@ async fn remember_poster(url: &str) -> bool {
     let Ok(Some(bytes)) = crate::hold::load_poster(&project, &media).await else {
         return false;
     };
-    store_still(url, &bytes)
+    // A poster is the first still, not a reason to tile it or to stop sampling.
+    store_poster_frame(url, &bytes)
+}
+
+fn store_poster_frame(url: &str, jpeg: &[u8]) -> bool {
+    if film_has_picture(url) {
+        return false;
+    }
+    let Some(src) = crate::media::blob_url(jpeg, "image/jpeg") else {
+        return false;
+    };
+    FILM.with(|film| {
+        let mut film = film.borrow_mut();
+        let frames = film.frames.entry(url.to_string()).or_default();
+        if frames.is_empty() {
+            frames.push((0.0, src));
+        }
+        film.failed.remove(url);
+    });
+    notify_film();
+    true
 }
 
 async fn fetch_poster(url: &str) -> bool {
@@ -1242,7 +1335,7 @@ fn film_video() -> Option<HtmlVideoElement> {
     video.set_preload("auto");
     let _ = video.set_attribute(
         "style",
-        "position:fixed;width:160px;height:90px;left:0;top:0;opacity:0;pointer-events:none;z-index:-1",
+        "position:fixed;width:2px;height:2px;left:0;top:0;opacity:0;pointer-events:none;z-index:-1",
     );
     doc.body()?.append_child(&video).ok()?;
     Some(video)
@@ -1408,13 +1501,14 @@ async fn grab_jpeg(video: &HtmlVideoElement) -> Option<String> {
 fn thumb_px(video: &HtmlVideoElement) -> (u32, u32) {
     let w = video.video_width().max(1);
     let h = video.video_height().max(1);
+    // Small JPEGs. A 160px grab of every column was enough to hitch the editor.
     if h > w {
-        let height = 160u32;
-        let width = ((160.0 * f64::from(w) / f64::from(h)).round() as u32).clamp(48, 160);
+        let height = 96u32;
+        let width = ((96.0 * f64::from(w) / f64::from(h)).round() as u32).clamp(36, 96);
         (width, height)
     } else {
-        let width = 160u32;
-        let height = ((160.0 * f64::from(h) / f64::from(w)).round() as u32).clamp(48, 160);
+        let width = 96u32;
+        let height = ((96.0 * f64::from(h) / f64::from(w)).round() as u32).clamp(36, 96);
         (width, height)
     }
 }
@@ -1591,19 +1685,17 @@ mod tests {
         assert!(!super::browser_needs_still(1920));
         let frames = [(0.4, "still")];
         let picks = super::film_picks(&frames, 0.0, 12.0, 5);
-        assert_eq!(picks.len(), 5);
-        assert!(picks.iter().all(|src| src == "still"));
+        assert_eq!(picks, vec!["still".to_string()]);
     }
 
     #[test]
-    fn one_decoded_frame_fills_the_strip_until_the_rest_arrive() {
+    fn one_decoded_frame_does_not_tile_the_strip() {
         let frames = [(1.5, "early"), (8.0, "late")];
         let picks = super::film_picks(&frames, 0.0, 10.0, 2);
         assert_eq!(picks, vec!["early".to_string(), "late".to_string()]);
         let only = [(1.5, "early")];
         let filled = super::film_picks(&only, 0.0, 10.0, 4);
-        assert_eq!(filled.len(), 4);
-        assert!(filled.iter().all(|src| src == "early"));
+        assert_eq!(filled, vec!["early".to_string()]);
         assert!(super::film_picks(&[], 0.0, 10.0, 3).is_empty());
     }
 }
