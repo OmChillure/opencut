@@ -583,7 +583,7 @@ pub(crate) async fn place_captions(
                 !row.content_type.starts_with("image/") && !oc_db::is_r2_object_key(&row.r2_key)
             });
         let note = if browser_only {
-            "no words yet. These clips stay in the browser that imported them, so a transcript cannot run.".to_string()
+            "no words yet. This browser has not stored a transcript for these clips.".to_string()
         } else {
             format!("no words yet — queued {queued} transcript(s). Try again when they finish.")
         };

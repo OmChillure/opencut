@@ -1083,10 +1083,10 @@ pub fn blob_url(bytes: &[u8], mime: &str) -> Option<String> {
     Url::create_object_url_with_blob(&blob).ok()
 }
 
-pub fn item_from_bytes_id(name: String, bytes: &[u8], id: String) -> Option<MediaItem> {
+pub fn item_from_blob(name: String, blob: &Blob, id: String) -> Option<MediaItem> {
     let kind = MediaKind::from_name(&name);
     let content_type = MediaKind::mime(&name).to_string();
-    let url = blob_url(bytes, &content_type)?;
+    let url = Url::create_object_url_with_blob(blob).ok()?;
     Some(MediaItem {
         id,
         name,

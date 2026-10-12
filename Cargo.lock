@@ -3343,6 +3343,7 @@ dependencies = [
  "oc-db",
  "oc-media",
  "oc-providers",
+ "oc-voice",
  "serde",
  "serde_json",
  "tokio",

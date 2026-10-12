@@ -99,16 +99,114 @@ pub async fn register_media(
     Ok(())
 }
 
-/// Register the clip, and keep the bytes in this browser. Nothing is sent to Cloudflare.
-pub async fn store_imported(
+/// Register the clip and keep the blob in this browser.
+/// The picture is not copied into Rust and is not sent to Cloudflare.
+pub async fn keep_imported_blob(
     project_id: &str,
     media_id: &str,
     filename: &str,
     content_type: &str,
-    bytes: Vec<u8>,
+    blob: &web_sys::Blob,
 ) -> Result<(), String> {
-    crate::hold::save_file(project_id, media_id, filename, content_type, &bytes).await?;
+    if blob.size() <= 0.0 {
+        return Err("empty clip".into());
+    }
+    crate::hold::save_blob(project_id, media_id, filename, content_type, blob).await?;
     register_media(project_id, media_id, filename, content_type, 0.0).await
+}
+
+/// Keep the blob, then read speech. A still skips speech.
+pub async fn store_imported_blob(
+    project_id: &str,
+    media_id: &str,
+    filename: &str,
+    content_type: &str,
+    blob: &web_sys::Blob,
+) -> Result<(), String> {
+    keep_imported_blob(project_id, media_id, filename, content_type, blob).await?;
+    transcribe_blob(project_id, media_id, content_type, blob).await
+}
+
+pub async fn transcribe_blob(
+    project_id: &str,
+    media_id: &str,
+    content_type: &str,
+    blob: &web_sys::Blob,
+) -> Result<(), String> {
+    if !should_send_speech(content_type, false) {
+        return Ok(());
+    }
+    store_speech_blob(project_id, media_id, content_type, blob).await
+}
+
+/// A still has no speech. A clip that already has words is not sent again.
+fn should_send_speech(content_type: &str, already_stored: bool) -> bool {
+    !already_stored && !content_type.starts_with("image/")
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SpeechOut {
+    stored: bool,
+}
+
+async fn speech_status(project_id: &str, media_id: &str) -> Result<SpeechOut, String> {
+    get_json(&format!(
+        "{API}/v1/projects/{project_id}/media/{media_id}/speech"
+    ))
+    .await
+}
+
+/// Store the transcript for one clip this browser holds. A clip that already has
+/// words is left alone, so the file is not sent again. The body is the blob.
+async fn store_speech_blob(
+    project_id: &str,
+    media_id: &str,
+    content_type: &str,
+    blob: &web_sys::Blob,
+) -> Result<(), String> {
+    let status = speech_status(project_id, media_id).await?;
+    if !should_send_speech(content_type, status.stored) {
+        return Ok(());
+    }
+    if blob.size() <= 0.0 {
+        return Err("empty clip".into());
+    }
+    put_blob(
+        &format!("{API}/v1/projects/{project_id}/media/{media_id}/speech"),
+        blob,
+    )
+    .await
+}
+
+/// Read every clip this browser holds that does not yet have a transcript.
+/// Each blob is sent on its own. The pictures are not loaded into Rust together.
+pub async fn ensure_speech(project_id: &str) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return ensure_speech_wasm(project_id).await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = project_id;
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn ensure_speech_wasm(project_id: &str) -> Result<(), String> {
+    let held = crate::hold::list_for_project(project_id).await?;
+    for file in held {
+        if !should_send_speech(&file.content_type, false) {
+            continue;
+        }
+        let status = speech_status(project_id, &file.id).await?;
+        if !should_send_speech(&file.content_type, status.stored) {
+            continue;
+        }
+        let blob = crate::hold::load_blob(project_id, &file.id).await?;
+        store_speech_blob(project_id, &file.id, &file.content_type, &blob).await?;
+    }
+    Ok(())
 }
 
 /// A server play URL. A blob, or an empty URL, is not one: the picture stays in the browser.
@@ -393,11 +491,24 @@ pub async fn watch_export(project_id: &str, preset: &str) -> Result<ExportWatch,
 }
 
 /// Send this browser's timeline clips to the render spool. Server clips are left alone.
-/// Nothing is written to Cloudflare here.
+/// Nothing is written to Cloudflare here. Each clip is one blob, not a Rust copy.
 pub async fn send_browser_sources(project_id: &str) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return send_browser_sources_wasm(project_id).await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = project_id;
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_browser_sources_wasm(project_id: &str) -> Result<(), String> {
     let project = get_project(project_id).await?;
     let media = list_media(project_id).await?;
-    let held = crate::hold::files_for_project(project_id).await?;
+    let held = crate::hold::list_for_project(project_id).await?;
     let clips = project
         .timeline
         .source_media_ids()
@@ -417,31 +528,74 @@ pub async fn send_browser_sources(project_id: &str) -> Result<(), String> {
         .collect::<Vec<_>>();
     let ids = oc_core::timeline::browser_spool_ids(&clips)?;
     for id in ids {
-        let file = held
-            .iter()
-            .find(|file| file.id == id)
-            .ok_or_else(|| format!("These clips are not in this browser: {id}"))?;
-        spool_media(project_id, &file.id, file.bytes.clone()).await?;
+        let blob = crate::hold::load_blob(project_id, &id)
+            .await
+            .map_err(|_| format!("These clips are not in this browser: {id}"))?;
+        put_blob(
+            &format!("{API}/v1/projects/{project_id}/media/{id}/spool"),
+            &blob,
+        )
+        .await?;
     }
     Ok(())
 }
 
-async fn spool_media(project_id: &str, media_id: &str, bytes: Vec<u8>) -> Result<(), String> {
-    let res = authed(
-        reqwest::Client::new()
-            .put(format!(
-                "{API}/v1/projects/{project_id}/media/{media_id}/spool"
-            ))
-            .header("content-type", "application/octet-stream"),
-    )
-    .body(bytes)
-    .send()
-    .await
-    .map_err(|e| e.to_string())?;
-    if res.status().is_success() {
+/// PUT a blob. The browser streams it. Rust does not take a second copy.
+async fn put_blob(url: &str, blob: &web_sys::Blob) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_put_blob(url, blob).await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (url, blob);
+        Err("a clip is sent from the browser".into())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn wasm_put_blob(url: &str, blob: &web_sys::Blob) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    let window = web_sys::window().ok_or_else(|| "no browser window".to_string())?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("PUT");
+    init.set_body(blob.as_ref());
+    let request = web_sys::Request::new_with_str_and_init(url, &init).map_err(js_err)?;
+    let _ = request
+        .headers()
+        .set("content-type", "application/octet-stream");
+    if let Some(token) = signed_token() {
+        let _ = request.headers().set("x-opencut-token", &token);
+    }
+    let resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(js_err)?;
+    let resp: web_sys::Response = resp
+        .dyn_into()
+        .map_err(|_| "the clip request failed".to_string())?;
+    if resp.ok() {
         return Ok(());
     }
-    Err(api_error_message(res).await)
+    let text = match resp.text() {
+        Ok(promise) => wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .ok()
+            .and_then(|value| value.as_string())
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    #[derive(Deserialize)]
+    struct ApiErr {
+        error: String,
+    }
+    if let Ok(body) = serde_json::from_str::<ApiErr>(&text) {
+        return Err(body.error);
+    }
+    if text.trim().is_empty() {
+        Err(format!("HTTP {}", resp.status()))
+    } else {
+        Err(text)
+    }
 }
 
 /// Ask for one JPEG of a clip this browser cannot decode. `source_url` is the
@@ -460,24 +614,6 @@ pub async fn request_poster(
         let _ = (project_id, media_id, source_url);
         Err("a still is made in the browser".into())
     }
-}
-
-async fn api_error_message(res: reqwest::Response) -> String {
-    #[derive(Deserialize)]
-    struct ApiErr {
-        error: String,
-    }
-    let status = res.status();
-    let text = res.text().await.unwrap_or_default();
-    serde_json::from_str::<ApiErr>(&text)
-        .map(|body| body.error)
-        .unwrap_or_else(|_| {
-            if text.trim().is_empty() {
-                format!("HTTP {}", status.as_u16())
-            } else {
-                text
-            }
-        })
 }
 
 pub async fn open_session(email: &str, password: &str) -> Result<(String, String), String> {
@@ -1053,6 +1189,15 @@ mod tests {
         assert!(reply.export_handoff);
         let err = take_stream_line(r#"{"type":"error","text":"the model stopped"}"#, &mut reply);
         assert_eq!(err.unwrap_err(), "the model stopped");
+    }
+
+    #[test]
+    fn speech_is_not_sent_again_or_for_a_still() {
+        assert!(should_send_speech("video/mp4", false));
+        assert!(should_send_speech("audio/mpeg", false));
+        assert!(!should_send_speech("video/mp4", true));
+        assert!(!should_send_speech("image/jpeg", false));
+        assert!(!should_send_speech("image/png", true));
     }
 
     #[test]

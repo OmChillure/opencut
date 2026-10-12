@@ -1066,6 +1066,146 @@ pub async fn put_media_spool(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[derive(Serialize)]
+pub(crate) struct SpeechOut {
+    stored: bool,
+    cues: i64,
+}
+
+/// Whether this clip already has a transcript row. The picture stays in the browser.
+pub async fn get_media_speech(
+    State(state): State<AppState>,
+    Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
+) -> ApiResult<Json<SpeechOut>> {
+    owned(&state, id, &email).await?;
+    let media = speech_media(&state, id, media_id).await?;
+    speech_out(&state, &media).await
+}
+
+/// Read this browser's clip once and store the transcript. The file is not kept,
+/// the media key stays `workspace/`, and a later cut uses the stored words.
+pub async fn put_media_speech(
+    State(state): State<AppState>,
+    Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<SpeechOut>> {
+    owned(&state, id, &email).await?;
+    let media = speech_media(&state, id, media_id).await?;
+    if oc_db::has_transcript(&state.db, media_id)
+        .await
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()))?
+    {
+        return speech_out(&state, &media).await;
+    }
+    if body.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty clip"));
+    }
+    let transcript = transcript_from_bytes(&body).await.map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("could not read speech: {err}"),
+        )
+    })?;
+    let cues = transcript.cues.len() as i64;
+    save_transcript_row(&state.db, media_id, &transcript)
+        .await
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()))?;
+    tracing::info!(project = %id, media = %media_id, cues, "speech stored");
+    Ok(Json(SpeechOut { stored: true, cues }))
+}
+
+async fn speech_media(
+    state: &AppState,
+    project_id: Uuid,
+    media_id: Uuid,
+) -> Result<oc_db::MediaRow, ApiError> {
+    let media = oc_db::get_media(&state.db, media_id).await?;
+    if media.project_id != project_id {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
+    }
+    if media.content_type.starts_with("image/") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "images are not transcribed",
+        ));
+    }
+    Ok(media)
+}
+
+async fn speech_out(state: &AppState, media: &oc_db::MediaRow) -> Result<Json<SpeechOut>, ApiError> {
+    let stored = oc_db::has_transcript(&state.db, media.id).await?;
+    let cues = if stored {
+        oc_db::count_transcript_cues(&state.db, media.id).await?
+    } else {
+        0
+    };
+    Ok(Json(SpeechOut { stored, cues }))
+}
+
+async fn transcript_from_bytes(bytes: &[u8]) -> Result<oc_voice::Transcript, String> {
+    let dir = std::env::temp_dir().join(format!("oc-speech-{}", Uuid::now_v7()));
+    let _guard = PosterDir(dir.clone());
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|err| err.to_string())?;
+    let input = dir.join("source.bin");
+    tokio::fs::write(&input, bytes)
+        .await
+        .map_err(|err| err.to_string())?;
+    match oc_voice::transcribe_path(&input).await {
+        Ok(transcript) => Ok(transcript),
+        Err(err) if ffmpeg_has_no_audio(&err.to_string()) => Ok(oc_voice::Transcript {
+            language: None,
+            full_text: String::new(),
+            cues: Vec::new(),
+        }),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn ffmpeg_has_no_audio(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("does not contain any stream")
+        || message.contains("output file does not contain")
+        || message.contains("no wav written")
+}
+
+async fn save_transcript_row(
+    db: &oc_db::Db,
+    media_id: Uuid,
+    transcript: &oc_voice::Transcript,
+) -> Result<(), oc_db::DbError> {
+    let raw = serde_json::to_value(transcript).unwrap_or_else(|_| serde_json::json!({}));
+    let owned: Vec<(i64, i64, String, Option<String>)> = transcript
+        .cues
+        .iter()
+        .map(|cue| {
+            (
+                cue.start.as_ticks(),
+                cue.end.as_ticks(),
+                cue.text.clone(),
+                cue.speaker.clone(),
+            )
+        })
+        .collect();
+    let refs: Vec<(i64, i64, &str, Option<&str>)> = owned
+        .iter()
+        .map(|(start, end, text, speaker)| (*start, *end, text.as_str(), speaker.as_deref()))
+        .collect();
+    oc_db::insert_transcript(
+        db,
+        media_id,
+        transcript.language.as_deref(),
+        &transcript.full_text,
+        &raw,
+        &refs,
+    )
+    .await?;
+    Ok(())
+}
+
 /// One JPEG for a clip this browser cannot decode. The upload is a temp file and
 /// is deleted before this returns. It is not a spool, not `OPENCUT_MEDIA_DIR`, and not R2.
 pub async fn post_media_poster(
@@ -1904,6 +2044,15 @@ pub async fn save_chat_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clip_with_no_audio_is_a_stored_silence() {
+        assert!(ffmpeg_has_no_audio(
+            "ffmpeg failed: Output file does not contain any stream"
+        ));
+        assert!(ffmpeg_has_no_audio("no wav written"));
+        assert!(!ffmpeg_has_no_audio("groq stt http: connection timed out"));
+    }
 
     #[test]
     fn upload_complete_waits_for_an_r2_object() {

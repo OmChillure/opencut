@@ -601,6 +601,22 @@ pub async fn finish_job(pool: &Db, id: Uuid, error: Option<&str>) -> Result<(), 
     Ok(())
 }
 
+/// Cue count on the newest transcript. Zero when that read found no words.
+pub async fn count_transcript_cues(pool: &Db, media_id: Uuid) -> Result<i64, DbError> {
+    let row = query_as::<(i64,)>(
+        "select count(*)::bigint from cues c
+         join transcripts t on t.id = c.transcript_id
+         where t.media_id = $1
+           and t.created_at = (
+             select max(t2.created_at) from transcripts t2 where t2.media_id = $1
+           )",
+    )
+    .bind(media_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 pub async fn has_transcript(pool: &Db, media_id: Uuid) -> Result<bool, DbError> {
     let row = query_as::<(Uuid,)>("select id from transcripts where media_id = $1 limit 1")
         .bind(media_id)

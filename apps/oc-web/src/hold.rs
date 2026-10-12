@@ -4,18 +4,39 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
-use web_sys::IdbTransactionMode;
+use web_sys::{Blob, BlobPropertyBag, IdbTransactionMode};
 
 const DB_NAME: &str = "opencut-media";
 const STORE: &str = "files";
 const DB_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HeldFile {
+pub struct HeldMeta {
     pub id: String,
     pub name: String,
     pub content_type: String,
-    pub bytes: Vec<u8>,
+}
+
+/// How a stored clip sits in IndexedDB.
+/// A video copied into a Rust `Vec` fills the wasm heap, and Chrome then kills
+/// the tab while speech is read (Aw, Snap, error code 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoldBody {
+    /// Blob handle. Reading the record does not copy the picture into Rust.
+    Blob,
+    /// Older record that stored a byte array. Wrap it once, then drop the array.
+    LegacyBytes,
+    Missing,
+}
+
+pub(crate) fn hold_body(has_blob: bool, has_bytes: bool) -> HoldBody {
+    if has_blob {
+        HoldBody::Blob
+    } else if has_bytes {
+        HoldBody::LegacyBytes
+    } else {
+        HoldBody::Missing
+    }
 }
 
 #[must_use]
@@ -50,12 +71,32 @@ pub fn project_of_key(key: &str) -> Option<&str> {
     }
 }
 
-pub async fn save_file(
+/// Keep a clip as a Blob. The bytes are not copied into Rust.
+pub async fn save_blob(
     project_id: &str,
     media_id: &str,
     name: &str,
     content_type: &str,
-    bytes: &[u8],
+    blob: &Blob,
+) -> Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (project_id, media_id, name, content_type, blob);
+        return Err("a clip is stored in the browser".into());
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        save_blob_wasm(project_id, media_id, name, content_type, blob).await
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn save_blob_wasm(
+    project_id: &str,
+    media_id: &str,
+    name: &str,
+    content_type: &str,
+    blob: &Blob,
 ) -> Result<(), String> {
     let db = open_db().await?;
     let tx = db
@@ -67,9 +108,7 @@ pub async fn save_file(
     set_field(&record, "id", &JsValue::from_str(media_id))?;
     set_field(&record, "name", &JsValue::from_str(name))?;
     set_field(&record, "content_type", &JsValue::from_str(content_type))?;
-    let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-    array.copy_from(bytes);
-    set_field(&record, "bytes", &array)?;
+    set_field(&record, "blob", blob.as_ref())?;
     let req = store
         .put_with_key(&record, &JsValue::from_str(&hold_key(project_id, media_id)))
         .map_err(js_err)?;
@@ -77,51 +116,155 @@ pub async fn save_file(
     Ok(())
 }
 
+/// A still is small. The video path uses [`save_blob`] so the picture never enters wasm.
+#[cfg(target_arch = "wasm32")]
+async fn save_file(
+    project_id: &str,
+    media_id: &str,
+    name: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+    array.copy_from(bytes);
+    let parts = js_sys::Array::of1(&array);
+    let opts = BlobPropertyBag::new();
+    opts.set_type(content_type);
+    let blob = Blob::new_with_u8_array_sequence_and_options(&parts, &opts).map_err(js_err)?;
+    save_blob(project_id, media_id, name, content_type, &blob).await
+}
+
 pub async fn save_poster(project_id: &str, media_id: &str, bytes: &[u8]) -> Result<(), String> {
-    if media_id.is_empty() || is_poster_id(media_id) || bytes.is_empty() {
-        return Err("no still to store".into());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (project_id, media_id, bytes);
+        return Ok(());
     }
-    save_file(
-        project_id,
-        &poster_id(media_id),
-        "poster.jpg",
-        "image/jpeg",
-        bytes,
-    )
-    .await
+    #[cfg(target_arch = "wasm32")]
+    {
+        if media_id.is_empty() || is_poster_id(media_id) || bytes.is_empty() {
+            return Err("no still to store".into());
+        }
+        save_file(
+            project_id,
+            &poster_id(media_id),
+            "poster.jpg",
+            "image/jpeg",
+            bytes,
+        )
+        .await
+    }
 }
 
 pub async fn load_poster(project_id: &str, media_id: &str) -> Result<Option<Vec<u8>>, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (project_id, media_id);
+        return Ok(None);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        load_poster_wasm(project_id, media_id).await
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_poster_wasm(project_id: &str, media_id: &str) -> Result<Option<Vec<u8>>, String> {
     if project_id.is_empty() || media_id.is_empty() || is_poster_id(media_id) {
         return Ok(None);
     }
-    let db = open_db().await?;
-    let tx = db
-        .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readonly)
-        .map_err(js_err)?;
-    let store = tx.object_store(STORE).map_err(js_err)?;
-    let req = store
-        .get(&JsValue::from_str(&hold_key(
-            project_id,
-            &poster_id(media_id),
-        )))
-        .map_err(js_err)?;
-    let value = await_request(req).await?;
+    let value = get_record(&hold_key(project_id, &poster_id(media_id))).await?;
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
-    Ok(bytes_field(&value, "bytes"))
+    let blob = blob_from_record(&value)?;
+    blob_bytes(&blob).await.map(Some)
 }
 
-pub async fn files_for_project(project_id: &str) -> Result<Vec<HeldFile>, String> {
-    let db = open_db().await?;
-    let tx = db
-        .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readonly)
-        .map_err(js_err)?;
-    let store = tx.object_store(STORE).map_err(js_err)?;
-    let req = store.get_all().map_err(js_err)?;
-    let value = await_request(req).await?;
-    Ok(files_in_project(&value, project_id))
+/// Names of clips in this browser. One record at a time, so a legacy byte array
+/// is wrapped and dropped before the next clip is opened.
+pub async fn list_for_project(project_id: &str) -> Result<Vec<HeldMeta>, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = project_id;
+        return Ok(Vec::new());
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        list_for_project_wasm(project_id).await
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn list_for_project_wasm(project_id: &str) -> Result<Vec<HeldMeta>, String> {
+    let keys = all_keys().await?;
+    let mut out = Vec::new();
+    for key in keys {
+        if project_of_key(&key) != Some(project_id) {
+            continue;
+        }
+        let record = get_record(&key).await?;
+        if record.is_null() || record.is_undefined() {
+            continue;
+        }
+        let Some(meta) = meta_from_record(&record) else {
+            continue;
+        };
+        if !is_library_file(&meta.id) {
+            continue;
+        }
+        let kind = classify_record(&record);
+        if kind == HoldBody::Missing {
+            continue;
+        }
+        let legacy = kind == HoldBody::LegacyBytes || has_binary_bytes(&record);
+        if legacy {
+            let rewritten = if let Ok(blob) = blob_from_record(&record) {
+                save_blob(
+                    project_id,
+                    &meta.id,
+                    &meta.name,
+                    &meta.content_type,
+                    &blob,
+                )
+                .await
+                .is_ok()
+            } else {
+                false
+            };
+            if !rewritten && kind == HoldBody::LegacyBytes {
+                continue;
+            }
+        }
+        drop(record);
+        if legacy {
+            // Let the browser drop the old byte array before the next clip is opened.
+            gloo_timers::future::TimeoutFuture::new(0).await;
+        }
+        out.push(meta);
+    }
+    Ok(out)
+}
+
+pub async fn load_blob(project_id: &str, media_id: &str) -> Result<Blob, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (project_id, media_id);
+        return Err("this clip is not in this browser".into());
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        load_blob_wasm(project_id, media_id).await
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_blob_wasm(project_id: &str, media_id: &str) -> Result<Blob, String> {
+    let record = get_record(&hold_key(project_id, media_id)).await?;
+    if record.is_null() || record.is_undefined() {
+        return Err("this clip is not in this browser".into());
+    }
+    blob_from_record(&record)
 }
 
 async fn open_db() -> Result<web_sys::IdbDatabase, String> {
@@ -189,37 +332,100 @@ async fn open_db() -> Result<web_sys::IdbDatabase, String> {
         .map_err(|_| "browser store did not open".to_string())
 }
 
-fn files_in_project(value: &JsValue, project_id: &str) -> Vec<HeldFile> {
+async fn get_record(key: &str) -> Result<JsValue, String> {
+    let db = open_db().await?;
+    let tx = db
+        .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readonly)
+        .map_err(js_err)?;
+    let store = tx.object_store(STORE).map_err(js_err)?;
+    let req = store.get(&JsValue::from_str(key)).map_err(js_err)?;
+    await_request(req).await
+}
+
+async fn all_keys() -> Result<Vec<String>, String> {
+    let db = open_db().await?;
+    let tx = db
+        .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readonly)
+        .map_err(js_err)?;
+    let store = tx.object_store(STORE).map_err(js_err)?;
+    let req = store.get_all_keys().map_err(js_err)?;
+    let value = await_request(req).await?;
     let Some(array) = value.dyn_ref::<js_sys::Array>() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let mut out = Vec::new();
-    for record in array.iter() {
-        if string_field(&record, "project_id").as_deref() != Some(project_id) {
-            continue;
-        }
-        let Some(id) = string_field(&record, "id") else {
-            continue;
-        };
-        if !is_library_file(&id) {
-            continue;
-        }
-        let Some(name) = string_field(&record, "name") else {
-            continue;
-        };
-        let content_type = string_field(&record, "content_type")
-            .unwrap_or_else(|| "application/octet-stream".into());
-        let Some(bytes) = bytes_field(&record, "bytes") else {
-            continue;
-        };
-        out.push(HeldFile {
-            id,
-            name,
-            content_type,
-            bytes,
-        });
+    Ok(array.iter().filter_map(|key| key.as_string()).collect())
+}
+
+fn meta_from_record(record: &JsValue) -> Option<HeldMeta> {
+    let id = string_field(record, "id")?;
+    let name = string_field(record, "name")?;
+    let content_type =
+        string_field(record, "content_type").unwrap_or_else(|| "application/octet-stream".into());
+    Some(HeldMeta {
+        id,
+        name,
+        content_type,
+    })
+}
+
+fn classify_record(record: &JsValue) -> HoldBody {
+    hold_body(has_blob(record), has_binary_bytes(record))
+}
+
+fn has_blob(record: &JsValue) -> bool {
+    field(record, "blob").is_some_and(|value| value.is_instance_of::<Blob>())
+        || field(record, "bytes").is_some_and(|value| value.is_instance_of::<Blob>())
+}
+
+fn has_binary_bytes(record: &JsValue) -> bool {
+    field(record, "bytes").is_some_and(|value| {
+        value.is_instance_of::<js_sys::Uint8Array>()
+            || value.is_instance_of::<js_sys::ArrayBuffer>()
+    })
+}
+
+fn blob_from_record(record: &JsValue) -> Result<Blob, String> {
+    if let Some(blob) = field(record, "blob").and_then(|value| value.dyn_into::<Blob>().ok()) {
+        return Ok(blob);
     }
-    out
+    let Some(bytes) = field(record, "bytes") else {
+        return Err("this clip is not in this browser".into());
+    };
+    if let Ok(blob) = bytes.clone().dyn_into::<Blob>() {
+        return Ok(blob);
+    }
+    let array = if let Ok(array) = bytes.clone().dyn_into::<js_sys::Uint8Array>() {
+        array
+    } else if bytes.is_instance_of::<js_sys::ArrayBuffer>() {
+        js_sys::Uint8Array::new(&bytes)
+    } else {
+        return Err("this clip is not in this browser".into());
+    };
+    let parts = js_sys::Array::of1(&array);
+    let opts = BlobPropertyBag::new();
+    if let Some(content_type) = string_field(record, "content_type") {
+        opts.set_type(&content_type);
+    }
+    Blob::new_with_u8_array_sequence_and_options(&parts, &opts).map_err(js_err)
+}
+
+async fn blob_bytes(blob: &Blob) -> Result<Vec<u8>, String> {
+    let buf = wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+        .await
+        .map_err(js_err)?;
+    let array = js_sys::Uint8Array::new(&buf);
+    let mut bytes = vec![0_u8; array.length() as usize];
+    array.copy_to(&mut bytes);
+    Ok(bytes)
+}
+
+fn field(value: &JsValue, name: &str) -> Option<JsValue> {
+    let field = js_sys::Reflect::get(value, &JsValue::from_str(name)).ok()?;
+    if field.is_null() || field.is_undefined() {
+        None
+    } else {
+        Some(field)
+    }
 }
 
 fn await_request(
@@ -271,23 +477,6 @@ fn string_field(value: &JsValue, name: &str) -> Option<String> {
         .and_then(|field| field.as_string())
 }
 
-fn bytes_field(value: &JsValue, name: &str) -> Option<Vec<u8>> {
-    let field = js_sys::Reflect::get(value, &JsValue::from_str(name)).ok()?;
-    if field.is_null() || field.is_undefined() {
-        return None;
-    }
-    let array = if let Ok(array) = field.clone().dyn_into::<js_sys::Uint8Array>() {
-        array
-    } else if field.is_instance_of::<js_sys::ArrayBuffer>() {
-        js_sys::Uint8Array::new(&field)
-    } else {
-        return None;
-    };
-    let mut bytes = vec![0_u8; array.length() as usize];
-    array.copy_to(&mut bytes);
-    Some(bytes)
-}
-
 fn request_message(event: &web_sys::Event) -> String {
     event
         .target()
@@ -332,5 +521,13 @@ mod tests {
             hold_key("project", &poster_id("clip")),
             "project/clip:poster"
         );
+    }
+
+    #[test]
+    fn a_new_clip_stays_a_blob_and_an_old_byte_array_is_wrapped_once() {
+        assert_eq!(hold_body(true, false), HoldBody::Blob);
+        assert_eq!(hold_body(true, true), HoldBody::Blob);
+        assert_eq!(hold_body(false, true), HoldBody::LegacyBytes);
+        assert_eq!(hold_body(false, false), HoldBody::Missing);
     }
 }

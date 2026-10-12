@@ -13,7 +13,7 @@ use media::{
     Clock, DragSession, DragSource, EditMode, EditTool, EditorTrack, MediaItem, MediaKind,
     TrackKindUi, advance_playhead, apply_monitor_look, capture_pointer, clamp_pps, clip_duration,
     clip_name, commit_drag, display_tracks, film_tiles, fit_scale, format_clock, format_tc_short,
-    item_from_bytes_id, lane_height, max_timeline_h, next_track_name, paint_clock, paint_playhead,
+    lane_height, max_timeline_h, next_track_name, paint_clock, paint_playhead,
     place_clip, playhead_now, preview_video, program_end, reset_tick_clock, ruler_marks_nle,
     scroll_left, seek_by, set_media_duration, set_playhead, sync_monitor, timeline_end,
     timeline_viewport_h, timeline_viewport_w, update_drag, video_duration_from_src,
@@ -25,6 +25,9 @@ use oc_core::{
 use oc_tools::{ToolId, actions as cut_actions, modes as edit_tools, track_actions};
 use pages::{Export, Login, NewProject, Projects};
 use toast::{ToastProvider, show_toast};
+use dioxus::html::FileData;
+#[cfg(target_arch = "wasm32")]
+use media::item_from_blob;
 use wasm_bindgen::JsCast;
 
 const CSS: &str = include_str!("../assets/style.css");
@@ -135,7 +138,46 @@ struct HeldImport {
     id: String,
     name: String,
     content_type: String,
-    bytes: Vec<u8>,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static HELD_FILES: std::cell::RefCell<std::collections::HashMap<String, web_sys::File>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn remember_import(id: &str, file: &web_sys::File) {
+    #[cfg(target_arch = "wasm32")]
+    HELD_FILES.with(|slot| {
+        slot.borrow_mut().insert(id.to_string(), file.clone());
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (id, file);
+    }
+}
+
+fn held_file(id: &str) -> Option<web_sys::File> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        HELD_FILES.with(|slot| slot.borrow().get(id).cloned())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+fn forget_import(id: &str) {
+    #[cfg(target_arch = "wasm32")]
+    HELD_FILES.with(|slot| {
+        slot.borrow_mut().remove(id);
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = id;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -846,6 +888,10 @@ fn AssetView(tab: AssetTab) -> Element {
                         let pid = save.project_id.peek().clone();
                         let clock = clock;
                         spawn(async move {
+                            if let Err(err) = api::ensure_speech(&pid).await {
+                                show_toast().error(format!("Speech was not stored — {err}"));
+                                return;
+                            }
                             match api::generate_captions(&pid).await {
                                 Ok((timeline, note)) => {
                                     let mut save = save;
@@ -1117,39 +1163,8 @@ fn MediaPanel() -> Element {
                         onchange: move |evt| {
                             spawn(async move {
                                 for file in evt.files() {
-                                    let name = file.name();
-                                    let Ok(bytes) = file.read_bytes().await else { continue };
-                                    let ctype = MediaKind::mime(&name).to_string();
-                                    let id = uuid::Uuid::now_v7().to_string();
-                                    let Some(item) = item_from_bytes_id(name.clone(), &bytes, id.clone()) else {
-                                        continue;
-                                    };
-                                    if matches!(item.kind, MediaKind::Video | MediaKind::Image)
-                                        && active.read().is_none()
-                                    {
-                                        active.set(Some(item.url.clone()));
-                                    }
-                                    library.write().push(item);
-                                    held.write().push(HeldImport {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        content_type: ctype.clone(),
-                                        bytes: bytes.to_vec(),
-                                    });
-                                    begin_upload(uploading, &id);
-                                    let pid = save.project_id.peek().clone();
-                                    let result = crate::api::store_imported(
-                                        &pid,
-                                        &id,
-                                        &name,
-                                        &ctype,
-                                        bytes.to_vec(),
-                                    )
-                                    .await;
-                                    if result.is_ok() {
-                                        held.write().retain(|row| row.id != id);
-                                    }
-                                    note_upload(uploading, &id, &name, result);
+                                    import_browser_file(file, save, library, active, held, uploading)
+                                        .await;
                                 }
                             });
                         },
@@ -2247,20 +2262,98 @@ fn save_held_imports(
     spawn(async move {
         for file in batch {
             begin_upload(uploading, &file.id);
-            let result = crate::api::store_imported(
-                &pid,
-                &file.id,
-                &file.name,
-                &file.content_type,
-                file.bytes,
-            )
-            .await;
+            let result = save_one_import(&pid, &file).await;
             if result.is_ok() {
                 held.write().retain(|row| row.id != file.id);
+                forget_import(&file.id);
             }
             note_upload(uploading, &file.id, &file.name, result);
         }
     });
+}
+
+async fn import_browser_file(
+    file: FileData,
+    save: WorkspaceSave,
+    mut library: Signal<Vec<MediaItem>>,
+    mut active: Signal<Option<String>>,
+    mut held: Signal<Vec<HeldImport>>,
+    mut uploading: Signal<Vec<String>>,
+) {
+    let name = file.name();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (file, save, library, active, held, uploading, name);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Some(web_file) = file.inner().downcast_ref::<web_sys::File>().cloned() else {
+            show_toast().error(format!("Could not read {name}"));
+            return;
+        };
+        if web_file.size() <= 0.0 {
+            show_toast().error(format!("{name} is empty"));
+            return;
+        }
+        let ctype = MediaKind::mime(&name).to_string();
+        let id = uuid::Uuid::now_v7().to_string();
+        let Some(item) = item_from_blob(name.clone(), &web_file, id.clone()) else {
+            show_toast().error(format!("Could not open {name}"));
+            return;
+        };
+        if matches!(item.kind, MediaKind::Video | MediaKind::Image) && active.peek().is_none() {
+            active.set(Some(item.url.clone()));
+        }
+        library.write().push(item);
+        remember_import(&id, &web_file);
+        held.write().push(HeldImport {
+            id: id.clone(),
+            name: name.clone(),
+            content_type: ctype.clone(),
+        });
+        begin_upload(uploading, &id);
+        let pid = save.project_id.peek().clone();
+        let kept = api::keep_imported_blob(&pid, &id, &name, &ctype, &web_file).await;
+        if let Err(err) = kept {
+            note_upload(uploading, &id, &name, Err(err));
+            return;
+        }
+        held.write().retain(|row| row.id != id);
+        forget_import(&id);
+        let speech = api::transcribe_blob(&pid, &id, &ctype, &web_file).await;
+        if let Err(err) = speech {
+            uploading.write().retain(|row| row != &id);
+            show_toast().error(format!(
+                "{name} is in this browser. Speech was not read — {err}"
+            ));
+            return;
+        }
+        note_upload(uploading, &id, &name, Ok(()));
+    }
+}
+
+async fn save_one_import(pid: &str, file: &HeldImport) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(web_file) = held_file(&file.id) {
+            return api::store_imported_blob(
+                pid,
+                &file.id,
+                &file.name,
+                &file.content_type,
+                &web_file,
+            )
+            .await;
+        }
+        let blob = hold::load_blob(pid, &file.id).await?;
+        return api::store_imported_blob(pid, &file.id, &file.name, &file.content_type, &blob)
+            .await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (pid, file);
+        Err("import runs in the browser".into())
+    }
 }
 
 fn page_project_id() -> Option<String> {
@@ -3404,34 +3497,46 @@ fn merge_library(
     }
 }
 
+async fn playable_held(project_id: &str, file: &hold::HeldMeta) -> Option<MediaItem> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let blob = hold::load_blob(project_id, &file.id).await.ok()?;
+        return item_from_blob(file.name.clone(), &blob, file.id.clone());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (project_id, file);
+        None
+    }
+}
+
 async fn restore_browser_media(
     project_id: &str,
     mut library: Signal<Vec<MediaItem>>,
     mut active: Signal<Option<String>>,
     remote_ids: &[String],
 ) {
-    let stored = match hold::files_for_project(project_id).await {
+    let stored = match hold::list_for_project(project_id).await {
         Ok(rows) => rows,
         Err(_) => return,
     };
     let mut items = library.peek().clone();
     let mut changed = false;
     for file in stored {
-        if let Some(existing) = items.iter_mut().find(|item| item.id == file.id) {
-            if !existing.url.starts_with("blob:") {
-                if let Some(url) = crate::media::blob_url(&file.bytes, &file.content_type) {
-                    existing.url = url;
-                    if existing.content_type.is_empty() {
-                        existing.content_type = file.content_type.clone();
-                    }
-                    changed = true;
+        let already = items
+            .iter()
+            .any(|item| item.id == file.id && item.url.starts_with("blob:"));
+        if !already && let Some(made) = playable_held(project_id, &file).await {
+            if let Some(existing) = items.iter_mut().find(|item| item.id == file.id) {
+                existing.url = made.url;
+                if existing.content_type.is_empty() {
+                    existing.content_type = made.content_type;
                 }
+                changed = true;
+            } else {
+                items.push(made);
+                changed = true;
             }
-        } else if let Some(item) =
-            item_from_bytes_id(file.name.clone(), &file.bytes, file.id.clone())
-        {
-            items.push(item);
-            changed = true;
         }
         if !remote_ids.iter().any(|id| id == &file.id) {
             let _ = api::register_media(project_id, &file.id, &file.name, &file.content_type, 0.0)
@@ -4023,11 +4128,10 @@ fn send_prompt(
                 break;
             }
             begin_upload(uploading, &file.id);
-            let result =
-                api::store_imported(&pid, &file.id, &file.name, &file.content_type, file.bytes)
-                    .await;
+            let result = save_one_import(&pid, &file).await;
             if result.is_ok() {
                 held.write().retain(|row| row.id != file.id);
+                forget_import(&file.id);
             } else if api::chat_current(turn) {
                 let err = result.as_ref().err().map(String::as_str).unwrap_or("");
                 messages.write().push(ChatMsg::status(format!(
@@ -4036,6 +4140,27 @@ fn send_prompt(
                 )));
             }
             note_upload(uploading, &file.id, &file.name, result);
+        }
+        if !api::chat_current(turn) {
+            let _ = save_chat_now(&pid, &bound, chat_id, chats, messages).await;
+            if api::chat_generation() == turn {
+                busy.set(false);
+            }
+            return;
+        }
+        if api::chat_current(turn) {
+            messages.write().push(ChatMsg::status(
+                "Reading speech from this browser. The words stay with the clip.".to_string(),
+            ));
+        }
+        if let Err(err) = api::ensure_speech(&pid).await {
+            if api::chat_current(turn) {
+                messages.write().push(ChatMsg::status(format!(
+                    "Speech was not stored — {err}"
+                )));
+                busy.set(false);
+            }
+            return;
         }
         if !api::chat_current(turn) {
             let _ = save_chat_now(&pid, &bound, chat_id, chats, messages).await;
