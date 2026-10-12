@@ -425,8 +425,11 @@ pub fn mcp_tools() -> Vec<McpTool> {
                  you set them. A shot the model has watched keeps the grade from that frame. \
                  A slot grade you set after see replaces it. Shots still ungraded are shown to \
                  the model, which grades each frame. The piece grade covers only a shot the model \
-                 could not see. Omit transition for a cut, and set a dissolve, wipe, or slide only \
-                 on the slot that needs it. Set caption_preset to one id from the caption-looks \
+                 could not see. A file with a keeper and a throwaway is more than one slot of that \
+                 media_id. source_in and duration are the keeper, not the file. fade_in on the first \
+                 slot, fade_out on the last. Set dissolve, fade_black, fade_white, wipe_left, or \
+                 slide_up on a slot that starts a new beat, place, or time. Omit transition on the \
+                 same thought or a matched action. Set caption_preset to one id from the caption-looks \
                  page. Leave caption_mood empty. Rust uses that same face, color, and effect on \
                  every line and only moves a line to stay off a close mouth. Slots must sit on a \
                  real shot or spoken line. \
@@ -464,7 +467,7 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 (
                     "slots",
                     str_prop(
-                        "Array of {media_id, source_in, duration, transition?, transition_duration?, speed?, end_scale?, ease?, grade?, fx?, fade_in?, fade_out?, cover?}. Omit transition for a cut. dissolve, fade_black, fade_white, wipe_left, slide_up on the slot that needs that join. end_scale above 1 is a push in and below 1 is an ease out, only on a shot the edit page names. Most slots omit it. ease is in_out, in, out, or linear.",
+                        "Array of {media_id, source_in, duration, transition?, transition_duration?, speed?, end_scale?, ease?, grade?, fx?, fade_in?, fade_out?, cover?}. source_in and duration are the keeper. The same media_id may be two slots when a throwaway sits between them. fade_in on the first slot, fade_out on the last. dissolve, fade_black, fade_white, wipe_left, slide_up on a new beat, place, or time. Omit transition on the same thought or a matched action. end_scale above 1 is one push on a hold whose motion is none. ease is in_out, in, out, or linear.",
                     ),
                     true,
                 ),

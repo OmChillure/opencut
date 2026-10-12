@@ -503,6 +503,11 @@ fn finish_picture(
                 caption_mood(plan).as_str()
             };
             notes.push(format!("captions {label}"));
+        } else if plan.captions {
+            notes.push(
+                "captions skipped — no transcript overlaps this cut. The words are the transcript stored for each clip."
+                    .into(),
+            );
         }
     }
 
@@ -1138,6 +1143,39 @@ mod tests {
             })
         });
         assert!(captioned);
+    }
+
+    #[test]
+    fn captions_without_speech_say_why() {
+        let picture = MediaId::new();
+        let mut timeline = Timeline::default();
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: true,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![slot(picture, 2.0)],
+        };
+        let notes = build_plan(
+            &mut timeline,
+            &plan,
+            &[window(picture, 0.0, 10.0, "talk", false)],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            notes.iter().any(|note| note.contains("captions skipped")),
+            "{notes:?}"
+        );
+        assert!(!crate::has_burnable_captions(&timeline));
     }
 
     #[test]

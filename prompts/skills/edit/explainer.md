@@ -16,4 +16,4 @@ A hold stays while the viewer is still reading the idea. Cut at the earliest fra
 
 A cutaway covers a jump or shows the thing being named. It does not interrupt a thought that is still unfinished.
 
-On the plan: excerpts in this order. `source_in` is the frame the beat starts. `duration` ends when the beat has done its job. Omit `transition` for a hard cut. `dissolve` only when time or place changes.
+On the plan: excerpts in this order. A file is not one slot when part of it should go. `source_in` is the frame the beat starts. `duration` ends when the beat has done its job and before the um or the retake. `fade_in` on the first slot, `fade_out` on the last. `dissolve` when time, place, or the idea changes. Omit `transition` when the next slot is the same thought. `end_scale` above 1 and `ease` `out` on one still hold that reveals the idea. After the last revision, `add_motion` once when a line names a person, a number, a place, or a punch line.

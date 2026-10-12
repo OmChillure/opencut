@@ -16,4 +16,4 @@ Reject a shot that raises a question the rest of the piece cannot answer. Keep a
 
 Match the product across cuts: color, shape, logo, and what the screen shows. If a cut makes the product look like a different object, cover it, trim it, or use another imported angle.
 
-On the plan: excerpts in this order. `source_in` is the action, not the head of the file. `duration` ends when the proof is visible. Omit `transition` unless the place changes. Leave a slot `grade` empty unless you saw the frame and the product color is wrong.
+On the plan: excerpts in this order. `source_in` is the action, not the head of the file, and not a stretch you are cutting. `duration` ends when the proof is visible. `fade_in` on the first slot, `fade_out` on the last. `dissolve` when the place or the beat changes. A matched action stays a cut. `end_scale` above 1 and `ease` `out` on one still hold that reveals the product. After the last revision, `add_motion` once when a line names a number, a place, or the product. Leave a slot `grade` empty unless you saw the frame and the product color is wrong.

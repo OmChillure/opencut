@@ -16,4 +16,4 @@ Faster is useful when the viewer already has the idea and the next shot adds a n
 
 Show the product or the use earlier than you would in a trailer. The first frame has to communicate without sound if the captions are on.
 
-On the plan: excerpts in this order, inside the duration they asked for. Hard cuts. `dissolve` only for a before and after that is a change of time. `end_scale` belongs on the one shot whose job is the reveal, and only when that shot's motion is `none`. Leave it off the rest. Keep the caption line readable. Do not animate every word.
+On the plan: excerpts in this order, inside the duration they asked for. Cut the weak stretch out of a file you are keeping. `fade_in` on the first slot, `fade_out` on the last. `dissolve` for a before and after or a change of time. A proof cut on the action stays a cut. `end_scale` above 1 and `ease` `out` on the one still hold whose job is the reveal. Leave it off the rest, and off a shot that already moves. After the last revision, `add_motion` once when a line names a number, a place, or a punch line. Keep the caption line readable. Do not animate every word.

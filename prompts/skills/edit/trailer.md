@@ -16,4 +16,4 @@ Reserve the strongest visual change for the strongest turn. Repetition is a moti
 
 A straight cut is the default. One `wipe_left` or `slide_up` is one moment, and only when the piece has already taught that language. Do not use one to hide a weak order. Any other transition name is the wrong join.
 
-On the plan: fewer excerpts than a documentary, chosen for consequence rather than coverage. The one push, if any, is `end_scale` on the disruption or the button, and only on a hold whose motion is `none`. Leave grade empty unless a frame you saw is a different light from the hero of that scene.
+On the plan: fewer excerpts than a documentary, chosen for consequence rather than coverage. Drop the padding inside a file you keep. `fade_in` on the open, `fade_out` on the button. One `dissolve`, `wipe_left`, or `slide_up` on the disruption. Do not put that join on every slot. `end_scale` above 1 and `ease` `out` on the disruption or the button, and only on a hold whose motion is `none`. After the last revision, `add_motion` once when a line is a name, a number, or a punch line. Leave grade empty unless a frame you saw is a different light from the hero of that scene.

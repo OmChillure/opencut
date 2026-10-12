@@ -17,4 +17,4 @@ Let a phrase finish. Anticipation starts before the hit. The payoff lands on the
 
 Repetition needs a change: subject, direction, size, or meaning. The same frame on the same beat is not a motif.
 
-On the plan: `music_id` is a file they imported, `music_volume` under 1 when people are talking. Omit `transition` except where a section changes. The one push, if any, is `end_scale` on the lift or the drop, and only on a hold whose motion is `none`. Leave it off every other slot. Captions do not pop on every beat.
+On the plan: `music_id` is a file they imported, `music_volume` under 1 when people are talking. Cut a dead picture out of a file even when the phrase around it stays. `fade_in` on the open, `fade_out` on the end. `dissolve` or `fade_black` where a section changes. A cut on the hit stays a cut. `end_scale` above 1 and `ease` `out` on the lift or the drop, and only on a hold whose motion is `none`. Leave it off every other slot. After the last revision, `add_motion` once when a line is a name, a number, or a punch line. Captions do not pop on every beat.

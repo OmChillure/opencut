@@ -16,4 +16,4 @@ If the piece is music-led, pick one sync: on the hits, on the phrase, against th
 
 Review once in your head: does the picture make sense with the sound down, do the words make sense with the picture covered, and can a caption be read at this pace. Captions follow the phrase. Do not animate every word.
 
-On the plan: put `end_scale` on the shots this page names and omit it on the rest. Put `transition` on the slot after the join that needs it. `fade_in` and `fade_out` only on the open and the close, unless this piece's shape said otherwise.
+On the plan: put `end_scale` above 1 and `ease` `out` on one still hold this page names, and omit it on the rest. Put `transition` on the slot after the join that needs it. `fade_in` on the first slot and `fade_out` on the last. A piece with every fade, every transition, and every `end_scale` empty is not finished. `add_motion` once after the last revision when a line is a name, a number, a place, or a punch line.

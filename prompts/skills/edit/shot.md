@@ -37,4 +37,4 @@ Montage, only when the sequence is the idea:
 
 Refuse random B-roll under the words, a picture that only restates the sentence, a speed ramp with no action, and escalation that arrives before the stakes exist.
 
-On the plan: `source_in` and `duration` are the job, not the file. `cover` only on a jump. Omit `transition` for a hard cut, another angle of the same moment, or a matched action. `dissolve` when time or place changes. A sound cross is not a slot field.
+On the plan: `source_in` and `duration` are the job, not the file. The same `media_id` may be two slots when a throwaway sits between keepers. `cover` only on a jump. Omit `transition` for a hard cut, another angle of the same moment, or a matched action. `dissolve` when time, place, or the idea changes. `fade_in` and `fade_out` on the open and the close. A sound cross is not a slot field.

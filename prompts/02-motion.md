@@ -4,7 +4,7 @@ The shot list already has `motion`: `l2r`, `r2l`, `toward`, `away`, or `none`. R
 
 ## The graphic
 
-Every graphic is `add_motion`. One `watch` of that spoken line replaces three `see` calls. Then pick one `design`. That call renders the clip and places it. Do not write HTML. Do not render a file. A camera move is not a reason to call it.
+Every graphic is `add_motion`. One `watch` of that spoken line replaces three `see` calls. Then pick one `design`. That call renders the clip and places it. Do not write HTML. Do not render a file. A piece places one graphic when a spoken line is a name, a number, a place, a quote, or a punch line. Call `add_motion` after the last `revise_edit`. Skipping that line leaves the piece unfinished. A camera move is `end_scale` on the slot, not this call.
 
 A punch line or a title: `kinetic-slam`, `kinetic-typewriter`, `kinetic-words`, `kinetic-wave`, `kinetic-bounce`, `kinetic-punch`, `kinetic-blur`, `kinetic-glitch`, `kinetic-burst`, or `kinetic-editorial`.
 A spoken number: `stat-count`, `stat-ring`, or `stat-bars`.
