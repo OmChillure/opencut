@@ -433,7 +433,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 }
 .preview-video-b { z-index: 1; }
 .preview-bed { display: none; }
-.preview-design, .preview-design-clip { z-index: 2; object-fit: cover; pointer-events: none; }
+.preview-design, .preview-design-clip { z-index: 2; object-fit: contain; pointer-events: none; }
 .program-canvas {
   position: absolute;
   inset: 0;

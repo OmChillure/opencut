@@ -8,7 +8,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const FPS = 8;
+const FPS = 24;
 
 const STYLES = {
   bold: { bg: "#111111", fg: "#f4f1ea", accent: "#ff4d2e", muted: "#8d867c", serif: false },
@@ -200,6 +200,12 @@ function buildStat() {
   hero.style.flexDirection = "column";
   hero.style.gap = "18px";
   const num = document.createElement("div");
+  const finalShown = prefix + Math.round(value).toLocaleString("en-US") + suffix;
+  const chars = Math.max(1, finalShown.length);
+  const fitted = Math.max(28, Math.min(spec.w * 0.16, spec.w * 0.86 / (chars * 0.62)));
+  num.style.fontSize = Math.round(fitted) + "px";
+  num.style.whiteSpace = "nowrap";
+  num.style.lineHeight = "1";
   const label = document.createElement("div");
   label.style.fontSize = Math.round(spec.w * 0.035) + "px";
   label.style.letterSpacing = "0.08em";

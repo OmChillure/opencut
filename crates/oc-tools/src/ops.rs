@@ -1309,19 +1309,32 @@ fn place_design(
             picture.look.move_ease = Some(Ease::Out);
         }
         DesignLayout::Beside => {
-            picture.look.card = Some(FrameCard {
-                x: 0.52,
-                y: 0.10,
-                w: 0.44,
-                h: 0.80,
+            // A tall frame keeps the face. The drawing sits in a lower band.
+            let portrait = timeline.height + 32 > timeline.width;
+            picture.look.card = Some(if portrait {
+                FrameCard {
+                    x: 0.08,
+                    y: 0.64,
+                    w: 0.84,
+                    h: 0.28,
+                }
+            } else {
+                FrameCard {
+                    x: 0.52,
+                    y: 0.10,
+                    w: 0.44,
+                    h: 0.80,
+                }
             });
         }
     }
     let design_id = timeline.place_clip(design_track, picture, PlaceMode::Normal)?;
     let words = text.trim();
     if !words.is_empty() {
+        let portrait = timeline.height + 32 > timeline.width;
         let (x, y) = match layout {
             DesignLayout::Behind => (Some(0.28), Some(0.42)),
+            DesignLayout::Beside if portrait => (Some(0.50), Some(0.78)),
             DesignLayout::Beside => (Some(0.74), Some(0.86)),
             DesignLayout::Cutaway => (None, None),
         };

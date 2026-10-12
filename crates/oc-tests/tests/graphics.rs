@@ -228,8 +228,45 @@ fn house_drawing_sits_beside_the_speaker() {
     )
     .unwrap();
     let design = tl.tracks.iter().find(|t| t.name == "Design").unwrap();
-    assert!(design.clips[0].look.card.is_some());
+    let card = design.clips[0].look.card.expect("beside card");
+    assert_eq!(card.x, 0.52);
+    assert_eq!(card.y, 0.10);
+    assert_eq!(card.w, 0.44);
+    assert_eq!(card.h, 0.80);
     assert!(tl.tracks.iter().all(|t| t.name != "Front"));
+}
+
+#[test]
+fn a_vertical_drawing_sits_in_the_lower_band() {
+    let mut tl = Timeline::new(oc_core::FrameRate::FPS_30, 1080, 1920);
+    let mut undo = UndoStack::new();
+    let v1 = tl.first_track(TrackKind::Video).unwrap().id;
+    tl.add_clip(v1, video(0.0, 8.0)).unwrap();
+    apply(
+        &mut tl,
+        &mut undo,
+        Op::AddDesign {
+            media_id: MediaId::new(),
+            at: Time::from_seconds(2.0),
+            duration: Duration::from_seconds(4.0),
+            layout: DesignLayout::Beside,
+            text: "10,000".into(),
+            label: GraphicKind::LowerThird,
+        },
+    )
+    .unwrap();
+    let card = tl
+        .tracks
+        .iter()
+        .find(|t| t.name == "Design")
+        .unwrap()
+        .clips[0]
+        .look
+        .card
+        .expect("lower band");
+    assert!(card.y >= 0.6, "{card:?}");
+    assert!(card.h <= 0.32, "{card:?}");
+    assert!(card.w >= 0.8, "{card:?}");
 }
 
 #[test]
