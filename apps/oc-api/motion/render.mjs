@@ -77,6 +77,11 @@ function labels() {
   const parts = (spec.prompt || spec.text).split(/[,|/]/).map((s) => s.trim()).filter((s) => /[A-Za-z]/.test(s));
   return parts.length >= 2 ? parts.slice(0, 5) : [];
 }
+const band = spec.h < spec.w * 0.5;
+if (band) {
+  document.body.style.background = "#111111";
+  document.body.style.color = "#f7f4ee";
+}
 const design = spec.design;
 if (design.startsWith("kinetic")) buildKinetic();
 else if (design.startsWith("stat")) buildStat();
@@ -90,6 +95,10 @@ function buildKinetic() {
   const hero = document.createElement("div");
   hero.className = "hero";
   hero.textContent = spec.text;
+  if (spec.h < spec.w * 0.5) {
+    hero.style.fontSize = Math.round(Math.max(22, spec.h * 0.46)) + "px";
+    hero.style.inset = "4% 6%";
+  }
   root.appendChild(hero);
   const letters = design === "kinetic-wave" || design === "kinetic-burst";
   if (letters) {
@@ -203,7 +212,8 @@ function buildStat() {
   const finalShown = prefix + Math.round(value).toLocaleString("en-US") + suffix;
   const chars = Math.max(1, finalShown.length);
   const fitted = Math.max(28, Math.min(spec.w * 0.16, spec.w * 0.86 / (chars * 0.62)));
-  num.style.fontSize = Math.round(fitted) + "px";
+  const fittedH = spec.h < spec.w * 0.5 ? spec.h * 0.62 : fitted;
+  num.style.fontSize = Math.round(Math.min(fitted, fittedH)) + "px";
   num.style.whiteSpace = "nowrap";
   num.style.lineHeight = "1";
   const label = document.createElement("div");

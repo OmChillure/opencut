@@ -162,6 +162,21 @@ pub fn frame_size(aspect: &str) -> (u32, u32) {
     }
 }
 
+/// A tall beside or behind graphic is the lower bar, not a full-frame plate.
+pub fn render_size(width: u32, height: u32, band: bool) -> (u32, u32) {
+    if !band {
+        return (width.max(2), height.max(2));
+    }
+    let w = even_px(width as f32 * 0.84);
+    let h = even_px(height as f32 * 0.10);
+    (w.max(64), h.max(64))
+}
+
+fn even_px(value: f32) -> u32 {
+    let px = value.round().max(2.0) as u32;
+    px / 2 * 2
+}
+
 pub struct RenderJob<'a> {
     pub design: &'a str,
     pub text: &'a str,
@@ -267,6 +282,15 @@ mod tests {
         assert_eq!(resolve("logo-reveal", "").unwrap().id, "logo-draw");
         let err = resolve("webpage", "").unwrap_err();
         assert!(err.contains("kinetic-slam"), "{err}");
+    }
+
+    #[test]
+    fn a_vertical_bar_renders_at_the_bar() {
+        let (width, height) = render_size(720, 1280, true);
+        assert_eq!(width, 604);
+        assert_eq!(height, 128);
+        assert_eq!(render_size(1280, 720, false), (1280, 720));
+        assert_eq!(render_size(720, 1280, false), (720, 1280));
     }
 
     #[test]

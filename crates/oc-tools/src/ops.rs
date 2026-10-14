@@ -1298,8 +1298,9 @@ fn place_design(
     picture.look.overlay = true;
     picture.look.fade_in = Duration::from_seconds(0.35);
     picture.look.fade_out = Duration::from_seconds(0.35);
+    let portrait = timeline.height + 32 > timeline.width;
     match layout {
-        DesignLayout::Cutaway | DesignLayout::Behind => {
+        DesignLayout::Cutaway => {
             picture.look.move_to = Some(Transform {
                 x: 0.0,
                 y: 0.0,
@@ -1308,33 +1309,40 @@ fn place_design(
             });
             picture.look.move_ease = Some(Ease::Out);
         }
-        DesignLayout::Beside => {
-            // A tall frame keeps the face. The drawing sits in a lower band.
-            let portrait = timeline.height + 32 > timeline.width;
-            picture.look.card = Some(if portrait {
-                FrameCard {
-                    x: 0.08,
-                    y: 0.64,
-                    w: 0.84,
-                    h: 0.28,
-                }
-            } else {
-                FrameCard {
-                    x: 0.52,
-                    y: 0.10,
-                    w: 0.44,
-                    h: 0.80,
-                }
+        DesignLayout::Behind if !portrait => {
+            picture.look.move_to = Some(Transform {
+                x: 0.0,
+                y: 0.0,
+                scale: 1.08,
+                rotation: 0.0,
+            });
+            picture.look.move_ease = Some(Ease::Out);
+        }
+        DesignLayout::Beside if !portrait => {
+            picture.look.card = Some(FrameCard {
+                x: 0.52,
+                y: 0.10,
+                w: 0.44,
+                h: 0.80,
+            });
+        }
+        DesignLayout::Beside | DesignLayout::Behind => {
+            // The person stays full frame. The bar sits under the face and above the captions.
+            picture.look.card = Some(FrameCard {
+                x: 0.08,
+                y: 0.50,
+                w: 0.84,
+                h: 0.10,
             });
         }
     }
     let design_id = timeline.place_clip(design_track, picture, PlaceMode::Normal)?;
     let words = text.trim();
     if !words.is_empty() {
-        let portrait = timeline.height + 32 > timeline.width;
         let (x, y) = match layout {
+            DesignLayout::Behind if portrait => (Some(0.50), Some(0.55)),
             DesignLayout::Behind => (Some(0.28), Some(0.42)),
-            DesignLayout::Beside if portrait => (Some(0.50), Some(0.78)),
+            DesignLayout::Beside if portrait => (Some(0.50), Some(0.55)),
             DesignLayout::Beside => (Some(0.74), Some(0.86)),
             DesignLayout::Cutaway => (None, None),
         };
@@ -1359,7 +1367,7 @@ fn place_design(
             )
         })
     });
-    if layout == DesignLayout::Behind {
+    if layout == DesignLayout::Behind && !portrait {
         if let Some((speaker_media, source_in)) = pip {
             let front = named_video_track(timeline, "Front");
             let mut pip = clip_for_media(speaker_media, at, duration, TrackKind::Video, source_in);
@@ -2311,10 +2319,22 @@ mod tests {
             Some(ExportPreset::Classic1080)
         );
         assert_eq!(ExportPreset::parse("nope"), None);
-        assert_eq!(ExportPreset::for_frame(1920, 1080), ExportPreset::Youtube1080);
-        assert_eq!(ExportPreset::for_frame(1080, 1920), ExportPreset::Vertical1080);
-        assert_eq!(ExportPreset::for_frame(1080, 1080), ExportPreset::Square1080);
-        assert_eq!(ExportPreset::for_frame(1440, 1080), ExportPreset::Classic1080);
+        assert_eq!(
+            ExportPreset::for_frame(1920, 1080),
+            ExportPreset::Youtube1080
+        );
+        assert_eq!(
+            ExportPreset::for_frame(1080, 1920),
+            ExportPreset::Vertical1080
+        );
+        assert_eq!(
+            ExportPreset::for_frame(1080, 1080),
+            ExportPreset::Square1080
+        );
+        assert_eq!(
+            ExportPreset::for_frame(1440, 1080),
+            ExportPreset::Classic1080
+        );
         assert_eq!(ExportPreset::Classic1080.size(), (1440, 1080));
     }
 

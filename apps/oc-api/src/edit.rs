@@ -77,7 +77,14 @@ pub(crate) async fn call_tool(
         return add_motion(db, project_id, &mut project.timeline, &call.arguments).await;
     }
     if name == "fit_frame" {
-        return fit_frame(db, project_id, &mut project.timeline, &media, &call.arguments).await;
+        return fit_frame(
+            db,
+            project_id,
+            &mut project.timeline,
+            &media,
+            &call.arguments,
+        )
+        .await;
     }
     if name == "snap_cuts_to_beats" {
         let raw = call
@@ -214,7 +221,13 @@ async fn add_motion(
 ) -> Result<String, String> {
     let ask = motion_ask(arguments)?;
     let aspect = broll_aspect(timeline, None);
-    let (width, height) = crate::motion::frame_size(&aspect);
+    let (frame_w, frame_h) = crate::motion::frame_size(&aspect);
+    let band = frame_h + 32 > frame_w
+        && matches!(
+            ask.layout,
+            oc_core::DesignLayout::Behind | oc_core::DesignLayout::Beside
+        );
+    let (width, height) = crate::motion::render_size(frame_w, frame_h, band);
     let bytes = crate::motion::render_mp4(&crate::motion::RenderJob {
         design: &ask.design,
         text: &ask.text,
@@ -495,7 +508,8 @@ async fn fit_frame(
 ) -> Result<String, String> {
     let (width, height) = fit_frame_size(arguments, media)?;
     let mut undo = UndoStack::new();
-    let applied = apply(timeline, &mut undo, Op::SetFrame { width, height }).map_err(|e| e.to_string())?;
+    let applied =
+        apply(timeline, &mut undo, Op::SetFrame { width, height }).map_err(|e| e.to_string())?;
     oc_db::save_timeline(db, project_id, timeline)
         .await
         .map_err(|e| e.to_string())?;

@@ -60,9 +60,7 @@ fn compositor_stacks_graphic_over_video() {
     .unwrap();
     let plan = plan_frame(&tl, Time::from_seconds(0.5));
     assert!(
-        plan.layers
-            .iter()
-            .any(|l| matches!(l, Layer::Video { .. })),
+        plan.layers.iter().any(|l| matches!(l, Layer::Video { .. })),
         "{plan:?}"
     );
     assert!(
@@ -255,18 +253,60 @@ fn a_vertical_drawing_sits_in_the_lower_band() {
         },
     )
     .unwrap();
+    let card = tl.tracks.iter().find(|t| t.name == "Design").unwrap().clips[0]
+        .look
+        .card
+        .expect("lower band");
+    assert!(card.y >= 0.48, "{card:?}");
+    assert!(card.h <= 0.14, "{card:?}");
+    assert!(card.y + card.h <= 0.62, "{card:?}");
+    assert!(card.w >= 0.8, "{card:?}");
+}
+
+#[test]
+fn a_vertical_behind_keeps_the_person_full_frame() {
+    let mut tl = Timeline::new(oc_core::FrameRate::FPS_30, 1080, 1920);
+    let mut undo = UndoStack::new();
+    let v1 = tl.first_track(TrackKind::Video).unwrap().id;
+    let speaker = MediaId::new();
+    tl.add_clip(v1, video_on(speaker, 0.0, 8.0)).unwrap();
+    apply(
+        &mut tl,
+        &mut undo,
+        Op::AddDesign {
+            media_id: MediaId::new(),
+            at: Time::from_seconds(1.5),
+            duration: Duration::from_seconds(3.0),
+            layout: DesignLayout::Behind,
+            text: "10".into(),
+            label: GraphicKind::Title,
+        },
+    )
+    .unwrap();
+    assert!(
+        tl.tracks.iter().all(|track| track.name != "Front"),
+        "a tall frame does not shrink the person into a corner"
+    );
     let card = tl
         .tracks
         .iter()
-        .find(|t| t.name == "Design")
+        .find(|track| track.name == "Design")
         .unwrap()
         .clips[0]
         .look
         .card
-        .expect("lower band");
-    assert!(card.y >= 0.6, "{card:?}");
-    assert!(card.h <= 0.32, "{card:?}");
-    assert!(card.w >= 0.8, "{card:?}");
+        .expect("lower bar");
+    assert!(card.y >= 0.48 && card.y + card.h <= 0.62, "{card:?}");
+    let speaker_clip = tl
+        .tracks
+        .iter()
+        .find(|track| track.name == "V1")
+        .unwrap()
+        .clips
+        .iter()
+        .find(|clip| clip.media_id == Some(speaker))
+        .unwrap();
+    assert!(speaker_clip.look.card.is_none());
 }
 
 #[test]
