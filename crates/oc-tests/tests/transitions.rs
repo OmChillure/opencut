@@ -1,9 +1,7 @@
 //! Same-track mix: Kdenlive Mix / Shotcut overlap / ffmpeg xfade.
 
 use oc_compositor::{Layer, plan_frame};
-use oc_core::{
-    Duration, Op, Time, Timeline, TrackKind, TransitionKind, UndoStack, apply,
-};
+use oc_core::{Duration, Op, Time, Timeline, TrackKind, TransitionKind, UndoStack, apply};
 use oc_tests::{timeline_with_two_shots, video};
 
 #[test]
@@ -124,7 +122,11 @@ fn dissolve_emits_incoming_shot_in_the_mix_window() {
         .collect();
     assert_eq!(videos.len(), 2, "outgoing + incoming: {videos:?}");
     assert_eq!(videos[0].0, a_media.unwrap());
-    assert!(videos[0].1 > 0.0 && videos[0].1 < 1.0, "progress {}", videos[0].1);
+    assert!(
+        videos[0].1 > 0.0 && videos[0].1 < 1.0,
+        "progress {}",
+        videos[0].1
+    );
     assert_eq!(videos[1].0, b_media.unwrap());
 }
 

@@ -1,8 +1,6 @@
 //! MCP schemas and TOOL-line parsing for the new look / mix / graphic ops.
 
-use oc_core::{
-    GraphicKind, McpCall, Op, TransitionKind, inspect_from_mcp, mcp_tools, op_from_mcp,
-};
+use oc_core::{GraphicKind, McpCall, Op, TransitionKind, inspect_from_mcp, mcp_tools, op_from_mcp};
 use serde_json::json;
 
 fn call(name: &str, arguments: serde_json::Value) -> McpCall {
@@ -35,7 +33,10 @@ fn catalog_lists_look_tools() {
         "set_speed_keys",
         "add_generator",
     ] {
-        assert!(names.contains(&need.to_string()), "missing {need} in {names:?}");
+        assert!(
+            names.contains(&need.to_string()),
+            "missing {need} in {names:?}"
+        );
     }
 }
 
@@ -70,7 +71,12 @@ fn parse_add_title_kinds() {
     ))
     .unwrap();
     match op {
-        Op::AddGraphic { graphic, start, duration, .. } => {
+        Op::AddGraphic {
+            graphic,
+            start,
+            duration,
+            ..
+        } => {
             assert_eq!(graphic.kind, GraphicKind::LowerThird);
             assert_eq!(graphic.text, "Ada");
             assert!((start.as_seconds() - 1.5).abs() < 1e-6);
@@ -107,13 +113,12 @@ fn parse_place_clip_excerpt() {
 
 #[test]
 fn parse_mixer_curves_mask_remap_and_generator() {
-    let mix = op_from_mcp(&call(
-        "set_mix",
-        json!({ "gain_db": -3.0, "pan": 0.5 }),
-    ))
-    .unwrap();
+    let mix = op_from_mcp(&call("set_mix", json!({ "gain_db": -3.0, "pan": 0.5 }))).unwrap();
     match mix {
-        Op::SetMix { track_id: None, mix } => {
+        Op::SetMix {
+            track_id: None,
+            mix,
+        } => {
             assert!((mix.gain_db + 3.0).abs() < 1e-3);
             assert!((mix.pan - 0.5).abs() < 1e-3);
         }
@@ -140,7 +145,9 @@ fn parse_mixer_curves_mask_remap_and_generator() {
     ))
     .unwrap();
     match mask {
-        Op::SetMask { mask: Some(shape), .. } => {
+        Op::SetMask {
+            mask: Some(shape), ..
+        } => {
             assert_eq!(shape.shape, oc_core::MaskShape::Ellipse);
             assert!(shape.invert);
         }
@@ -184,7 +191,11 @@ fn parse_mixer_curves_mask_remap_and_generator() {
 
 #[test]
 fn grade_defaults_are_zero_and_transition_keeps_duration() {
-    let grade = op_from_mcp(&call("set_grade", json!({ "clip_id": clip(), "lut": "film" }))).unwrap();
+    let grade = op_from_mcp(&call(
+        "set_grade",
+        json!({ "clip_id": clip(), "lut": "film" }),
+    ))
+    .unwrap();
     match grade {
         Op::SetGrade { grade, .. } => {
             assert_eq!(grade.exposure, 0.0);
@@ -213,11 +224,7 @@ fn grade_defaults_are_zero_and_transition_keeps_duration() {
         Op::SetTransition { duration, .. } => assert_eq!(duration, Some(0.4)),
         other => panic!("{other:?}"),
     }
-    let batched = op_from_mcp(&call(
-        "set_grade",
-        json!({ "all": true, "exposure": 0.1 }),
-    ))
-    .unwrap();
+    let batched = op_from_mcp(&call("set_grade", json!({ "all": true, "exposure": 0.1 }))).unwrap();
     assert!(matches!(batched, Op::StyleClips { all: true, .. }));
 }
 

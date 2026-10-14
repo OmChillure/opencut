@@ -17,11 +17,10 @@ use tracing_subscriber::EnvFilter;
 
 use crate::routes::{
     apply_ops, chat, complete_upload, create_chat, create_project, delete_project,
-    generate_captions, get_chat, get_export, get_media_file, get_project, head_export, health,
-    list_ai_providers, list_chats, list_media, list_projects, open_session, patch_media,
-    get_media_speech, post_media_poster, put_media_bytes, put_media_spool, put_media_speech,
-    register_media, request_upload,
-    save_chat_messages, transcribe_media, update_project,
+    generate_captions, get_chat, get_export, get_media_file, get_media_speech, get_project,
+    head_export, health, list_ai_providers, list_chats, list_media, list_projects, open_session,
+    patch_media, post_media_poster, put_media_bytes, put_media_speech, put_media_spool,
+    register_media, request_upload, save_chat_messages, transcribe_media, update_project,
 };
 use crate::state::AppState;
 

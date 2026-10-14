@@ -33,7 +33,10 @@ pub fn frame_for_picture(width: u32, height: u32, rotation: i32) -> (u32, u32) {
 pub fn mp4_display_size(bytes: &[u8]) -> Option<(u32, u32)> {
     let mut from = 0;
     while from + 4 <= bytes.len() {
-        let Some(rel) = bytes[from..].windows(4).position(|window| window == b"tkhd") else {
+        let Some(rel) = bytes[from..]
+            .windows(4)
+            .position(|window| window == b"tkhd")
+        else {
             break;
         };
         let at = from + rel;
@@ -132,10 +135,7 @@ mod tests {
     fn a_sideways_tkhd_reports_the_upright_size() {
         let bytes = tkhd(0, TURN_LEFT, 3840, 2160);
         assert_eq!(mp4_display_size(&bytes), Some((2160, 3840)));
-        assert_eq!(
-            frame_for_picture(2160, 3840, 0),
-            (1080, 1920)
-        );
+        assert_eq!(frame_for_picture(2160, 3840, 0), (1080, 1920));
     }
 
     #[test]

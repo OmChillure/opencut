@@ -1128,7 +1128,10 @@ async fn speech_media(
     Ok(media)
 }
 
-async fn speech_out(state: &AppState, media: &oc_db::MediaRow) -> Result<Json<SpeechOut>, ApiError> {
+async fn speech_out(
+    state: &AppState,
+    media: &oc_db::MediaRow,
+) -> Result<Json<SpeechOut>, ApiError> {
     let stored = oc_db::has_transcript(&state.db, media.id).await?;
     let cues = if stored {
         oc_db::count_transcript_cues(&state.db, media.id).await?

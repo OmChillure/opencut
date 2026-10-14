@@ -220,15 +220,9 @@ async fn list_for_project_wasm(project_id: &str) -> Result<Vec<HeldMeta>, String
         let legacy = kind == HoldBody::LegacyBytes || has_binary_bytes(&record);
         if legacy {
             let rewritten = if let Ok(blob) = blob_from_record(&record) {
-                save_blob(
-                    project_id,
-                    &meta.id,
-                    &meta.name,
-                    &meta.content_type,
-                    &blob,
-                )
-                .await
-                .is_ok()
+                save_blob(project_id, &meta.id, &meta.name, &meta.content_type, &blob)
+                    .await
+                    .is_ok()
             } else {
                 false
             };

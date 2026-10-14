@@ -10,11 +10,11 @@ mod registry;
 mod review;
 mod watch;
 
-pub use frame::{frame_for_picture, mp4_display_size};
 pub use finish::{
     CoverShot, SpokenLine, caption_recipe_for, has_burnable_captions, mapped_cues, program_clips,
     redress_unset_captions,
 };
+pub use frame::{frame_for_picture, mp4_display_size};
 pub use intent::{Intent, asks_for_whole_piece, is_director_request, parse_intent};
 pub use mcp::{
     Inspect, McpCall, McpTool, call_changes_timeline, inspect_from_mcp, mcp_tools, op_from_mcp,
