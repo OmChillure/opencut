@@ -749,16 +749,151 @@ fn seated_slots(
     windows: &[SourceWindow],
     lines: &[SpokenLine],
 ) -> Vec<EditSlot> {
-    let mut seated = slots.to_vec();
-    for slot in &mut seated {
+    let mut seated = Vec::new();
+    for slot in slots {
         let file_end = windows
             .iter()
             .filter(|window| window.media == slot.media_id)
             .map(|window| window.duration)
             .fold(0.0, f64::max);
-        seat_on_speech(slot, lines, file_end);
+        seated.extend(split_throwaways(slot, lines, file_end));
     }
     seated
+}
+
+/// One file laid down whole still loses the um, the retake gap, and the dead air.
+/// A breath under 0.7s stays. A silent picture stays where the model put it.
+fn split_throwaways(slot: &EditSlot, lines: &[SpokenLine], file_end: f64) -> Vec<EditSlot> {
+    let speed = slot_speed(slot);
+    let src_in = slot.source_in.max(0.0);
+    let src_out = src_in + slot.duration.max(0.2) * speed;
+    let mut rows: Vec<&SpokenLine> = lines
+        .iter()
+        .filter(|line| line.media == slot.media_id && line.end > line.start + 0.05)
+        .collect();
+    rows.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let keepers: Vec<&SpokenLine> = rows
+        .iter()
+        .copied()
+        .filter(|line| {
+            !crate::finish::is_filler(&line.text)
+                && speech_kept(line.start, line.end, src_in, src_out)
+        })
+        .collect();
+    if keepers.is_empty() {
+        let only_filler = rows.iter().any(|line| {
+            crate::finish::is_filler(&line.text)
+                && ranges_overlap(line.start, line.end, src_in, src_out)
+        });
+        if only_filler {
+            return Vec::new();
+        }
+        return vec![slot.clone()];
+    }
+    let groups = group_keepers(&keepers, &rows);
+    if groups.len() <= 1 {
+        let mut one = slot.clone();
+        seat_on_speech(&mut one, lines, file_end);
+        return vec![one];
+    }
+    let mut pieces = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        let mut piece = slot.clone();
+        let first = group[0].start.max(0.0);
+        let last = group[group.len() - 1].end;
+        piece.source_in = first;
+        piece.duration = (last - first).max(0.2) / speed;
+        if index > 0 {
+            piece.fade_in = None;
+            piece.transition = None;
+            piece.transition_duration = None;
+            piece.end_scale = None;
+            piece.cover = None;
+        }
+        if index + 1 < groups.len() {
+            piece.fade_out = None;
+        }
+        seat_on_speech(&mut piece, lines, file_end);
+        trim_filler_edges(&mut piece, &rows);
+        if piece.duration >= 0.35 {
+            pieces.push(piece);
+        }
+    }
+    if pieces.is_empty() {
+        let mut one = slot.clone();
+        seat_on_speech(&mut one, lines, file_end);
+        vec![one]
+    } else {
+        pieces
+    }
+}
+
+fn slot_speed(slot: &EditSlot) -> f64 {
+    slot.speed
+        .filter(|speed| speed.is_finite() && *speed > 0.05)
+        .map(f64::from)
+        .unwrap_or(1.0)
+}
+
+fn ranges_overlap(start: f64, end: f64, src_in: f64, src_out: f64) -> bool {
+    end.min(src_out) - start.max(src_in) > 0.12
+}
+
+fn group_keepers<'a>(
+    keepers: &[&'a SpokenLine],
+    rows: &[&'a SpokenLine],
+) -> Vec<Vec<&'a SpokenLine>> {
+    let mut groups: Vec<Vec<&SpokenLine>> = Vec::new();
+    for line in keepers {
+        let split = groups
+            .last()
+            .and_then(|group| group.last())
+            .is_some_and(|prev| {
+                let gap = line.start - prev.end;
+                gap >= 0.70 || filler_between(rows, prev.end, line.start)
+            });
+        if split || groups.is_empty() {
+            groups.push(vec![*line]);
+        } else if let Some(group) = groups.last_mut() {
+            group.push(*line);
+        }
+    }
+    groups
+}
+
+fn filler_between(rows: &[&SpokenLine], start: f64, end: f64) -> bool {
+    rows.iter().any(|line| {
+        crate::finish::is_filler(&line.text) && line.end > start + 0.02 && line.start < end - 0.02
+    })
+}
+
+/// A handle must not swallow the um it was supposed to leave out.
+fn trim_filler_edges(slot: &mut EditSlot, rows: &[&SpokenLine]) {
+    let speed = slot_speed(slot);
+    let mut inn = slot.source_in.max(0.0);
+    let mut out = inn + slot.duration.max(0.0) * speed;
+    for line in rows {
+        if !crate::finish::is_filler(&line.text) {
+            continue;
+        }
+        if line.end <= inn + 0.02 || line.start >= out - 0.02 {
+            continue;
+        }
+        if line.end <= inn + 0.35 {
+            inn = inn.max(line.end);
+        } else if line.start >= out - 0.35 {
+            out = out.min(line.start);
+        }
+    }
+    if out < inn + 0.35 {
+        return;
+    }
+    slot.source_in = inn;
+    slot.duration = (out - inn) / speed;
 }
 
 /// Pull a talking slot onto the lines it actually uses.
@@ -1624,6 +1759,128 @@ mod tests {
         );
         assert!(near(pictures[4].source_in.as_seconds(), 30.0));
         assert!(near(pictures[4].source_out().as_seconds(), 34.0));
+    }
+
+    #[test]
+    fn a_whole_file_loses_the_um_and_the_dead_air() {
+        let media = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 20.0;
+        whole.fade_in = Some(0.4);
+        whole.fade_out = Some(0.5);
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole],
+        };
+        let lines = vec![
+            line(media, 1.0, 3.2, "every finalist gets a kit"),
+            line(media, 3.35, 3.9, "um"),
+            line(media, 8.2, 11.0, "and a certificate"),
+        ];
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[window(media, 0.0, 20.0, "close", false)],
+            &[],
+            &lines,
+            &[],
+        )
+        .unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 2, "{pictures:?}");
+        assert!(pictures[0].source_in.as_seconds() < 1.05, "{pictures:?}");
+        assert!(
+            pictures[0].source_out().as_seconds() < 3.4,
+            "the um stays out {:?}",
+            pictures[0].source_out().as_seconds()
+        );
+        assert!(pictures[0].source_out().as_seconds() > 3.15);
+        assert!(pictures[0].look.fade_in.as_seconds() > 0.0);
+        assert!(pictures[1].source_in.as_seconds() > 7.6, "{pictures:?}");
+        assert!(pictures[1].source_in.as_seconds() < 8.25);
+        assert!(pictures[1].source_out().as_seconds() > 11.0);
+        assert_eq!(pictures[1].look.fade_in.as_seconds(), 0.0);
+        assert!(pictures[1].look.fade_out.as_seconds() > 0.0);
+        assert!(pictures[1].look.transition == TransitionKind::Cut);
+    }
+
+    #[test]
+    fn a_short_breath_stays_in_the_line() {
+        let media = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 12.0;
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole],
+        };
+        let lines = vec![
+            line(media, 1.0, 3.0, "the first half"),
+            line(media, 3.4, 6.0, "continues the thought"),
+        ];
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[window(media, 0.0, 12.0, "close", false)],
+            &[],
+            &lines,
+            &[],
+        )
+        .unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 1, "{pictures:?}");
+        assert!(pictures[0].source_in.as_seconds() < 1.05);
+        assert!(pictures[0].source_out().as_seconds() > 5.9);
+    }
+
+    #[test]
+    fn a_filler_only_slot_is_dropped() {
+        let media = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 4.0;
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole],
+        };
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[window(media, 0.0, 8.0, "close", false)],
+            &[],
+            &[line(media, 1.0, 2.2, "um uh")],
+            &[],
+        )
+        .unwrap();
+        assert!(program_pictures(&timeline).is_empty());
     }
 
     #[test]
