@@ -199,6 +199,7 @@ pub fn Projects() -> Element {
                                                 if let Err(err) = api::delete_project(&pid).await {
                                                     status.set(format!("Delete failed — {err}"));
                                                 } else {
+                                                    crate::forget_open_tab(&pid);
                                                     let n = projects.read().len();
                                                     status.set(if n == 0 {
                                                         "No projects yet".into()

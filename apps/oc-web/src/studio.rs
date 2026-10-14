@@ -1,5 +1,5 @@
 //! Editor surfaces modeled on Kdenlive: audio mixer, curves, alpha shapes,
-//! scopes, generators, time remap, undo history, multicam, and the rendered file.
+//! generators, time remap, undo history, multicam, and the rendered file.
 
 use crate::WorkspaceSave;
 use crate::media::{self, Clock, MediaItem, capture_pointer};
@@ -675,110 +675,6 @@ pub fn UndoHistory() -> Element {
 }
 
 #[component]
-pub fn Scopes() -> Element {
-    let mut open = use_signal(|| false);
-    if *open.read() {
-        ensure_scopes();
-    }
-    rsx! {
-        div { class: "scopes",
-            button {
-                class: "btn btn-ghost",
-                onclick: move |_| {
-                    let next = !*open.peek();
-                    open.set(next);
-                },
-                "Scopes"
-            }
-            if *open.read() {
-                canvas {
-                    id: "scope-canvas",
-                    width: "280",
-                    height: "168",
-                    class: "scope-canvas",
-                }
-                p { class: "mixer-note", "Waveform, RGB parade, vectorscope, and histogram of the current monitor frame." }
-            }
-        }
-    }
-}
-
-fn ensure_scopes() {
-    use std::sync::Once;
-    static STARTED: Once = Once::new();
-    STARTED.call_once(|| {
-        spawn(async move {
-            loop {
-                gloo_timers::future::TimeoutFuture::new(400).await;
-                paint_scopes();
-            }
-        });
-    });
-}
-
-pub fn paint_scopes() {
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
-        return;
-    };
-    let Some(canvas) = doc
-        .get_element_by_id("scope-canvas")
-        .and_then(|el| el.dyn_into::<HtmlCanvasElement>().ok())
-    else {
-        return;
-    };
-    let Ok(ctx) = canvas.get_context("2d") else {
-        return;
-    };
-    let Some(ctx) = ctx.and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok()) else {
-        return;
-    };
-    let w = canvas.width() as f64;
-    let h = canvas.height() as f64;
-    let Some(px) = media::graded_frame() else {
-        return;
-    };
-    let plot_h = (h - 42.0).max(48.0);
-    ctx.set_fill_style_str("#111");
-    ctx.fill_rect(0.0, 0.0, w, h);
-    let mut bins = [0u32; 32];
-    // Waveform (luma) on the left third, parade in the middle, vectorscope on the right.
-    for y in (0..90).step_by(2) {
-        for x in (0..160).step_by(2) {
-            let i = ((y * 160 + x) * 4) as usize;
-            if i + 2 >= px.len() {
-                continue;
-            }
-            let x = x / 2;
-            let y = y / 2;
-            let r = px[i] as f64;
-            let g = px[i + 1] as f64;
-            let b = px[i + 2] as f64;
-            let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-            let bin = (luma * 31.0).clamp(0.0, 31.0) as usize;
-            bins[bin] = bins[bin].saturating_add(1);
-            ctx.set_fill_style_str("rgba(180,220,180,0.35)");
-            ctx.fill_rect(x as f64 * 0.9, (1.0 - luma) * (plot_h - 4.0), 1.0, 1.0);
-            ctx.set_fill_style_str("rgba(220,80,80,0.45)");
-            ctx.fill_rect(90.0 + (r / 255.0) * 50.0, y as f64 * 2.4, 1.0, 1.0);
-            ctx.set_fill_style_str("rgba(80,200,80,0.45)");
-            ctx.fill_rect(90.0 + (g / 255.0) * 50.0, y as f64 * 2.4 + 1.0, 1.0, 1.0);
-            ctx.set_fill_style_str("rgba(80,120,220,0.45)");
-            ctx.fill_rect(90.0 + (b / 255.0) * 50.0, y as f64 * 2.4 + 2.0, 1.0, 1.0);
-            let uu = (b - luma * 255.0) / 255.0;
-            let vv = (r - luma * 255.0) / 255.0;
-            ctx.set_fill_style_str("rgba(240,220,120,0.8)");
-            ctx.fill_rect(210.0 + uu * 28.0, (plot_h * 0.5) - vv * 28.0, 1.5, 1.5);
-        }
-    }
-    let peak = bins.iter().copied().max().unwrap_or(1).max(1) as f64;
-    ctx.set_fill_style_str("rgba(220,220,220,0.85)");
-    for (i, count) in bins.iter().enumerate() {
-        let bar = (*count as f64 / peak) * 32.0;
-        ctx.fill_rect(6.0 + i as f64 * 8.4, h - 6.0 - bar, 6.0, bar);
-    }
-}
-
-#[component]
 pub fn MulticamBank() -> Element {
     let save = use_context::<WorkspaceSave>();
     let tool = use_context::<Signal<ToolId>>();
@@ -1149,13 +1045,7 @@ fn film_failed(url: &str) -> bool {
 }
 
 fn stored_count(url: &str) -> usize {
-    FILM.with(|film| {
-        film.borrow()
-            .frames
-            .get(url)
-            .map(Vec::len)
-            .unwrap_or(0)
-    })
+    FILM.with(|film| film.borrow().frames.get(url).map(Vec::len).unwrap_or(0))
 }
 
 fn frame_near(url: &str, at: f64) -> bool {
@@ -1169,9 +1059,7 @@ fn frame_near(url: &str, at: f64) -> bool {
 
 fn drop_wishes(url: &str) {
     FILM.with(|film| {
-        film.borrow_mut()
-            .wishes
-            .retain(|(wish, _)| wish != url);
+        film.borrow_mut().wishes.retain(|(wish, _)| wish != url);
     });
 }
 

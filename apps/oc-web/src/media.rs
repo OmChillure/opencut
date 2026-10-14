@@ -7,7 +7,7 @@ use uuid::Uuid;
 use wasm_bindgen::JsCast;
 use web_sys::{Blob, BlobPropertyBag, HtmlVideoElement, Url};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Clock {
     pub current: Signal<f64>,
     pub duration: Signal<f64>,
@@ -1190,8 +1190,8 @@ thread_local! {
     static LAST_TICK_MS: Cell<f64> = const { Cell::new(0.0) };
     static LAST_PLAY_MS: Cell<f64> = const { Cell::new(0.0) };
     static LAST_SEEK_MS: Cell<f64> = const { Cell::new(0.0) };
+    static LAST_MONITOR_AT: Cell<f64> = const { Cell::new(0.0) };
     static FRONT_IS_B: Cell<bool> = const { Cell::new(false) };
-    static HOLD_SINCE: Cell<f64> = const { Cell::new(0.0) };
 }
 
 pub fn playhead_now() -> f64 {
@@ -1424,22 +1424,123 @@ fn contiguous_source(a: &ProgramShot, b: &ProgramShot) -> bool {
 }
 
 fn preroll(video: &HtmlVideoElement, shot: &ProgramShot) {
+    let key = format!("{}@{:.3}", shot.media_id, shot.source_in.max(0.0));
     let loaded = video.get_attribute("data-media").unwrap_or_default();
     if loaded != shot.media_id {
         let _ = video.set_attribute("data-media", &shot.media_id);
+        let _ = video.set_attribute("data-preroll", "");
         video.set_src(&shot.url);
         video.set_muted(true);
         return;
     }
-    if video.ready_state() >= 2 {
-        let drift = (video.current_time() - shot.source_in).abs();
-        if drift > 0.08 {
-            video.set_current_time(shot.source_in.max(0.0));
-        }
+    if video.ready_state() < 2 {
+        return;
+    }
+    let drift = (video.current_time() - shot.source_in).abs();
+    let stamp = video.get_attribute("data-preroll").unwrap_or_default();
+    let now_ms = js_sys::Date::now();
+    // One seek. Calling this every frame was restarting the decode and stalling the cut.
+    if seek_due(&stamp, &key, drift, now_ms, video.seeking()) {
+        let _ = video.set_attribute("data-preroll", &format!("{key}|{now_ms:.0}"));
+        video.set_current_time(shot.source_in.max(0.0));
     }
     if !video.paused() {
         let _ = video.pause();
     }
+}
+
+/// True when the playhead is off the target and the last seek to that target has settled.
+/// A target that creeps forward while the decode is in flight is the same seek.
+fn seek_due(stamp: &str, key: &str, drift: f64, now_ms: f64, seeking: bool) -> bool {
+    if !drift.is_finite() || drift <= 0.04 {
+        return false;
+    }
+    let Some((pending, issued)) = stamp.split_once('|') else {
+        return true;
+    };
+    let age = now_ms - issued.parse::<f64>().unwrap_or(0.0);
+    let close = keys_close(pending, key);
+    if close && age < 500.0 {
+        return false;
+    }
+    if pending == key {
+        return if seeking { age > 2000.0 } else { age > 500.0 };
+    }
+    if seeking && close && age < 2000.0 {
+        return false;
+    }
+    true
+}
+
+fn keys_close(pending: &str, key: &str) -> bool {
+    let (Some(left), Some(right)) = (trailing_number(pending), trailing_number(key)) else {
+        return false;
+    };
+    (left - right).abs() < 0.5 && key_prefix(pending) == key_prefix(key)
+}
+
+fn trailing_number(key: &str) -> Option<f64> {
+    key.rsplit('@').next()?.parse().ok()
+}
+
+fn key_prefix(key: &str) -> &str {
+    key.rsplit_once('@').map(|(prefix, _)| prefix).unwrap_or("")
+}
+
+/// What to do with the two program elements when the playhead enters a shot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutHandoff {
+    /// The front already shows this shot. Decode the following one on the standby.
+    PrerollNext,
+    /// The standby is already parked on this shot. Show it.
+    Swap,
+    /// The front is still on the previous excerpt. Leave that frame up until the standby arrives.
+    Hold,
+    /// The playhead jumped, or the standby did not arrive. Seek the front once.
+    SeekFront,
+}
+
+fn cut_handoff(
+    front_drift: f64,
+    standby_ready: bool,
+    into_shot: f64,
+    playing: bool,
+    stepped: bool,
+    seek_pending: bool,
+) -> CutHandoff {
+    let front_off = front_drift.is_finite() && front_drift > 0.25;
+    if !playing || !front_off {
+        return CutHandoff::PrerollNext;
+    }
+    if standby_ready {
+        return CutHandoff::Swap;
+    }
+    if seek_pending {
+        return CutHandoff::PrerollNext;
+    }
+    if stepped && into_shot < 1.2 {
+        return CutHandoff::Hold;
+    }
+    CutHandoff::SeekFront
+}
+
+/// Playback ticks move at most a gap-skip. A click on the timeline moves further.
+fn monitor_stepped(now: f64) -> bool {
+    let prev = LAST_MONITOR_AT.with(Cell::get);
+    LAST_MONITOR_AT.with(|cell| cell.set(now));
+    prev > 0.0 && now + 0.02 >= prev && now - prev <= 0.6
+}
+
+fn seek_stamp_pending(video: &HtmlVideoElement, expected: f64, now_ms: f64) -> bool {
+    let stamp = video.get_attribute("data-seek-at").unwrap_or_default();
+    let Some((pending, issued)) = stamp.split_once('|') else {
+        return false;
+    };
+    let age = now_ms - issued.parse::<f64>().unwrap_or(0.0);
+    let Some(target) = trailing_number(pending) else {
+        return false;
+    };
+    age >= 0.0 && age < 2000.0 && (target - expected).abs() < 0.5
 }
 
 fn preroll_ready(video: &HtmlVideoElement, shot: &ProgramShot) -> bool {
@@ -1475,13 +1576,21 @@ fn set_class_token(selector: &str, token: &str, on: bool) {
 }
 
 fn seek_video(video: &HtmlVideoElement, time: f64, force: bool) {
-    let ms = js_sys::Date::now();
-    let last = LAST_SEEK_MS.with(Cell::get);
-    if !force && ms - last < 80.0 {
+    let time = time.max(0.0);
+    let key = format!("{time:.3}");
+    let now_ms = js_sys::Date::now();
+    let stamp = video.get_attribute("data-seek-at").unwrap_or_default();
+    let drift = (video.current_time() - time).abs();
+    if !seek_due(&stamp, &key, drift, now_ms, video.seeking()) {
         return;
     }
-    LAST_SEEK_MS.with(|cell| cell.set(ms));
-    video.set_current_time(time.max(0.0));
+    let last = LAST_SEEK_MS.with(Cell::get);
+    if !force && now_ms - last < 80.0 {
+        return;
+    }
+    LAST_SEEK_MS.with(|cell| cell.set(now_ms));
+    let _ = video.set_attribute("data-seek-at", &format!("{key}|{now_ms:.0}"));
+    video.set_current_time(time);
 }
 
 pub fn css_filter(grade: oc_core::Grade, fx: oc_core::Fx) -> String {
@@ -1939,7 +2048,20 @@ pub fn apply_monitor_look(
                     b.set_src(&next_url);
                 }
             }
-            if b.ready_state() >= 2 && (b.current_time() - next_src).abs() > 0.12 {
+            let mix_drift = (b.current_time() - next_src).abs();
+            let mix_key = format!("mix@{:.3}", next_src.max(0.0));
+            let mix_stamp = b.get_attribute("data-mix-seek").unwrap_or_default();
+            if b.ready_state() >= 2
+                && seek_due(
+                    &mix_stamp,
+                    &mix_key,
+                    mix_drift,
+                    js_sys::Date::now(),
+                    b.seeking(),
+                )
+            {
+                let now_ms = js_sys::Date::now();
+                let _ = b.set_attribute("data-mix-seek", &format!("{mix_key}|{now_ms:.0}"));
                 b.set_current_time(next_src.max(0.0));
             }
             let (b_op, b_tf) = incoming_preview_css(kind, mix);
@@ -1999,7 +2121,13 @@ pub fn apply_monitor_look(
     }
     paint_design(&doc, engine, library, now, playing);
     paint_monitor_matte(&doc, engine.letterbox);
-    let _ = paint_grade_canvas();
+    // A readback of the monitor every tick stalls the frame a new clip is decoded.
+    let show_cube = LIVE.with(|slot| slot.borrow().cube_id.is_some());
+    if show_cube {
+        let _ = paint_grade_canvas();
+    } else {
+        set_class_off("#grade-canvas", true);
+    }
     paint_program(engine, library, now);
     sync_preview_sound(engine, library, now, playing);
 }
@@ -2101,7 +2229,7 @@ fn paint_design(
     };
     let style = if let Some(card) = clip.look.card {
         format!(
-            "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;opacity:{faded:.3};{motion}",
+            "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;right:auto;bottom:auto;object-fit:cover;opacity:{faded:.3};{motion}",
             card.x * 100.0,
             card.y * 100.0,
             card.w * 100.0,
@@ -2134,17 +2262,17 @@ fn paint_design(
         if !playing {
             let _ = video.pause();
             if ready && drift > 0.04 {
-                video.set_current_time(local);
+                seek_video(&video, local, false);
             }
         } else if video.paused() {
             if ready && drift > 0.08 {
-                video.set_current_time(local);
+                seek_video(&video, local, false);
             }
             if ready {
                 let _ = video.play();
             }
         } else if ready && drift > 0.45 {
-            video.set_current_time(local);
+            seek_video(&video, local, false);
         }
         return;
     }
@@ -2158,18 +2286,6 @@ fn paint_design(
     let _ = img.set_attribute("src", &item.url);
     let _ = img.set_attribute("style", &style);
     set_class_off(".preview-design", false);
-}
-
-/// A ramp has no single playbackRate, so the playhead follows the wall clock.
-pub fn uses_wall_clock(engine: &oc_core::Timeline, now: f64) -> bool {
-    let t = oc_core::Time::from_seconds(now);
-    engine.tracks.iter().any(|track| {
-        program_track(track)
-            && track
-                .clips
-                .iter()
-                .any(|clip| !clip.disabled && clip.contains(t) && clip.ramps())
-    })
 }
 
 fn frame_timing(engine: &oc_core::Timeline, shot: &ProgramShot, now: f64) -> (f64, f64, bool) {
@@ -2211,6 +2327,7 @@ pub fn sync_monitor(
     now: f64,
     playing: bool,
 ) {
+    let stepped = monitor_stepped(now);
     sync_preview_sound(engine, library, now, playing);
     let shot = clip_under(tracks, library, now);
     let next = following_shot(tracks, library, now);
@@ -2281,7 +2398,51 @@ pub fn sync_monitor(
                     LAST_SEEK_MS.with(|cell| cell.set(0.0));
                 }
             }
-            if let Some(standby) = standby_video() {
+            let expected =
+                shot.source_in + (now - shot.start).max(0.0) * shot.speed.clamp(0.25, 4.0);
+            let front_drift = if video.ready_state() >= 2 {
+                (video.current_time() - expected).abs()
+            } else {
+                0.0
+            };
+            let standby_ready =
+                standby_video().is_some_and(|standby| preroll_ready(&standby, &shot));
+            let seek_pending = seek_stamp_pending(&video, expected, js_sys::Date::now());
+            let handoff = cut_handoff(
+                front_drift,
+                standby_ready,
+                (now - shot.start).max(0.0),
+                playing && !media_changed,
+                stepped,
+                seek_pending,
+            );
+            if handoff == CutHandoff::Swap {
+                // Seeking the visible element here is the hitch in the middle of the cut.
+                if let Some(standby) = standby_video() {
+                    standby.set_muted(false);
+                    let _ = standby.play();
+                }
+                let _ = video.pause();
+                video.set_muted(true);
+                swap_program();
+                let Some(front) = preview_video() else {
+                    return;
+                };
+                video = front;
+                LAST_PLAY_MS.with(|cell| cell.set(js_sys::Date::now()));
+                LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
+            }
+            let hold = handoff == CutHandoff::Hold;
+            if hold || handoff == CutHandoff::SeekFront {
+                // Keep decoding this shot. Pointing the standby at the one after it
+                // drops the frame we are waiting to show.
+                if let Some(standby) = standby_video() {
+                    preroll(&standby, &shot);
+                }
+                if hold && !video.paused() {
+                    let _ = video.pause();
+                }
+            } else if let Some(standby) = standby_video() {
                 if let Some(next) = &next {
                     if next.kind == MediaKind::Video {
                         preroll(&standby, next);
@@ -2306,14 +2467,12 @@ pub fn sync_monitor(
             let keep_rolling = !wall && next.as_ref().is_some_and(|n| contiguous_source(&shot, n));
 
             if !playing {
-                HOLD_SINCE.with(|cell| cell.set(0.0));
                 let _ = video.pause();
                 if ready && drift > 0.04 {
                     seek_video(&video, src_time, false);
                 }
             } else if past_file {
                 // Hold the last decoded frame. Playing again seeks into a black tail.
-                HOLD_SINCE.with(|cell| cell.set(0.0));
                 let parked = (file_end - 0.08).max(0.0);
                 if (video.current_time() - parked).abs() > 0.04 {
                     seek_video(&video, parked, true);
@@ -2321,7 +2480,6 @@ pub fn sync_monitor(
                 let _ = video.pause();
             } else if near_end && ready {
                 if keep_rolling {
-                    HOLD_SINCE.with(|cell| cell.set(0.0));
                     if let Some(n) = &next {
                         set_playhead(n.start.max(now) + 1e-3);
                         LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
@@ -2330,7 +2488,6 @@ pub fn sync_monitor(
                     n.kind == MediaKind::Video
                         && standby_video().is_some_and(|s| preroll_ready(&s, n))
                 }) {
-                    HOLD_SINCE.with(|cell| cell.set(0.0));
                     if let Some(n) = &next {
                         if let Some(standby) = standby_video() {
                             standby.set_muted(false);
@@ -2343,24 +2500,14 @@ pub fn sync_monitor(
                         LAST_PLAY_MS.with(|cell| cell.set(js_sys::Date::now()));
                         LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                     }
-                } else if next.is_some() {
-                    let now_ms = js_sys::Date::now();
-                    let since = HOLD_SINCE.with(Cell::get);
-                    if since <= 0.0 {
-                        HOLD_SINCE.with(|cell| cell.set(now_ms));
-                    }
-                    if now_ms - HOLD_SINCE.with(Cell::get) < 320.0 {
-                        set_playhead((shot.start + take - 0.04).max(shot.start));
-                        LAST_TICK_MS.with(|cell| cell.set(now_ms));
-                    }
-                } else {
-                    HOLD_SINCE.with(|cell| cell.set(0.0));
+                } else if next.is_none() {
                     let _ = video.pause();
                     set_playhead(shot.start + take);
                     LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
                 }
+            } else if hold {
+                // The outgoing frame stays. The clock keeps moving.
             } else if paused {
-                HOLD_SINCE.with(|cell| cell.set(0.0));
                 if ready && (media_changed || drift > 0.08) {
                     seek_video(&video, src_time, media_changed);
                 }
@@ -2370,10 +2517,7 @@ pub fn sync_monitor(
                     let _ = video.play();
                 }
             } else if ready && drift > 0.45 && since_play > 250.0 {
-                HOLD_SINCE.with(|cell| cell.set(0.0));
                 seek_video(&video, src_time, false);
-            } else {
-                HOLD_SINCE.with(|cell| cell.set(0.0));
             }
             // The wall clock owns the playhead. Following the video clock here
             // skips a push, a dissolve, or a caption pop when this tick stalled.
@@ -2573,6 +2717,47 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_is_not_restarted_while_it_is_in_flight() {
+        assert!(seek_due("", "a@1.000", 1.2, 1_000.0, false));
+        assert!(!seek_due("a@1.000|1000", "a@1.000", 1.2, 1_200.0, false));
+        assert!(seek_due("a@1.000|1000", "a@1.000", 1.2, 1_600.0, false));
+        assert!(!seek_due("a@1.000|1000", "a@1.000", 1.2, 1_600.0, true));
+        assert!(seek_due("a@1.000|1000", "a@1.000", 1.2, 3_200.0, true));
+        assert!(seek_due("a@1.000|1000", "b@4.000", 2.0, 1_100.0, false));
+        assert!(!seek_due("", "a@1.000", 0.02, 1_000.0, false));
+        assert!(!seek_due("1.200|1000", "1.350", 0.8, 1_100.0, true));
+        assert!(seek_due("1.200|1000", "6.000", 4.0, 1_100.0, true));
+    }
+
+    #[test]
+    fn a_cut_waits_for_the_standby_and_a_jump_does_not() {
+        assert_eq!(
+            cut_handoff(2.0, true, 0.05, true, true, false),
+            CutHandoff::Swap
+        );
+        assert_eq!(
+            cut_handoff(2.0, false, 0.05, true, true, false),
+            CutHandoff::Hold
+        );
+        assert_eq!(
+            cut_handoff(2.0, false, 0.05, true, false, false),
+            CutHandoff::SeekFront
+        );
+        assert_eq!(
+            cut_handoff(2.0, false, 2.0, true, true, false),
+            CutHandoff::SeekFront
+        );
+        assert_eq!(
+            cut_handoff(0.05, false, 0.05, true, true, false),
+            CutHandoff::PrerollNext
+        );
+        assert_eq!(
+            cut_handoff(2.0, false, 0.05, true, true, true),
+            CutHandoff::PrerollNext
+        );
+    }
+
+    #[test]
     fn a_black_grab_is_not_a_picture_and_a_bright_pixel_is() {
         assert!(!frame_has_picture(&[0, 0, 0, 255, 2, 2, 2, 255]));
         let mut bytes = vec![0u8; 16];
@@ -2720,9 +2905,25 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(uses_wall_clock(&timeline, 0.2));
-        assert!(uses_wall_clock(&timeline, 3.95));
-        assert!(!uses_wall_clock(&timeline, 4.2));
+        let media_id = timeline
+            .first_track(oc_core::TrackKind::Video)
+            .unwrap()
+            .clips[0]
+            .media_id
+            .unwrap();
+        let shot = ProgramShot {
+            media_id: media_id.to_string(),
+            url: String::new(),
+            kind: MediaKind::Video,
+            start: 0.0,
+            source_in: 0.0,
+            duration: 4.0,
+            speed: 1.0,
+        };
+        let wall = |now| super::frame_timing(&timeline, &shot, now).2;
+        assert!(wall(0.2));
+        assert!(wall(3.95));
+        assert!(!wall(4.2));
     }
 
     #[test]
@@ -3274,10 +3475,6 @@ fn monitor_size() -> (f64, f64) {
         .unwrap_or((16.0, 9.0))
 }
 
-pub fn graded_frame() -> Option<Vec<u8>> {
-    program_scope_sample().or_else(paint_grade_canvas)
-}
-
 fn program_pixels(frame_w: u32, frame_h: u32) -> (u32, u32) {
     let fw = frame_w.max(2) as f32;
     let fh = frame_h.max(2) as f32;
@@ -3313,8 +3510,7 @@ fn paint_program(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
             set_class_off("#program-canvas", true);
         }
         oc_core::compositor::MonitorPath::Gpu => {
-            let (shift, scope) = monitor_shift_and_scope(&fitted, &sources, &engine.cubes, now);
-            store_gpu_scope(scope);
+            let shift = monitor_shift(&fitted, &sources, &engine.cubes, now);
             if oc_core::compositor::present_monitor(
                 &canvas,
                 &fitted,
@@ -3333,7 +3529,6 @@ fn paint_program(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
         }
         oc_core::compositor::MonitorPath::Cpu => {
             set_gpu_class("#program-canvas", false);
-            clear_gpu_scope();
             let surface = oc_core::compositor::composite(&fitted, &sources, &engine.cubes);
             let stabilize = fitted.layers.iter().any(|layer| {
                 matches!(
@@ -3364,16 +3559,12 @@ fn paint_program(engine: &oc_core::Timeline, library: &[MediaItem], now: f64) {
     }
 }
 
-fn monitor_shift_and_scope(
+fn monitor_shift(
     plan: &oc_core::compositor::FramePlan,
     sources: &[oc_core::compositor::FrameSource],
     cubes: &[oc_core::CubeLut],
     now: f64,
-) -> ((i32, i32), Vec<u8>) {
-    let mut thumb_plan = plan.clone();
-    thumb_plan.width = GRADE_W;
-    thumb_plan.height = GRADE_H;
-    let thumb = oc_core::compositor::composite(&thumb_plan, sources, cubes);
+) -> (i32, i32) {
     let stabilize = plan.layers.iter().any(|layer| {
         matches!(
             layer,
@@ -3386,20 +3577,19 @@ fn monitor_shift_and_scope(
     });
     if !stabilize {
         reset_stabilize();
-        return ((0, 0), thumb.rgba);
+        return (0, 0);
     }
+    let mut thumb_plan = plan.clone();
+    thumb_plan.width = GRADE_W;
+    thumb_plan.height = GRADE_H;
+    let thumb = oc_core::compositor::composite(&thumb_plan, sources, cubes);
     let correction = STAB.with(|slot| {
         let mut state = slot.borrow_mut();
         stab_correction(&mut state, &thumb, now)
     });
-    let scope = if correction == (0, 0) {
-        thumb.rgba
-    } else {
-        shift_surface(&thumb, correction.0, correction.1).rgba
-    };
     let dx = ((correction.0 as f32) * (plan.width as f32 / STAB_W as f32)).round() as i32;
     let dy = ((correction.1 as f32) * (plan.height as f32 / STAB_H as f32)).round() as i32;
-    ((dx, dy), scope)
+    (dx, dy)
 }
 
 fn sources_ready(
@@ -3694,15 +3884,6 @@ impl Default for StabMem {
 
 thread_local! {
     static STAB: RefCell<StabMem> = RefCell::new(StabMem::default());
-    static GPU_SCOPE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
-}
-
-fn store_gpu_scope(pixels: Vec<u8>) {
-    GPU_SCOPE.with(|slot| *slot.borrow_mut() = Some(pixels));
-}
-
-fn clear_gpu_scope() {
-    GPU_SCOPE.with(|slot| *slot.borrow_mut() = None);
 }
 
 fn reset_stabilize() {
@@ -3880,43 +4061,6 @@ fn blit_surface(
         return false;
     };
     ctx.put_image_data(&image, 0.0, 0.0).is_ok()
-}
-
-fn program_scope_sample() -> Option<Vec<u8>> {
-    let canvas = program_canvas()?;
-    let class = canvas.get_attribute("class").unwrap_or_default();
-    if class.split_whitespace().any(|part| part == "off") {
-        return None;
-    }
-    if class.split_whitespace().any(|part| part == "gpu") {
-        return GPU_SCOPE.with(|slot| slot.borrow().clone());
-    }
-    let w = canvas.width();
-    let h = canvas.height();
-    if w < 2 || h < 2 {
-        return None;
-    }
-    let ctx = canvas
-        .get_context("2d")
-        .ok()
-        .flatten()?
-        .dyn_into::<web_sys::CanvasRenderingContext2d>()
-        .ok()?;
-    let data = ctx.get_image_data(0.0, 0.0, w as f64, h as f64).ok()?;
-    let src = data.data().0;
-    let mut out = vec![0u8; (GRADE_W * GRADE_H * 4) as usize];
-    for y in 0..GRADE_H {
-        for x in 0..GRADE_W {
-            let sx = (x * (w - 1) / (GRADE_W - 1)).min(w - 1);
-            let sy = (y * (h - 1) / (GRADE_H - 1)).min(h - 1);
-            let s = ((sy * w + sx) * 4) as usize;
-            let d = ((y * GRADE_W + x) * 4) as usize;
-            if s + 3 < src.len() && d + 3 < out.len() {
-                out[d..d + 4].copy_from_slice(&src[s..s + 4]);
-            }
-        }
-    }
-    Some(out)
 }
 
 fn paint_grade_canvas() -> Option<Vec<u8>> {
@@ -4249,15 +4393,19 @@ fn sync_bed_el(media: &web_sys::HtmlMediaElement, key: &str, bed: Option<&BedCue
     media.set_playback_rate(bed.rate);
     let ready = media.ready_state() >= 2;
     let drift = (media.current_time() - bed.source).abs();
-    if !playing {
-        let _ = media.pause();
-        if ready && drift > 0.08 {
+    let want_seek = ready && ((playing && drift > 0.45) || (!playing && drift > 0.08));
+    if want_seek {
+        let key = format!("{:.3}", bed.source);
+        let stamp = media.get_attribute("data-seek-at").unwrap_or_default();
+        let now_ms = js_sys::Date::now();
+        if seek_due(&stamp, &key, drift, now_ms, media.seeking()) {
+            let _ = media.set_attribute("data-seek-at", &format!("{key}|{now_ms:.0}"));
             media.set_current_time(bed.source);
         }
-        return;
     }
-    if ready && drift > 0.45 {
-        media.set_current_time(bed.source);
+    if !playing {
+        let _ = media.pause();
+        return;
     }
     if media.paused() && ready {
         let _ = media.play();

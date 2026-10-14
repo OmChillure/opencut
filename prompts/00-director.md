@@ -63,7 +63,7 @@ The request chooses the shape.
     - `import_cube` loads a `.cube` onto one video clip. `text` is the whole file. It replaces the named LUT on that clip.
     - `set_frame_rate` sets `fps` (23.976, 24, 25, 29.97, 30, 50, 59.94, or 60). Clips stay where they are.
     - `set_background` sets the monitor and letterbox color (`#rrggbb`, or black, white, gray, charcoal).
-    Scopes, filmstrips, waveforms, and undo history are the editor's own view. You do not call them. A finished piece exports itself once the review has no `fix:` lines.
+    Filmstrips, waveforms, and undo history are the editor's own view. You do not call them. A finished piece exports itself once the review has no `fix:` lines.
 16. **Captions follow the footage.** One caption theme for the whole video. The words are the transcript. Call `edit_skill` `captions` for the decision, then `edit_skill` `caption-looks`, and set `caption_preset` to the one id that page names. Set `captions: true` only when the words should be on screen. Leave `caption_mood` empty. A style word does not pick it. A vertical frame is not a reason to pick a loud preset. That same face, color, and effect is used on every line. Rust moves a line only to keep it off a close mouth and inside the frame. Do not give the first line one style and the next line another. Type stays in front of the picture. A caption is a short line in a band. It does not cover the picture and it does not leave the frame.
 
 ## After a cut already exists
