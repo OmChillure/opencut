@@ -377,8 +377,38 @@ async fn scene_cuts(input: &Path) -> Result<Vec<f64>, crate::MediaError> {
     Ok(times)
 }
 
+const LOOK_SDR: &str = "scale=384:-2";
+/// Phone clips are PQ or HLG. A plain scale of those frames is a flat gray picture.
+const LOOK_HDR: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=384:-2";
+
+/// The scale `see` and `watch` use. HDR is tonemapped so the model sees the picture.
+fn look_filter(color_transfer: &str) -> &'static str {
+    match color_transfer.trim() {
+        "smpte2084" | "arib-std-b67" => LOOK_HDR,
+        _ => LOOK_SDR,
+    }
+}
+
 /// One JPEG at `at` seconds. 384px wide keeps the frame readable and the vision tokens small.
+///
+/// HDR is tonemapped. A filter the build cannot run falls back to a plain scale.
 pub async fn grab_jpeg(input: &Path, at: f64, dest: &Path) -> Result<(), crate::MediaError> {
+    let filter = look_filter(&color_transfer(input).await);
+    if grab_filtered_jpeg(input, at, dest, filter).await.is_ok() {
+        return Ok(());
+    }
+    if filter != LOOK_SDR && grab_filtered_jpeg(input, at, dest, LOOK_SDR).await.is_ok() {
+        return Ok(());
+    }
+    Err(crate::MediaError::Ffmpeg("no jpeg".into()))
+}
+
+async fn grab_filtered_jpeg(
+    input: &Path,
+    at: f64,
+    dest: &Path,
+    filter: &str,
+) -> Result<(), crate::MediaError> {
     let out = Command::new("ffmpeg")
         .args([
             "-y",
@@ -389,7 +419,7 @@ pub async fn grab_jpeg(input: &Path, at: f64, dest: &Path) -> Result<(), crate::
             "-frames:v",
             "1",
             "-vf",
-            "scale=384:-2",
+            filter,
             "-q:v",
             "8",
             &path_str(dest),
@@ -670,6 +700,14 @@ fn path_str(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phone_transfer_is_tonemapped_for_the_model() {
+        assert!(look_filter("smpte2084").contains("tonemap"));
+        assert!(look_filter("arib-std-b67").contains("tonemap"));
+        assert_eq!(look_filter("bt709"), LOOK_SDR);
+        assert_eq!(look_filter("  "), LOOK_SDR);
+    }
 
     #[test]
     fn labels_dark_frame() {
