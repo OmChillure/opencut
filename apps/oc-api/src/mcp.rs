@@ -76,6 +76,10 @@ pub fn builtin_mcp_acp(project_id: &str, tool_allow: Option<&str>) -> Option<Val
             }
         }
     }
+    env.push(json!({
+        "name": "OPENCUT_SPOOL_DIR",
+        "value": oc_db::spool_root().to_string_lossy(),
+    }));
     if let Some(allow) = tool_allow.map(str::trim).filter(|allow| !allow.is_empty()) {
         env.push(json!({ "name": "OPENCUT_TOOL_ALLOW", "value": allow }));
     }
@@ -365,6 +369,7 @@ mod tests {
         assert_eq!(mcp["args"][0], "mcp");
         let env = mcp["env"].as_array().unwrap();
         assert!(env.iter().any(|e| e["name"] == "OPENCUT_PROJECT_ID"));
+        assert!(env.iter().any(|e| e["name"] == "OPENCUT_SPOOL_DIR"));
         assert!(!env.iter().any(|e| e["name"] == "OPENCUT_TOOL_ALLOW"));
         let Some(limited) = builtin_mcp_acp(
             "11111111-1111-1111-1111-111111111111",

@@ -427,6 +427,63 @@ mod browser_bin_tests {
         assert!(listed.contains("frame=1080x1920"), "{listed}");
     }
 
+    #[tokio::test]
+    async fn a_browser_clip_opens_from_the_temporary_copy() {
+        let row = spool_row();
+        let path = oc_db::render_spool_file(row.project_id, row.id, &row.filename);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, vec![9u8; 64]).unwrap();
+        let mut temps = Vec::new();
+        let opened = super::open_for_frames(&row, None, &mut temps).await;
+        assert_eq!(opened.as_deref(), Some(path.as_path()));
+        assert!(temps.is_empty(), "the temporary copy must stay for export");
+        assert!(path.is_file());
+        let text = run_inspect(
+            Inspect::ListBin,
+            &Timeline::default(),
+            std::slice::from_ref(&row),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(text.contains("hold=browser"), "{text}");
+        assert!(text.contains("temporary copy"), "{text}");
+        assert!(!text.contains("cannot open"), "{text}");
+        std::fs::remove_file(&path).unwrap();
+        let mut temps = Vec::new();
+        assert!(
+            super::open_for_frames(&row, None, &mut temps)
+                .await
+                .is_none()
+        );
+        let gone = run_inspect(
+            Inspect::ListBin,
+            &Timeline::default(),
+            std::slice::from_ref(&row),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(gone.contains("see and watch cannot open them"), "{gone}");
+    }
+
+    fn spool_row() -> oc_db::MediaRow {
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-7000-8000-0000000000aa",
+            "project_id": "00000000-0000-7000-8000-0000000000bb",
+            "r2_key": "workspace/00000000-0000-7000-8000-0000000000aa",
+            "filename": "phone.mp4",
+            "content_type": "video/mp4",
+            "byte_size": null,
+            "duration_ticks": 240000,
+            "width": 1080,
+            "height": 1920,
+            "status": "browser",
+            "created_at": "2026-10-08T00:00:00Z"
+        }))
+        .expect("spool media row")
+    }
+
     fn media_row(
         filename: &str,
         content_type: &str,
@@ -860,9 +917,7 @@ pub(crate) async fn watch_range(
     let opened = open_for_frames(row, r2, &mut temps).await;
     let Some(path) = opened else {
         clear_frame_temps(&mut temps).await;
-        return Err(format!(
-            "media {media_id} stays in the browser that imported it"
-        ));
+        return Err(frames_unavailable(row, media_id));
     };
     let mut frames = Vec::new();
     for at in &times {
@@ -1087,9 +1142,7 @@ pub(crate) async fn see_frame(
     let opened = open_for_frames(row, r2, &mut temps).await;
     let Some(path) = opened else {
         clear_frame_temps(&mut temps).await;
-        return Err(format!(
-            "media {media_id} stays in the browser that imported it"
-        ));
+        return Err(frames_unavailable(row, media_id));
     };
     let dest = std::env::temp_dir().join(format!("oc-see-{}-{}.jpg", media_id, Uuid::new_v4()));
     let grabbed = oc_media::grab_jpeg(&path, at, &dest).await;
@@ -1109,13 +1162,46 @@ pub(crate) async fn see_frame(
     })
 }
 
+fn frames_unavailable(row: &oc_db::MediaRow, media_id: Uuid) -> String {
+    if oc_db::is_r2_object_key(&row.r2_key) {
+        format!("could not open media {media_id}")
+    } else {
+        format!("media {media_id} stays in the browser that imported it")
+    }
+}
+
+/// A browser clip is readable once this browser has sent the temporary spool.
+/// That file is not an R2 object and is not added to `temps`, so a later cleanup
+/// does not delete the copy export still needs.
+fn look_copy_ready(row: &oc_db::MediaRow) -> bool {
+    if oc_db::is_r2_object_key(&row.r2_key) {
+        return true;
+    }
+    if row.content_type.starts_with("audio/") {
+        return false;
+    }
+    let path = oc_db::render_spool_file(row.project_id, row.id, &row.filename);
+    std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() > 32)
+}
+
+fn browser_picture(row: &oc_db::MediaRow) -> bool {
+    row.r2_key.starts_with("workspace/") && !row.content_type.starts_with("audio/")
+}
+
 async fn open_for_frames(
     row: &oc_db::MediaRow,
     r2: Option<&oc_db::R2>,
     temps: &mut Vec<std::path::PathBuf>,
 ) -> Option<std::path::PathBuf> {
     if !oc_db::is_r2_object_key(&row.r2_key) {
-        return None;
+        if !look_copy_ready(row) {
+            return None;
+        }
+        return Some(oc_db::render_spool_file(
+            row.project_id,
+            row.id,
+            &row.filename,
+        ));
     }
     let r2 = r2?;
     let bytes = r2.get_bytes(&row.r2_key).await.ok()?;
@@ -1252,9 +1338,17 @@ pub(crate) fn run_inspect(
                 ));
             }
             if browser_held {
-                out.push_str(
-                    "These clips stay in the browser that imported them. see and watch cannot open them.\n",
-                );
+                let pictures: Vec<&oc_db::MediaRow> =
+                    media.iter().filter(|row| browser_picture(row)).collect();
+                if pictures.is_empty() || pictures.iter().any(|row| !look_copy_ready(row)) {
+                    out.push_str(
+                        "These clips stay in the browser that imported them. see and watch cannot open them.\n",
+                    );
+                } else {
+                    out.push_str(
+                        "These clips stay in the browser that imported them. see and watch read the temporary copy this browser sent. Nothing is stored on Cloudflare.\n",
+                    );
+                }
             }
             out
         }

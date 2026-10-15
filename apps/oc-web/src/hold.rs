@@ -1,5 +1,6 @@
 //! Imported pictures stay in this browser. IndexedDB is per site visitor, so the
-//! editor works without sending the file to Cloudflare or to the server disk.
+//! editor works without sending the file to Cloudflare. A chat may send a temporary
+//! spool so see and watch can read a frame. That copy is not the media library.
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;

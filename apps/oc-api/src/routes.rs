@@ -1060,6 +1060,33 @@ pub async fn put_media_spool(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// Byte size of the temporary copy, when this browser has already sent it.
+/// The file stays out of Cloudflare. A missing copy is 404.
+pub async fn head_media_spool(
+    State(state): State<AppState>,
+    Path((id, media_id)): Path<(Uuid, Uuid)>,
+    SignedIn(email): SignedIn,
+) -> ApiResult<Response> {
+    owned(&state, id, &email).await?;
+    let media = oc_db::get_media(&state.db, media_id).await?;
+    if media.project_id != id {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "media not in project"));
+    }
+    let path = oc_db::render_spool_file(id, media_id, &media.filename);
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "no temporary copy"))?;
+    if !meta.is_file() || meta.len() <= 32 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "no temporary copy"));
+    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_LENGTH, meta.len().to_string())
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
 #[derive(Serialize)]
 pub(crate) struct SpeechOut {
     stored: bool,
@@ -1077,8 +1104,9 @@ pub async fn get_media_speech(
     speech_out(&state, &media).await
 }
 
-/// Read this browser's clip once and store the transcript. The file is not kept,
-/// the media key stays `workspace/`, and a later cut uses the stored words.
+/// Read this browser's clip once and store the transcript. The media key stays
+/// `workspace/`. A picture is also kept as a temporary spool so see and watch can
+/// read a frame. That copy is not stored on Cloudflare.
 pub async fn put_media_speech(
     State(state): State<AppState>,
     Path((id, media_id)): Path<(Uuid, Uuid)>,
@@ -1095,6 +1123,11 @@ pub async fn put_media_speech(
     }
     if body.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty clip"));
+    }
+    if !media.content_type.starts_with("audio/") {
+        if let Err(err) = oc_db::write_render_spool(id, media_id, &media.filename, &body).await {
+            tracing::warn!(project = %id, media = %media_id, "look copy was not kept: {err}");
+        }
     }
     let transcript = transcript_from_bytes(&body).await.map_err(|err| {
         ApiError::new(

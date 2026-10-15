@@ -7145,6 +7145,18 @@ fn send_prompt(
                     .push(ChatMsg::status(format!("Speech was not stored — {err}")));
             }
         }
+        if api::chat_current(turn) {
+            messages.write().push(ChatMsg::status(
+                "Preparing the picture so the edit can see it. The file stays in this browser and is not stored on Cloudflare.".to_string(),
+            ));
+        }
+        if let Err(err) = api::send_look_sources(&pid).await {
+            if api::chat_current(turn) {
+                messages.write().push(ChatMsg::status(format!(
+                    "The edit cannot see the picture yet — {err}"
+                )));
+            }
+        }
         if !api::chat_current(turn) {
             turn_clock.stamp();
             let _ = save_chat_now(&pid, &bound, chat_id, chats, messages).await;

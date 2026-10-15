@@ -144,6 +144,25 @@ fn should_send_speech(content_type: &str, already_stored: bool) -> bool {
     !already_stored && !content_type.starts_with("image/")
 }
 
+/// A picture this browser holds. Audio and a cached poster are not a look.
+fn should_send_look(id: &str, content_type: &str, name: &str) -> bool {
+    if crate::hold::is_poster_id(id) || content_type.starts_with("audio/") {
+        return false;
+    }
+    if content_type.starts_with("video/") || content_type.starts_with("image/") {
+        return true;
+    }
+    !matches!(
+        crate::media::MediaKind::from_name(name),
+        crate::media::MediaKind::Audio
+    )
+}
+
+/// True when the temporary copy is the same file this browser holds.
+fn spool_size_matches(on_disk: u64, blob_size: f64) -> bool {
+    blob_size > 0.0 && on_disk == blob_size.round() as u64
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct SpeechOut {
     stored: bool,
@@ -207,6 +226,96 @@ async fn ensure_speech_wasm(project_id: &str) -> Result<(), String> {
         store_speech_blob(project_id, &file.id, &file.content_type, &blob).await?;
     }
     Ok(())
+}
+
+/// Send pictures this browser holds so `see`, `watch`, and the grade look can read them.
+/// A copy that is already the same size is left in place. Nothing is written to Cloudflare.
+/// `true` means at least one file was sent.
+pub async fn send_look_sources(project_id: &str) -> Result<bool, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return send_look_sources_wasm(project_id).await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = project_id;
+        Ok(false)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_look_sources_wasm(project_id: &str) -> Result<bool, String> {
+    let held = crate::hold::list_for_project(project_id).await?;
+    let mut sent = false;
+    let mut first_err: Option<String> = None;
+    for file in held {
+        if !should_send_look(&file.id, &file.content_type, &file.name) {
+            continue;
+        }
+        let blob = match crate::hold::load_blob(project_id, &file.id).await {
+            Ok(blob) => blob,
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+                continue;
+            }
+        };
+        match ensure_spooled(project_id, &file.id, &blob).await {
+            Ok(uploaded) => sent |= uploaded,
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    Ok(sent)
+}
+
+/// PUT a blob only when the temporary copy is missing or a different size.
+#[cfg(target_arch = "wasm32")]
+async fn ensure_spooled(
+    project_id: &str,
+    media_id: &str,
+    blob: &web_sys::Blob,
+) -> Result<bool, String> {
+    let size = blob.size();
+    if size <= 0.0 {
+        return Err("empty clip".into());
+    }
+    if let Some(len) = spool_len(project_id, media_id).await {
+        if spool_size_matches(len, size) {
+            return Ok(false);
+        }
+    }
+    put_blob(
+        &format!("{API}/v1/projects/{project_id}/media/{media_id}/spool"),
+        blob,
+    )
+    .await?;
+    Ok(true)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn spool_len(project_id: &str, media_id: &str) -> Option<u64> {
+    let response = authed(reqwest::Client::new().head(format!(
+        "{API}/v1/projects/{project_id}/media/{media_id}/spool"
+    )))
+    .send()
+    .await
+    .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
 }
 
 /// A server play URL. A blob, or an empty URL, is not one: the picture stays in the browser.
@@ -531,11 +640,7 @@ async fn send_browser_sources_wasm(project_id: &str) -> Result<(), String> {
         let blob = crate::hold::load_blob(project_id, &id)
             .await
             .map_err(|_| format!("These clips are not in this browser: {id}"))?;
-        put_blob(
-            &format!("{API}/v1/projects/{project_id}/media/{id}/spool"),
-            &blob,
-        )
-        .await?;
+        ensure_spooled(project_id, &id, &blob).await.map(|_| ())?;
     }
     Ok(())
 }
@@ -1216,6 +1321,23 @@ mod tests {
         assert!(!should_send_speech("video/mp4", true));
         assert!(!should_send_speech("image/jpeg", false));
         assert!(!should_send_speech("image/png", true));
+    }
+
+    #[test]
+    fn a_look_is_sent_for_a_picture_and_skipped_when_the_copy_matches() {
+        assert!(should_send_look("clip", "video/mp4", "phone.mp4"));
+        assert!(should_send_look("clip", "image/jpeg", "still.jpg"));
+        assert!(should_send_look(
+            "clip",
+            "application/octet-stream",
+            "take.mov"
+        ));
+        assert!(!should_send_look("clip", "audio/mpeg", "bed.mp3"));
+        assert!(should_send_look("clip", "video/mp4", "bed.mp3"));
+        assert!(!should_send_look("clip:poster", "image/jpeg", "poster.jpg"));
+        assert!(spool_size_matches(1200, 1200.0));
+        assert!(!spool_size_matches(1200, 900.0));
+        assert!(!spool_size_matches(0, 0.0));
     }
 
     #[test]
