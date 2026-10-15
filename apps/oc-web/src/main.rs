@@ -213,12 +213,7 @@ fn end_upload(mut uploading: Signal<Vec<String>>, id: &str) {
     uploading.write().retain(|row| row != id);
 }
 
-fn note_upload(
-    uploading: Signal<Vec<String>>,
-    id: &str,
-    name: &str,
-    result: Result<(), String>,
-) {
+fn note_upload(uploading: Signal<Vec<String>>, id: &str, name: &str, result: Result<(), String>) {
     end_upload(uploading, id);
     match result {
         Ok(()) => show_toast().success(format!("{name} saved in this browser")),
@@ -987,7 +982,11 @@ fn held_for_project(project_id: &str, held: &[HeldImport]) -> Vec<HeldImport> {
 
 /// Keep clips from both lists, except ones removed in this tab.
 /// A blob already on a row wins. An empty row takes a blob. Pins fill anything still missing.
-fn union_library(project_id: &str, mut base: Vec<MediaItem>, extra: &[MediaItem]) -> Vec<MediaItem> {
+fn union_library(
+    project_id: &str,
+    mut base: Vec<MediaItem>,
+    extra: &[MediaItem],
+) -> Vec<MediaItem> {
     base.retain(|item| !is_buried(project_id, &item.id));
     let extra: Vec<MediaItem> = extra
         .iter()
@@ -2169,9 +2168,9 @@ pub(crate) fn forget_open_tab(id: &str) {
 mod open_tab_tests {
     use super::{
         Aspect, EditorTrack, EngineTimeline, MediaItem, MediaKind, OpenTab, TrackKindUi,
-        WorkspaceSnap, bury_media, close_open_tab, ensure_tab, forget_workspace, fresh_project_name,
-        merge_media, neighbor_after_close, pin_media, recall, remember_fill, remember_stash,
-        rename_tab,
+        WorkspaceSnap, bury_media, close_open_tab, ensure_tab, forget_workspace,
+        fresh_project_name, merge_media, neighbor_after_close, pin_media, recall, remember_fill,
+        remember_stash, rename_tab,
     };
 
     fn sample_snap(name: &str, media_id: &str, url: &str) -> WorkspaceSnap {
@@ -2432,10 +2431,22 @@ mod open_tab_tests {
         remember_fill(id, 1, sample_snap("one", "clip", "blob:clip"));
         bury_media(id, "clip");
         remember_fill(id, 2, sample_snap("two", "clip", "blob:again"));
-        assert!(!recall(id).unwrap().library.iter().any(|item| item.id == "clip"));
+        assert!(
+            !recall(id)
+                .unwrap()
+                .library
+                .iter()
+                .any(|item| item.id == "clip")
+        );
         forget_workspace(id);
         remember_fill(id, 3, sample_snap("reload", "clip", "blob:clip"));
-        assert!(recall(id).unwrap().library.iter().any(|item| item.id == "clip"));
+        assert!(
+            recall(id)
+                .unwrap()
+                .library
+                .iter()
+                .any(|item| item.id == "clip")
+        );
         forget_workspace(id);
     }
 }
@@ -5013,13 +5024,8 @@ async fn run_speech_job(job: SpeechJob) {
             store_frame(job.save, &job.media_id, width, height, false);
         }
     }
-    let speech = api::transcribe_blob(
-        &job.project_id,
-        &job.media_id,
-        &job.content_type,
-        &job.file,
-    )
-    .await;
+    let speech =
+        api::transcribe_blob(&job.project_id, &job.media_id, &job.content_type, &job.file).await;
     ensure_library_item(&job.project_id, job.library, job.active, &job.item);
     if let Err(err) = speech {
         show_toast().error(format!(
@@ -6545,15 +6551,9 @@ async fn register_if_needed(project_id: &str, file: &hold::HeldMeta, remote_ids:
         note_registered(project_id, &file.id);
         return;
     }
-    if api::register_media(
-        project_id,
-        &file.id,
-        &file.name,
-        &file.content_type,
-        0.0,
-    )
-    .await
-    .is_ok()
+    if api::register_media(project_id, &file.id, &file.name, &file.content_type, 0.0)
+        .await
+        .is_ok()
     {
         note_registered(project_id, &file.id);
     }
