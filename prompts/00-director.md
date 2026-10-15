@@ -30,7 +30,8 @@ The request chooses the shape.
   Do not drop the file because the head, the middle, or the tail is weak, and do not lay
   the whole file down because one line in it is good. `source_in` is where the keeper
   starts. `duration` stops before the um, the retake, the repeated line, the walk-in, or
-  the dead air. The next slot of that file starts after that stretch. The gaps list is
+  the dead air. A silent hold after the last word is dead air, even when it is not um or uh.
+  The next slot of that file starts after that stretch. The gaps list is
   those stretches. A slot does not cover a gap.
 
 ## Rules

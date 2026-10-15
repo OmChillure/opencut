@@ -695,6 +695,32 @@ fn leftover_speech(clips: &[&Clip], speech: &[Spoken], request: &str) -> Vec<Str
                 clip.end().as_seconds()
             ));
         }
+        let last_word = inside
+            .iter()
+            .filter(|line| !line_is_filler(&line.text))
+            .max_by(|a, b| {
+                a.end
+                    .partial_cmp(&b.end)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some(last) = last_word {
+            let past = src_out - last.end;
+            if past >= 0.70 {
+                let speed = if clip.speed.is_finite() && clip.speed > 0.0 {
+                    f64::from(clip.speed)
+                } else {
+                    1.0
+                };
+                let tail_at = clip.start.as_seconds() + (last.end - src_in).max(0.0) / speed;
+                notes.push(format!(
+                    "quiet tail {:.1}–{:.1}s holds {:.1}s after the last word (source {:.2}s)",
+                    tail_at,
+                    clip.end().as_seconds(),
+                    past,
+                    last.end
+                ));
+            }
+        }
     }
     notes
 }
@@ -912,7 +938,7 @@ mod tests {
     #[test]
     fn clean_short_cut_has_no_fix_lines() {
         let media = MediaId::new();
-        let tl = tl_with(vec![video_clip(media, 0.0, 8.0, 2.0)]);
+        let tl = tl_with(vec![video_clip(media, 0.0, 4.2, 2.0)]);
         let speech = vec![Spoken {
             media,
             start: 2.2,
@@ -921,6 +947,37 @@ mod tests {
         }];
         let review = review_cut(&tl, &speech, "trim the open");
         assert!(!review.issues, "{}", review.text);
+    }
+
+    #[test]
+    fn a_quiet_tail_after_the_last_word_is_sent_back() {
+        let media = MediaId::new();
+        let speech = vec![Spoken {
+            media,
+            start: 0.4,
+            end: 5.0,
+            text: "food and refreshments are on the house".into(),
+        }];
+        let review = review_cut(
+            &tl_with(vec![video_clip(media, 0.0, 10.0, 0.0)]),
+            &speech,
+            "cinematic edit",
+        );
+        assert!(review.text.contains("quiet tail"), "{}", review.text);
+        let held = review_cut(
+            &tl_with(vec![video_clip(media, 0.0, 5.4, 0.0)]),
+            &speech,
+            "cinematic edit",
+        );
+        assert!(!held.text.contains("quiet tail"), "{}", held.text);
+        let quiet = MediaId::new();
+        let film = review_cut(
+            &tl_with(vec![video_clip(quiet, 0.0, 4.0, 0.0)]),
+            &[],
+            "cinematic edit",
+        );
+        assert!(!film.text.contains("silence kept"), "{}", film.text);
+        assert!(!film.text.contains("quiet tail"), "{}", film.text);
     }
 
     #[test]

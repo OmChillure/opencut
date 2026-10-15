@@ -1813,6 +1813,53 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_hold_after_the_last_word_is_cut() {
+        let media = MediaId::new();
+        let quiet = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 17.54;
+        let mut silent = slot(quiet, 30.0);
+        silent.duration = 4.0;
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole, silent],
+        };
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[
+                window(media, 0.0, 17.54, "close", false),
+                window(quiet, 0.0, 40.0, "wide", true),
+            ],
+            &[],
+            &[line(
+                media,
+                8.0,
+                12.54,
+                "food and refreshments are on the house",
+            )],
+            &[],
+        )
+        .unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 2, "{pictures:?}");
+        assert!(pictures[0].source_out().as_seconds() < 13.0, "{pictures:?}");
+        assert!(pictures[0].source_out().as_seconds() > 12.5);
+        assert!(near(pictures[1].source_in.as_seconds(), 30.0));
+        assert!(near(pictures[1].source_out().as_seconds(), 34.0));
+    }
+
+    #[test]
     fn a_short_breath_stays_in_the_line() {
         let media = MediaId::new();
         let mut whole = slot(media, 0.0);
