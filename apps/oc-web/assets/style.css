@@ -1195,6 +1195,8 @@ button.proj-tab-name { cursor: pointer; }
   min-width: 0;
   scrollbar-width: thin;
   scrollbar-color: #3a3a3a transparent;
+  touch-action: none;
+  user-select: none;
 }
 .tl-scroll::-webkit-scrollbar { height: 8px; }
 .tl-scroll::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 4px; }

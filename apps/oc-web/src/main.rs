@@ -14,12 +14,13 @@ use dioxus::prelude::*;
 use media::item_from_blob;
 use media::{
     Clock, DragSession, DragSource, EditMode, EditTool, EditorTrack, MediaItem, MediaKind,
-    TrackKindUi, advance_playhead, apply_monitor_look, capture_pointer, clamp_pps, clip_duration,
-    clip_name, commit_drag, display_tracks, film_tiles, fit_scale, format_clock, lane_height,
-    max_timeline_h, next_track_name, paint_clock, paint_playhead, place_clip, playhead_now,
-    preview_video, program_end, reset_tick_clock, ruler_marks_nle, scroll_left, seek_by,
-    set_media_duration, set_playhead, sync_monitor, timeline_end, timeline_viewport_h,
-    timeline_viewport_w, update_drag, video_duration_from_src,
+    TrackKindUi, advance_playhead, apply_monitor_look, capture_pointer, clip_duration, clip_name,
+    commit_drag, display_tracks, film_tiles, fit_pps, fit_scale, format_clock, lane_height,
+    max_timeline_h, next_track_name, paint_clock, paint_playhead, pinch_pps, place_clip,
+    playhead_now, preview_video, program_end, reset_tick_clock, ruler_marks_nle, scroll_for_zoom,
+    scroll_left, scroll_origin, seek_by, set_media_duration, set_playhead, set_scroll_left,
+    sync_monitor, timeline_end, timeline_span, timeline_viewport_h, timeline_viewport_w,
+    update_drag, video_duration_from_src, wheel_pps,
 };
 use oc_core::TimelineEditMode;
 use oc_core::{
@@ -3788,6 +3789,143 @@ fn Preview(aspect: Signal<Aspect>, playing: Signal<bool>) -> Element {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TimePinch {
+    pps: f64,
+    dist: f64,
+    anchor: f64,
+    view_x: f64,
+}
+
+fn touch_point(evt: &Event<PointerData>) -> Option<(i32, f64, f64)> {
+    if !evt.data().pointer_type().eq_ignore_ascii_case("touch") {
+        return None;
+    }
+    let at = evt.client_coordinates();
+    Some((evt.data().pointer_id(), at.x, at.y))
+}
+
+fn remember_finger(fingers: &[(i32, f64, f64)], point: (i32, f64, f64)) -> Vec<(i32, f64, f64)> {
+    let mut next: Vec<_> = fingers
+        .iter()
+        .copied()
+        .filter(|row| row.0 != point.0)
+        .collect();
+    next.push(point);
+    if next.len() > 2 {
+        next.remove(0);
+    }
+    next
+}
+
+fn finger_span(fingers: &[(i32, f64, f64)]) -> f64 {
+    if fingers.len() < 2 {
+        return 0.0;
+    }
+    let dx = fingers[0].1 - fingers[1].1;
+    let dy = fingers[0].2 - fingers[1].2;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn pinch_from(fingers: &[(i32, f64, f64)], pps: f64) -> TimePinch {
+    let (origin, scroll) = scroll_origin();
+    let mid = (fingers[0].1 + fingers[1].1) * 0.5;
+    let view_x = (mid - origin).max(0.0);
+    TimePinch {
+        pps,
+        dist: finger_span(fingers).max(1.0),
+        anchor: scroll + view_x,
+        view_x,
+    }
+}
+
+fn capture_scroller(ids: &[i32]) {
+    let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(".tl-scroll").ok().flatten())
+    else {
+        return;
+    };
+    for id in ids {
+        let _ = el.set_pointer_capture(*id);
+    }
+}
+
+fn release_finger(
+    fingers: &std::rc::Rc<std::cell::RefCell<Vec<(i32, f64, f64)>>>,
+    pinch: &std::rc::Rc<std::cell::Cell<Option<TimePinch>>>,
+    evt: &Event<PointerData>,
+) {
+    let id = evt.data().pointer_id();
+    let mut list = fingers.borrow_mut();
+    list.retain(|row| row.0 != id);
+    if list.len() < 2 {
+        pinch.set(None);
+    }
+}
+
+fn zoom_wheel(evt: &Event<WheelData>, pps_now: f64) -> Option<(f64, f64)> {
+    let next = wheel_pps(pps_now, evt.data().delta().strip_units().y);
+    if (next - pps_now).abs() < 0.01 {
+        return None;
+    }
+    let (origin, scroll) = scroll_origin();
+    let view_x = (evt.client_coordinates().x - origin).max(0.0);
+    Some((
+        next,
+        scroll_for_zoom(pps_now, next, scroll + view_x, view_x),
+    ))
+}
+
+fn apply_zoom(
+    mut zoom_held: Signal<bool>,
+    mut pps: Signal<f64>,
+    mut pending: Signal<Option<f64>>,
+    next: f64,
+    scroll: f64,
+) {
+    let scroll = scroll.max(0.0);
+    zoom_held.set(true);
+    pending.set(Some(scroll));
+    if (*pps.peek() - next).abs() > 0.01 {
+        pps.set(next);
+    } else {
+        set_scroll_left(scroll);
+    }
+}
+
+/// Ctrl or meta plus wheel is a trackpad pinch. The listener must not be passive,
+/// or the browser zooms the page and ignores preventDefault.
+fn bind_timeline_wheel() -> bool {
+    let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(".tl-scroll").ok().flatten())
+    else {
+        return false;
+    };
+    let closure =
+        wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::WheelEvent| {
+            if event.ctrl_key() || event.meta_key() {
+                event.prevent_default();
+            }
+        }) as Box<dyn FnMut(web_sys::WheelEvent)>);
+    let opts = web_sys::AddEventListenerOptions::new();
+    opts.set_capture(true);
+    opts.set_passive(false);
+    if el
+        .add_event_listener_with_callback_and_add_event_listener_options(
+            "wheel",
+            closure.as_ref().unchecked_ref(),
+            &opts,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    closure.forget();
+    true
+}
+
 #[component]
 fn Timeline() -> Element {
     let library = use_context::<Signal<Vec<MediaItem>>>();
@@ -3804,13 +3942,32 @@ fn Timeline() -> Element {
     let mut tl_drag = use_context::<Signal<Option<(f64, f64)>>>();
     let save = use_context::<WorkspaceSave>();
     let uploading = use_context::<CtxUploading>().0;
+    let mut asset_tab = use_context::<Signal<AssetTab>>();
     let mut view_h = use_signal(|| 280.0_f64);
     let mut view_w = use_signal(|| 800.0_f64);
     let mut trim = use_signal(|| None::<(String, bool)>);
+    let mut zoom_held = use_signal(|| false);
+    let mut pending_scroll = use_signal(|| None::<f64>);
+    let fingers =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(Vec::<(i32, f64, f64)>::new())));
+    let pinch = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(None::<TimePinch>)));
+    let wheel_bound = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     let now = *clock.current.read();
-    let span = program_end(&tracks.read()).max(8.0);
-    let canvas_w = (span * *pps.read() + 160.0).max(*view_w.read());
-    let playhead = format!("left: {}px", now * *pps.read());
+    let span = timeline_span(&tracks.read());
+    let view_now = *view_w.read();
+    let held = *zoom_held.read();
+    let stored_pps = *pps.read();
+    let pps_now = if held {
+        stored_pps
+    } else {
+        fit_pps(span, view_now)
+    };
+    let canvas_w = if held {
+        (span * pps_now).max(view_now)
+    } else {
+        view_now.max(1.0)
+    };
+    let playhead = format!("left: {}px", now * pps_now);
     let now_label = format_clock(now);
     let dur_label = format_clock(span);
     let rows = display_tracks(&tracks.read());
@@ -3833,9 +3990,48 @@ fn Timeline() -> Element {
             }
         }
     });
+    use_effect(move || {
+        let width = *view_w.read();
+        let span_now = timeline_span(&tracks.read());
+        let trimming = trim.read().is_some();
+        let dragging = drag.read().is_some();
+        if *zoom_held.peek() || trimming || dragging {
+            return;
+        }
+        let next = fit_pps(span_now, width);
+        if (*pps.peek() - next).abs() > 0.05 {
+            pps.set(next);
+        }
+        pending_scroll.set(Some(0.0));
+        set_scroll_left(0.0);
+    });
+    use_effect(move || {
+        let _ = *pps.read();
+        if let Some(x) = *pending_scroll.read() {
+            set_scroll_left(x);
+        }
+    });
+    let bound = wheel_bound.clone();
+    use_effect(move || {
+        let _ = *view_w.read();
+        if bound.get() {
+            return;
+        }
+        if bind_timeline_wheel() {
+            bound.set(true);
+        }
+    });
+    let fingers_down = fingers.clone();
+    let fingers_move = fingers.clone();
+    let fingers_up = fingers.clone();
+    let fingers_cancel = fingers.clone();
+    let pinch_down = pinch.clone();
+    let pinch_move = pinch.clone();
+    let pinch_up = pinch.clone();
+    let pinch_cancel = pinch.clone();
     let tool = *edit_tool.read();
     let target_id = target_track.read().clone();
-    let marks = ruler_marks_nle(span, *pps.read());
+    let marks = ruler_marks_nle(span, pps_now);
 
     rsx! {
         section {
@@ -4170,8 +4366,66 @@ fn Timeline() -> Element {
                 }
                 div {
                     class: "tl-scroll",
-                    "data-pps": "{*pps.read()}",
+                    "data-pps": "{pps_now}",
                     "data-span": "{span}",
+                    onwheel: move |evt| {
+                        if !(evt.modifiers().ctrl() || evt.modifiers().meta()) {
+                            return;
+                        }
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        let Some((next, scroll)) = zoom_wheel(&evt, *pps.peek()) else {
+                            return;
+                        };
+                        apply_zoom(zoom_held, pps, pending_scroll, next, scroll);
+                    },
+                    onpointerdown: move |evt| {
+                        let Some(point) = touch_point(&evt) else {
+                            return;
+                        };
+                        let mut list = fingers_down.borrow_mut();
+                        *list = remember_finger(&list, point);
+                        if list.len() < 2 {
+                            return;
+                        }
+                        evt.prevent_default();
+                        zoom_held.set(true);
+                        drag.set(None);
+                        trim.set(None);
+                        suppress_seek.set(true);
+                        pinch_down.set(Some(pinch_from(&list, *pps.peek())));
+                        capture_scroller(&[list[0].0, list[1].0]);
+                    },
+                    onpointermove: move |evt| {
+                        let Some(point) = touch_point(&evt) else {
+                            return;
+                        };
+                        let mut list = fingers_move.borrow_mut();
+                        if !list.iter().any(|row| row.0 == point.0) {
+                            return;
+                        }
+                        *list = remember_finger(&list, point);
+                        let Some(origin) = pinch_move.get() else {
+                            return;
+                        };
+                        if list.len() < 2 {
+                            return;
+                        }
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        let next = pinch_pps(origin.pps, origin.dist, finger_span(&list));
+                        let scroll = scroll_for_zoom(
+                            origin.pps,
+                            next,
+                            origin.anchor,
+                            origin.view_x,
+                        );
+                        apply_zoom(zoom_held, pps, pending_scroll, next, scroll);
+                    },
+                    onpointerup: move |evt| release_finger(&fingers_up, &pinch_up, &evt),
+                    onpointercancel: move |evt| {
+                        release_finger(&fingers_cancel, &pinch_cancel, &evt);
+                    },
                     onclick: move |evt| {
                         if *suppress_seek.peek() {
                             suppress_seek.set(false);
@@ -4179,27 +4433,33 @@ fn Timeline() -> Element {
                         }
                         let x = evt.element_coordinates().x + scroll_left();
                         if x > 0.0 {
-                            seek_to_time(clock, x / *pps.read());
+                            seek_to_time(clock, x / pps_now);
                         }
                     },
                     div {
                         class: "ruler",
                         style: "width: {canvas_w}px",
-                        title: "Scroll to zoom time",
-                        onwheel: move |evt| {
-                            let dy = evt.data().delta().strip_units().y;
-                            if dy.abs() < 0.1 {
-                                return;
-                            }
+                        title: "Scroll or pinch to stretch time. Double-click to fit.",
+                        ondoubleclick: move |evt| {
                             evt.prevent_default();
                             evt.stop_propagation();
-                            let factor = if dy > 0.0 { 1.0 / 1.15 } else { 1.15 };
-                            let next = clamp_pps(*pps.peek() * factor);
+                            zoom_held.set(false);
+                            let next = fit_pps(span, *view_w.peek());
                             pps.set(next);
+                            pending_scroll.set(Some(0.0));
+                            set_scroll_left(0.0);
+                        },
+                        onwheel: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            let Some((next, scroll)) = zoom_wheel(&evt, *pps.peek()) else {
+                                return;
+                            };
+                            apply_zoom(zoom_held, pps, pending_scroll, next, scroll);
                         },
                         for mark in marks.iter() {
                             {
-                                let left = mark.time * *pps.read();
+                                let left = mark.time * pps_now;
                                 let cls = if mark.major { "r-tick major" } else { "r-tick" };
                                 rsx! {
                                     span { class: "{cls}", style: "left: {left}px",
@@ -4212,7 +4472,7 @@ fn Timeline() -> Element {
                         }
                         for marker in save.engine.read().markers.iter() {
                             {
-                                let left = marker.time.as_seconds() * *pps.read();
+                                let left = marker.time.as_seconds() * pps_now;
                                 let name = marker.name.clone();
                                 rsx! {
                                     span {
@@ -4276,7 +4536,7 @@ fn Timeline() -> Element {
                                             if x <= 0.0 {
                                                 return;
                                             }
-                                            let at = x / *pps.read();
+                                            let at = x / pps_now;
                                             if *edit_tool.peek() == EditTool::Razor {
                                                 let _ = tools::split_at(save, pick_lane.as_str(), at);
                                                 return;
@@ -4293,8 +4553,8 @@ fn Timeline() -> Element {
                                         },
                                         for clip in track.clips.iter() {
                                             {
-                                                let left = clip.start * *pps.read();
-                                                let width = (clip.duration * *pps.read()).max(24.0);
+                                                let left = clip.start * pps_now;
+                                                let width = (clip.duration * pps_now).max(24.0);
                                                 let item = library.read().iter().find(|m| m.id == clip.media_id).cloned();
                                                 let name = clip_name(clip, item.as_ref().map(|m| m.name.as_str()));
                                                 let url = item.as_ref().map(|m| m.url.clone()).unwrap_or_default();
@@ -4496,8 +4756,8 @@ fn Timeline() -> Element {
                                         }
                                         if let Some((at, dur, ref ghost_name)) = ghost {
                                             {
-                                                let left = at * *pps.read();
-                                                let width = (dur * *pps.read()).max(24.0);
+                                                let left = at * pps_now;
+                                                let width = (dur * pps_now).max(24.0);
                                                 let label = format!(
                                                     "{}  {}",
                                                     ghost_name,

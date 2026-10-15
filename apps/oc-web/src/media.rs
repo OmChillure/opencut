@@ -382,11 +382,52 @@ pub fn film_tiles(width_px: f64) -> i32 {
     ((width_px / 48.0).floor() as i32).clamp(1, 32)
 }
 
-pub const PPS_MIN: f64 = 10.0;
-pub const PPS_MAX: f64 = 80.0;
+pub const PPS_MIN: f64 = 0.5;
+pub const PPS_MAX: f64 = 480.0;
 
 pub fn clamp_pps(pps: f64) -> f64 {
     pps.clamp(PPS_MIN, PPS_MAX)
+}
+
+/// Pixels per second that stretches `span` across the timeline panel.
+pub fn fit_pps(span: f64, view_w: f64) -> f64 {
+    let span = if span.is_finite() && span > 0.25 {
+        span
+    } else {
+        8.0
+    };
+    let view = if view_w.is_finite() && view_w > 160.0 {
+        view_w
+    } else {
+        800.0
+    };
+    clamp_pps(view / span)
+}
+
+/// Two fingers apart stretch time. Two fingers together compress it.
+pub fn pinch_pps(origin_pps: f64, origin_dist: f64, dist: f64) -> f64 {
+    if !(origin_pps.is_finite() && origin_dist >= 1.0 && dist.is_finite() && dist > 0.0) {
+        return clamp_pps(origin_pps);
+    }
+    clamp_pps(origin_pps * (dist / origin_dist))
+}
+
+/// Wheel zoom. A positive delta compresses time. A negative delta stretches it.
+pub fn wheel_pps(pps: f64, delta_y: f64) -> f64 {
+    if !(pps.is_finite() && delta_y.is_finite() && delta_y.abs() >= 0.01) {
+        return clamp_pps(pps);
+    }
+    let factor = if delta_y > 0.0 { 1.0 / 1.15 } else { 1.15 };
+    clamp_pps(pps * factor)
+}
+
+/// Scroll offset that keeps `anchor_content` under the same viewport pixel after a zoom.
+pub fn scroll_for_zoom(prev_pps: f64, next_pps: f64, anchor_content: f64, view_x: f64) -> f64 {
+    if !(prev_pps.is_finite() && prev_pps > 0.0 && next_pps.is_finite()) {
+        return 0.0;
+    }
+    let time = anchor_content / prev_pps;
+    (time * next_pps - view_x).max(0.0)
 }
 
 pub fn wave_bars(seed: &str, n: usize) -> Vec<u8> {
@@ -440,6 +481,28 @@ pub fn scroll_left() -> f64 {
         .and_then(|d| d.query_selector(".tl-scroll").ok().flatten())
         .map(|el| f64::from(el.scroll_left()))
         .unwrap_or(0.0)
+}
+
+pub fn set_scroll_left(x: f64) {
+    let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(".tl-scroll").ok().flatten())
+    else {
+        return;
+    };
+    el.set_scroll_left(x.round().max(0.0) as i32);
+}
+
+/// Left edge of the timeline scroller, in client pixels, and its current scroll.
+pub fn scroll_origin() -> (f64, f64) {
+    let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(".tl-scroll").ok().flatten())
+    else {
+        return (0.0, 0.0);
+    };
+    let rect = el.get_bounding_client_rect();
+    (rect.left(), f64::from(el.scroll_left()))
 }
 
 pub fn next_track_name(tracks: &[EditorTrack], kind: TrackKindUi) -> String {
@@ -1021,6 +1084,18 @@ pub fn close_editor_gaps(tracks: &mut [EditorTrack]) {
             cursor = track.clips[i].end();
         }
     }
+}
+
+/// How wide the ruler is. Includes captions so a line past the picture still has a frame.
+pub fn timeline_span(tracks: &[EditorTrack]) -> f64 {
+    tracks
+        .iter()
+        .filter(|track| !track.hidden)
+        .flat_map(|track| track.clips.iter())
+        .filter(|clip| !clip.disabled)
+        .map(TimelineClip::end)
+        .fold(0.0, f64::max)
+        .max(8.0)
 }
 
 /// End of the picture the monitor should play. Captions and the source file length do not extend it.
@@ -2579,6 +2654,21 @@ pub fn seek_by(clock: Clock, delta: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_timeline_fits_the_panel_and_a_pinch_stretches_it() {
+        let fitted = fit_pps(10.0, 1000.0);
+        assert!((fitted - 100.0).abs() < 1e-6);
+        assert!((pinch_pps(fitted, 100.0, 150.0) - 150.0).abs() < 1e-6);
+        assert!((pinch_pps(fitted, 100.0, 50.0) - 50.0).abs() < 1e-6);
+        assert!((wheel_pps(fitted, -1.0) - 115.0).abs() < 1e-6);
+        assert!((wheel_pps(fitted, 1.0) - (100.0 / 1.15)).abs() < 1e-6);
+        let scroll = scroll_for_zoom(100.0, 200.0, 400.0, 200.0);
+        assert!((scroll - 600.0).abs() < 1e-6);
+        let tracks = vec![video_track(vec![clip("a", "m", 0.0, 12.0)])];
+        assert!((timeline_span(&tracks) - 12.0).abs() < 1e-6);
+        assert!((timeline_span(&[]) - 8.0).abs() < 1e-6);
+    }
 
     fn clip(id: &str, media: &str, start: f64, duration: f64) -> TimelineClip {
         TimelineClip {
