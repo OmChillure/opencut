@@ -1496,13 +1496,6 @@ fn export_probe_requested(raw: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LocalExport {
-    Absent,
-    Writing { modified_ms: u64 },
-    Ready { modified_ms: u64 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ExportStamp {
     modified_ms: u64,
 }
@@ -1510,21 +1503,12 @@ struct ExportStamp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportChoice {
     Wait,
-    Local,
     Remote,
 }
 
-enum LocatedExport {
-    Local(std::path::PathBuf),
-    Remote { key: String, bytes: u64 },
-}
-
-fn export_dir() -> String {
-    std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into())
-}
-
-fn local_export_path(id: Uuid, preset: oc_core::ExportPreset) -> std::path::PathBuf {
-    std::path::PathBuf::from(export_dir()).join(preset.file_name(id))
+struct RemoteExport {
+    key: String,
+    bytes: u64,
 }
 
 fn export_preset_wire(preset: oc_core::ExportPreset) -> String {
@@ -1551,26 +1535,6 @@ fn export_probe_state(file_ready: bool, job_status: Option<&str>) -> &'static st
     }
 }
 
-fn file_modified_ms(path: &std::path::Path) -> Option<u64> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|age| age.as_millis() as u64)
-}
-
-fn read_local_export(path: &std::path::Path) -> LocalExport {
-    if !path.is_file() {
-        return LocalExport::Absent;
-    }
-    let modified_ms = file_modified_ms(path).unwrap_or(0);
-    if mp4_has_moov(path) {
-        LocalExport::Ready { modified_ms }
-    } else {
-        LocalExport::Writing { modified_ms }
-    }
-}
-
 fn export_is_current(modified_ms: u64, job_started_ms: Option<i64>) -> bool {
     match job_started_ms {
         Some(started) if started > 0 => {
@@ -1580,32 +1544,12 @@ fn export_is_current(modified_ms: u64, job_started_ms: Option<i64>) -> bool {
     }
 }
 
-/// Pick the requested preset. A newer file of another preset is not a candidate.
-/// A file older than the latest export job is the previous render.
-fn choose_export(
-    local: LocalExport,
-    remote: Option<ExportStamp>,
-    job_started_ms: Option<i64>,
-) -> ExportChoice {
-    if let LocalExport::Writing { modified_ms } = local {
-        if job_started_ms.is_some() && export_is_current(modified_ms, job_started_ms) {
-            return ExportChoice::Wait;
-        }
-    }
-    let local_ms = match local {
-        LocalExport::Ready { modified_ms } if export_is_current(modified_ms, job_started_ms) => {
-            Some(modified_ms)
-        }
-        _ => None,
-    };
-    let remote_ms = remote
-        .filter(|stamp| export_is_current(stamp.modified_ms, job_started_ms))
-        .map(|stamp| stamp.modified_ms);
-    match (local_ms, remote_ms) {
-        (Some(local_ms), Some(remote_ms)) if remote_ms > local_ms => ExportChoice::Remote,
-        (Some(_), _) => ExportChoice::Local,
-        (None, Some(_)) => ExportChoice::Remote,
-        (None, None) => ExportChoice::Wait,
+/// A file older than this preset's latest export job is the previous render.
+fn choose_export(remote: Option<ExportStamp>, job_started_ms: Option<i64>) -> ExportChoice {
+    if remote.is_some_and(|stamp| export_is_current(stamp.modified_ms, job_started_ms)) {
+        ExportChoice::Remote
+    } else {
+        ExportChoice::Wait
     }
 }
 
@@ -1626,10 +1570,8 @@ async fn locate_export(
     state: &AppState,
     id: Uuid,
     preset: oc_core::ExportPreset,
-) -> Result<LocatedExport, ApiError> {
+) -> Result<RemoteExport, ApiError> {
     let started = oc_db::latest_export_job_ms(&state.db, id, &export_preset_wire(preset)).await?;
-    let path = local_export_path(id, preset);
-    let local = read_local_export(&path);
     let filename = preset.file_name(id);
     let key = oc_media::export_object_key(ProjectId::from_uuid(id), &filename);
     let (remote, head_failed) = match &state.r2 {
@@ -1642,18 +1584,16 @@ async fn locate_export(
         },
         None => (None, false),
     };
+    let bytes = remote.map(|item| item.bytes).unwrap_or(0);
     let stamp = remote.map(|item| ExportStamp {
         modified_ms: item.modified_ms,
     });
-    match choose_export(local, stamp, started) {
-        ExportChoice::Local => Ok(LocatedExport::Local(path)),
-        ExportChoice::Remote => Ok(LocatedExport::Remote {
-            key,
-            bytes: remote.map(|item| item.bytes).unwrap_or(0),
-        }),
-        ExportChoice::Wait if head_failed && matches!(local, LocalExport::Absent) => Err(
-            ApiError::new(StatusCode::BAD_GATEWAY, "export store is unavailable"),
-        ),
+    match choose_export(stamp, started) {
+        ExportChoice::Remote => Ok(RemoteExport { key, bytes }),
+        ExportChoice::Wait if head_failed => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "export store is unavailable",
+        )),
         ExportChoice::Wait => Err(ApiError::new(StatusCode::NOT_FOUND, "no export yet")),
     }
 }
@@ -1677,15 +1617,8 @@ pub async fn head_export(
 ) -> ApiResult<Response> {
     owned(&state, id, &email).await?;
     let preset = requested_preset(&state, id, &query.preset).await?;
-    match locate_export(&state, id, preset).await? {
-        LocatedExport::Local(path) => {
-            let len = std::fs::metadata(&path)
-                .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "no export yet"))?
-                .len();
-            Ok(export_head(len))
-        }
-        LocatedExport::Remote { bytes, .. } => Ok(export_head(bytes)),
-    }
+    let export = locate_export(&state, id, preset).await?;
+    Ok(export_head(export.bytes))
 }
 
 pub async fn get_export(
@@ -1693,35 +1626,26 @@ pub async fn get_export(
     Path(id): Path<Uuid>,
     Query(query): Query<ExportQuery>,
     SignedIn(email): SignedIn,
-    headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
     owned(&state, id, &email).await?;
     let preset = requested_preset(&state, id, &query.preset).await?;
     if export_probe_requested(&query.probe) {
         return export_probe(&state, id, preset).await;
     }
-    match locate_export(&state, id, preset).await? {
-        LocatedExport::Local(path) => {
-            serve_local_file(&path, "video/mp4", headers.get(header::RANGE))
-                .await
-                .map(with_no_store)
-        }
-        LocatedExport::Remote { key, .. } => {
-            let Some(r2) = &state.r2 else {
-                return Err(ApiError::new(StatusCode::NOT_FOUND, "no export yet"));
-            };
-            let url = r2
-                .presign_get(&key, Duration::from_secs(6 * 3600))
-                .await
-                .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()))?;
-            Ok(Response::builder()
-                .status(StatusCode::TEMPORARY_REDIRECT)
-                .header(header::LOCATION, url)
-                .header(header::CACHE_CONTROL, "no-store")
-                .body(Body::empty())
-                .unwrap_or_else(|_| Response::new(Body::empty())))
-        }
-    }
+    let export = locate_export(&state, id, preset).await?;
+    let Some(r2) = &state.r2 else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "no export yet"));
+    };
+    let url = r2
+        .presign_get(&export.key, Duration::from_secs(6 * 3600))
+        .await
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()))?;
+    Ok(Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, url)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty())))
 }
 
 async fn export_probe(
@@ -1751,115 +1675,6 @@ async fn export_probe(
         "error": error,
     }))
     .into_response())
-}
-
-fn with_no_store(mut response: Response) -> Response {
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
-    response
-}
-
-/// A file ffmpeg is still writing has `ftyp` and an `mdat` that runs to EOF.
-/// `moov` is only there after the encode finishes. Serving before that plays
-/// the first GOP and then goes blank, and a download has no playable stream.
-fn mp4_has_moov(path: &std::path::Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let len = match file.metadata() {
-        Ok(meta) => meta.len(),
-        Err(_) => return false,
-    };
-    let mut pos = 0u64;
-    while pos + 8 <= len {
-        if file.seek(SeekFrom::Start(pos)).is_err() {
-            return false;
-        }
-        let mut header = [0u8; 8];
-        if file.read_exact(&mut header).is_err() {
-            return false;
-        }
-        let size32 = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        if &header[4..8] == b"moov" {
-            return true;
-        }
-        let box_size = if size32 == 1 {
-            let mut large = [0u8; 8];
-            if file.read_exact(&mut large).is_err() {
-                return false;
-            }
-            u64::from_be_bytes(large)
-        } else if size32 == 0 {
-            return false;
-        } else {
-            u64::from(size32)
-        };
-        if box_size < 8 || pos.saturating_add(box_size) > len {
-            return false;
-        }
-        pos += box_size;
-    }
-    false
-}
-
-async fn serve_local_file(
-    path: &std::path::Path,
-    content_type: &str,
-    range: Option<&axum::http::HeaderValue>,
-) -> ApiResult<Response> {
-    let data = tokio::fs::read(path)
-        .await
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "media file missing"))?;
-    let len = data.len() as u64;
-    let ctype = if content_type.is_empty() {
-        "application/octet-stream"
-    } else {
-        content_type
-    };
-    if let Some(range) = range
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_byte_range)
-    {
-        let (start, end) = range;
-        let start = start.min(len.saturating_sub(1));
-        let end = end
-            .unwrap_or(len.saturating_sub(1))
-            .min(len.saturating_sub(1))
-            .max(start);
-        let slice = data[start as usize..=end as usize].to_vec();
-        return Ok(Response::builder()
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header(header::CONTENT_TYPE, ctype)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-            .header(header::CONTENT_LENGTH, slice.len())
-            .body(Body::from(slice))
-            .unwrap_or_else(|_| Response::new(Body::empty())));
-    }
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, ctype)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_LENGTH, len)
-        .body(Body::from(data))
-        .unwrap_or_else(|_| Response::new(Body::empty())))
-}
-
-fn parse_byte_range(raw: &str) -> Option<(u64, Option<u64>)> {
-    let spec = raw.strip_prefix("bytes=")?;
-    let spec = spec.split(',').next()?.trim();
-    let (a, b) = spec.split_once('-')?;
-    let start = if a.is_empty() { 0 } else { a.parse().ok()? };
-    let end = if b.is_empty() {
-        None
-    } else {
-        Some(b.parse().ok()?)
-    };
-    Some((start, end))
 }
 
 #[derive(Deserialize)]
@@ -2261,39 +2076,6 @@ mod tests {
         assert!(!tool_finished(&pending));
     }
 
-    fn box_bytes(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-        let size = (8 + payload.len()) as u32;
-        let mut out = size.to_be_bytes().to_vec();
-        out.extend_from_slice(kind);
-        out.extend_from_slice(payload);
-        out
-    }
-
-    #[test]
-    fn an_unfinished_mp4_is_not_served() {
-        let dir = std::env::temp_dir().join("oc-moov-check");
-        std::fs::create_dir_all(&dir).unwrap();
-        let done = dir.join("done.mp4");
-        let writing = dir.join("writing.mp4");
-        let decoy = dir.join("decoy.mp4");
-        let mut finished = box_bytes(b"ftyp", b"isom");
-        finished.extend(box_bytes(b"moov", b"mvhd"));
-        finished.extend(box_bytes(b"mdat", b"frames"));
-        std::fs::write(&done, &finished).unwrap();
-        // size 0 means the box runs to EOF, which is how ffmpeg leaves mdat.
-        let mut partial = box_bytes(b"ftyp", b"isom");
-        partial.extend_from_slice(&0u32.to_be_bytes());
-        partial.extend_from_slice(b"mdat");
-        partial.extend_from_slice(b"moov-is-not-a-box-here");
-        std::fs::write(&writing, &partial).unwrap();
-        let mut bait = box_bytes(b"ftyp", b"isom");
-        bait.extend(box_bytes(b"free", b"moov"));
-        std::fs::write(&decoy, &bait).unwrap();
-        assert!(mp4_has_moov(&done));
-        assert!(!mp4_has_moov(&writing));
-        assert!(!mp4_has_moov(&decoy));
-    }
-
     #[test]
     fn query_email_is_percent_decoded() {
         assert_eq!(query_param("user=a%40b.com&x=1", "user"), "a@b.com");
@@ -2349,15 +2131,10 @@ mod tests {
             export_preset(&vertical),
             oc_core::ExportPreset::Vertical1080
         );
-        assert_eq!(
-            local_export_path(id, oc_core::ExportPreset::Square1080),
-            std::path::PathBuf::from(export_dir())
-                .join("00000000-0000-0000-0000-000000000000-square-1080.mp4")
-        );
     }
 
     #[test]
-    fn the_requested_preset_is_served_and_an_older_render_is_not() {
+    fn a_current_cloudflare_file_is_served_and_an_older_render_is_not() {
         let started = 1_000_000_i64;
         let old = ExportStamp {
             modified_ms: (started as u64) - 60_000,
@@ -2365,129 +2142,26 @@ mod tests {
         let fresh = ExportStamp {
             modified_ms: (started as u64) + 1_000,
         };
+        let within_slack = ExportStamp {
+            modified_ms: (started as u64) - 1_000,
+        };
         let older_than_slack = ExportStamp {
             modified_ms: (started as u64) - EXPORT_CLOCK_SLACK_MS - 1,
         };
+        assert_eq!(choose_export(None, Some(started)), ExportChoice::Wait);
+        assert_eq!(choose_export(Some(old), Some(started)), ExportChoice::Wait);
         assert_eq!(
-            choose_export(
-                LocalExport::Ready {
-                    modified_ms: old.modified_ms
-                },
-                None,
-                Some(started)
-            ),
-            ExportChoice::Wait
-        );
-        assert_eq!(
-            choose_export(LocalExport::Absent, Some(fresh), Some(started)),
+            choose_export(Some(fresh), Some(started)),
             ExportChoice::Remote
         );
         assert_eq!(
-            choose_export(
-                LocalExport::Writing {
-                    modified_ms: fresh.modified_ms
-                },
-                Some(old),
-                Some(started)
-            ),
-            ExportChoice::Wait
-        );
-        assert_eq!(
-            choose_export(
-                LocalExport::Ready {
-                    modified_ms: fresh.modified_ms
-                },
-                Some(old),
-                Some(started)
-            ),
-            ExportChoice::Local
-        );
-        let newer_remote = ExportStamp {
-            modified_ms: fresh.modified_ms + 5_000,
-        };
-        assert_eq!(
-            choose_export(
-                LocalExport::Ready {
-                    modified_ms: fresh.modified_ms
-                },
-                Some(newer_remote),
-                Some(started)
-            ),
+            choose_export(Some(within_slack), Some(started)),
             ExportChoice::Remote
         );
         assert_eq!(
-            choose_export(
-                LocalExport::Ready {
-                    modified_ms: older_than_slack.modified_ms
-                },
-                None,
-                Some(started)
-            ),
+            choose_export(Some(older_than_slack), Some(started)),
             ExportChoice::Wait
         );
-        assert_eq!(
-            choose_export(
-                LocalExport::Ready {
-                    modified_ms: (started as u64) - 1_000,
-                },
-                None,
-                Some(started)
-            ),
-            ExportChoice::Local
-        );
-        assert_eq!(
-            choose_export(
-                LocalExport::Ready {
-                    modified_ms: old.modified_ms
-                },
-                None,
-                None
-            ),
-            ExportChoice::Local
-        );
-        assert_eq!(
-            choose_export(
-                LocalExport::Writing {
-                    modified_ms: old.modified_ms
-                },
-                Some(old),
-                None
-            ),
-            ExportChoice::Remote
-        );
-    }
-
-    #[test]
-    fn a_partial_export_is_not_a_finished_file() {
-        let dir = std::env::temp_dir().join("oc-export-pick");
-        std::fs::create_dir_all(&dir).unwrap();
-        let done = dir.join("done.mp4");
-        let writing = dir.join("writing.mp4");
-        let mut finished = box_bytes(b"ftyp", b"isom");
-        finished.extend(box_bytes(b"moov", b"mvhd"));
-        std::fs::write(&done, &finished).unwrap();
-        std::fs::write(&writing, b"ftyp").unwrap();
-        assert!(matches!(
-            read_local_export(&done),
-            LocalExport::Ready { .. }
-        ));
-        assert!(matches!(
-            read_local_export(&writing),
-            LocalExport::Writing { .. }
-        ));
-        assert!(matches!(
-            read_local_export(&dir.join("missing.mp4")),
-            LocalExport::Absent
-        ));
-    }
-
-    #[test]
-    fn byte_range_reads_start_and_optional_end() {
-        assert_eq!(parse_byte_range("bytes=0-99"), Some((0, Some(99))));
-        assert_eq!(parse_byte_range("bytes=10-"), Some((10, None)));
-        assert_eq!(parse_byte_range("bytes=-"), Some((0, None)));
-        assert_eq!(parse_byte_range("bytes=4-8, 10-12"), Some((4, Some(8))));
-        assert_eq!(parse_byte_range("items=0-1"), None);
-        assert_eq!(parse_byte_range("bytes=nope-1"), None);
+        assert_eq!(choose_export(Some(old), None), ExportChoice::Remote);
     }
 }

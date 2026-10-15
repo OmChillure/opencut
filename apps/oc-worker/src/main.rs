@@ -586,17 +586,6 @@ async fn export(db: &Db, r2: Option<&R2>, p: ExportPayload) -> anyhow::Result<()
         ms = t0.elapsed().as_millis(),
         "export stored on Cloudflare"
     );
-    let out_dir = std::env::var("OPENCUT_EXPORT_DIR").unwrap_or_else(|_| "data/exports".into());
-    let output = std::path::PathBuf::from(&out_dir).join(&filename);
-    if let Err(err) = tokio::fs::create_dir_all(&out_dir).await {
-        tracing::warn!(project = %p.project_id, "local export cache was not written: {err}");
-    } else if let Err(err) = tokio::fs::copy(&rendered.output, &output).await {
-        tracing::warn!(
-            project = %p.project_id,
-            path = %output.display(),
-            "finished video is on Cloudflare; local copy failed: {err}"
-        );
-    }
     Ok(())
 }
 
