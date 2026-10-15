@@ -4693,7 +4693,8 @@ fn AiSidebar(
             let Ok(remote) = api::list_chats(&pid).await else {
                 return;
             };
-            if project_for_chats.peek().as_str() != pid || listed_for.peek().as_str() != pid.as_str()
+            if project_for_chats.peek().as_str() != pid
+                || listed_for.peek().as_str() != pid.as_str()
             {
                 return;
             }
@@ -4760,11 +4761,6 @@ fn AiSidebar(
     let panel_w = if open { *ai_width.read() } else { 0.0 };
     let current_chat = chat_id.read().clone();
     let saved_chats = chats.read().clone();
-    let chat_title = saved_chats
-        .iter()
-        .find(|row| Some(&row.id) == current_chat.as_ref())
-        .map(|row| row.title.clone())
-        .unwrap_or_else(|| "New chat".into());
     let menu_open = *chat_menu.read();
     let running = *busy.read();
     let _worked_tick = *worked_tick.read();
@@ -4774,6 +4770,19 @@ fn AiSidebar(
     if running {
         splice_live_turn(&mut folded, &project_now);
     }
+    let live_title = chat_switch_label(&folded);
+    let mut menu_rows = saved_chats.clone();
+    if let Some(id) = current_chat.as_ref()
+        && live_title != "New chat"
+        && let Some(row) = menu_rows.iter_mut().find(|row| &row.id == id)
+    {
+        row.title = live_title.clone();
+    }
+    let chat_title = menu_rows
+        .iter()
+        .find(|row| Some(&row.id) == current_chat.as_ref())
+        .map(|row| chat_menu_label(row, &menu_rows))
+        .unwrap_or(live_title);
     let chat_empty = folded.is_empty();
     let typed = draft.read().clone();
     let composer = if composer_echoes_turn(&typed, &project_now) {
@@ -4799,7 +4808,7 @@ fn AiSidebar(
                     div { class: "ai-head-actions ai-copy",
                         button {
                             class: "chat-switch",
-                            title: "Saved chats",
+                            title: "{chat_title}",
                             onclick: move |_| {
                                 let next = !*chat_menu.peek();
                                 chat_menu.set(next);
@@ -4830,15 +4839,16 @@ fn AiSidebar(
                     if saved_chats.is_empty() {
                         p { class: "chat-menu-empty", "No saved chats yet" }
                     }
-                    for chat in saved_chats.iter() {
+                    for chat in menu_rows.iter() {
                         {
                             let id = chat.id.clone();
                             let selected = current_chat.as_deref() == Some(id.as_str());
                             let pid = save.project_id.peek().clone();
-                            let label = chat_menu_label(chat, &saved_chats);
+                            let label = chat_menu_label(chat, &menu_rows);
                             rsx! {
                                 button {
                                     class: if selected { "on" } else { "" },
+                                    title: "{label}",
                                     disabled: running,
                                     onclick: move |_| open_saved_chat(
                                         id.clone(),
@@ -6421,6 +6431,60 @@ fn new_chat_should_reset(busy: bool, messages: usize, draft: &str) -> bool {
     !busy && messages == 0 && draft.trim().is_empty()
 }
 
+/// Opening words, five dots, closing words. A short line stays whole.
+fn chat_switch_label(messages: &[ChatMsg]) -> String {
+    let first = messages
+        .iter()
+        .find(|msg| msg.role == ChatRole::User && !msg.text.trim().is_empty());
+    let Some(first) = first else {
+        return "New chat".into();
+    };
+    let last = messages.iter().rev().find(|msg| {
+        matches!(msg.role, ChatRole::User | ChatRole::Bot) && !msg.text.trim().is_empty()
+    });
+    let last = last
+        .map(|msg| msg.text.as_str())
+        .unwrap_or(first.text.as_str());
+    bracket_chat(&first.text, last)
+}
+
+fn bracket_chat(first: &str, last: &str) -> String {
+    let head = chat_words(first);
+    let tail = chat_words(last);
+    if head.is_empty() {
+        return "New chat".into();
+    }
+    if head == tail {
+        return chat_ends(&head);
+    }
+    format!("{} ..... {}", chat_head(&head, 3), chat_tail(&tail, 3))
+}
+
+fn chat_words(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
+fn chat_ends(words: &[&str]) -> String {
+    if words.len() <= 6 {
+        return words.join(" ");
+    }
+    format!("{} ..... {}", chat_head(words, 3), chat_tail(words, 3))
+}
+
+fn chat_head<'a>(words: &[&'a str], n: usize) -> String {
+    words.iter().take(n).copied().collect::<Vec<_>>().join(" ")
+}
+
+fn chat_tail<'a>(words: &[&'a str], n: usize) -> String {
+    let skip = words.len().saturating_sub(n);
+    words
+        .iter()
+        .skip(skip)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn chat_menu_label(chat: &api::ChatSummary, all: &[api::ChatSummary]) -> String {
     let twins = all.iter().filter(|row| row.title == chat.title).count();
     if twins < 2 {
@@ -6629,11 +6693,8 @@ fn start_new_chat(
         match api::create_chat(&project_id).await {
             Ok(chat) => {
                 remember_summary(&mut chats, chat.clone());
-                if new_chat_should_reset(
-                    *busy.peek(),
-                    messages.peek().len(),
-                    draft.peek().as_str(),
-                ) {
+                if new_chat_should_reset(*busy.peek(), messages.peek().len(), draft.peek().as_str())
+                {
                     chat_id.set(Some(chat.id.clone()));
                     messages.set(Vec::new());
                     draft.set(String::new());
@@ -8262,11 +8323,33 @@ mod chat_tests {
         assert_eq!(merged[0].id, "newer");
         assert_eq!(merged[1].id, "new");
         assert!(merged.iter().any(|row| row.id == "old"));
-        assert_eq!(
-            chat_menu_label(&merged[0], &merged),
-            "New chat 1"
-        );
+        assert_eq!(chat_menu_label(&merged[0], &merged), "New chat 1");
         assert_eq!(chat_menu_label(&merged[2], &merged), "Yesterday");
+    }
+
+    #[test]
+    fn the_switcher_shows_the_opening_and_the_close() {
+        let long = "can you make a cinematic edit using this cllips?";
+        let only = vec![ChatMsg::user(long)];
+        assert_eq!(
+            chat_switch_label(&only),
+            "can you make ..... using this cllips?"
+        );
+        let mut thread = vec![ChatMsg::user(long), ChatMsg::bot("The cut is ready now")];
+        assert_eq!(
+            chat_switch_label(&thread),
+            "can you make ..... is ready now"
+        );
+        thread.push(ChatMsg::user("trim the end"));
+        assert_eq!(
+            chat_switch_label(&thread),
+            "can you make ..... trim the end"
+        );
+        assert_eq!(
+            chat_switch_label(&[ChatMsg::user("edit like a pro editor")]),
+            "edit like a pro editor"
+        );
+        assert_eq!(chat_switch_label(&[]), "New chat");
     }
 
     #[test]
@@ -8328,7 +8411,10 @@ mod chat_tests {
         assert_eq!(list.len(), 1);
         let mut statuses = vec![ChatMsg::status("Sending to xai · grok-4.7…")];
         splice_live_turn(&mut statuses, "proj");
-        assert_eq!(statuses[0].text, "can you create a cinematic edit using this");
+        assert_eq!(
+            statuses[0].text,
+            "can you create a cinematic edit using this"
+        );
         assert!(matches!(statuses[1].role, ChatRole::Status));
         let mut other = Vec::new();
         splice_live_turn(&mut other, "nope");
@@ -8341,7 +8427,10 @@ mod chat_tests {
             "  can you create a cinematic edit using this\n",
             "proj"
         ));
-        assert!(!composer_echoes_turn("can you create a cinematic edit", "proj"));
+        assert!(!composer_echoes_turn(
+            "can you create a cinematic edit",
+            "proj"
+        ));
         assert!(!composer_echoes_turn(
             "can you create a cinematic edit using this",
             "other"

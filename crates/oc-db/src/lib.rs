@@ -870,32 +870,66 @@ pub fn normalize_user_email(raw: &str) -> Result<String, DbError> {
     Ok(email)
 }
 
-/// Keep a title the person set. Otherwise use the first thing they asked.
-pub fn chat_title(current: &str, first_user_text: Option<&str>) -> String {
+/// Keep a title the person set. An automatic title is the opening words,
+/// then `.....`, then the closing words, so it is not a second copy of the first line.
+pub fn chat_title(current: &str, first_user_text: Option<&str>, last_text: Option<&str>) -> String {
     let current = current.trim();
-    if !current.is_empty() && current != "New chat" {
-        return current.to_string();
-    }
-    let Some(text) = first_user_text
+    let Some(first) = first_user_text
         .map(str::trim)
         .filter(|text| !text.is_empty())
     else {
-        return "New chat".into();
-    };
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut out = String::new();
-    for (i, ch) in flat.chars().enumerate() {
-        if i == 48 {
-            out.push('…');
-            break;
+        if current.is_empty() {
+            return "New chat".into();
         }
-        out.push(ch);
+        return current.to_string();
+    };
+    if !current.is_empty() && current != "New chat" && !chat_title_is_automatic(current) {
+        return current.to_string();
     }
-    if out.is_empty() {
-        "New chat".into()
-    } else {
-        out
+    bracket_words(first, last_text.unwrap_or(first))
+}
+
+fn chat_title_is_automatic(current: &str) -> bool {
+    current.contains(".....") || current.ends_with('…') || current.ends_with("...")
+}
+
+/// First words, five dots, last words. A short line stays whole.
+pub fn bracket_words(first: &str, last: &str) -> String {
+    let head = words_of(first);
+    let tail = words_of(last);
+    if head.is_empty() {
+        return "New chat".into();
     }
+    let same = head == tail;
+    if same {
+        return ends_of(&head);
+    }
+    format!("{} ..... {}", take_head(&head, 3), take_tail(&tail, 3))
+}
+
+fn words_of(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
+fn ends_of(words: &[&str]) -> String {
+    if words.len() <= 6 {
+        return words.join(" ");
+    }
+    format!("{} ..... {}", take_head(words, 3), take_tail(words, 3))
+}
+
+fn take_head<'a>(words: &[&'a str], n: usize) -> String {
+    words.iter().take(n).copied().collect::<Vec<_>>().join(" ")
+}
+
+fn take_tail<'a>(words: &[&'a str], n: usize) -> String {
+    let skip = words.len().saturating_sub(n);
+    words
+        .iter()
+        .skip(skip)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// CLI tracing must not land in the database.
@@ -981,7 +1015,7 @@ pub async fn create_chat(
     title: Option<&str>,
 ) -> Result<ChatRow, DbError> {
     let user = normalize_user_email(user)?;
-    let title = chat_title("", title);
+    let title = chat_title("", title, None);
     let id = Uuid::now_v7();
     let row = query_as::<ChatRow>(
         "insert into chats (id, project_id, user_email, title)
@@ -1027,13 +1061,16 @@ pub async fn save_chat_messages(
     let user = normalize_user_email(user)?;
     let chat = chat_for_user(pool, project_id, chat_id, &user).await?;
     let messages = prepare_chat_messages(messages);
-    let title = chat_title(
-        &chat.title,
-        messages
-            .iter()
-            .find(|msg| msg.role == "user")
-            .map(|msg| msg.text.as_str()),
-    );
+    let first_user = messages
+        .iter()
+        .find(|msg| msg.role == "user")
+        .map(|msg| msg.text.as_str());
+    let last_line = messages
+        .iter()
+        .rev()
+        .find(|msg| msg.role == "user" || msg.role == "assistant")
+        .map(|msg| msg.text.as_str());
+    let title = chat_title(&chat.title, first_user, last_line);
     let mut tx = pool.begin().await?;
     query("delete from chat_messages where chat_id = $1")
         .bind(chat_id)
@@ -1160,21 +1197,38 @@ mod tests {
     }
 
     #[test]
-    fn chat_title_uses_the_first_request() {
-        assert_eq!(super::chat_title("", None), "New chat");
-        assert_eq!(super::chat_title("New chat", None), "New chat");
+    fn chat_title_uses_the_opening_and_the_close() {
+        assert_eq!(super::chat_title("", None, None), "New chat");
+        assert_eq!(super::chat_title("New chat", None, None), "New chat");
         assert_eq!(
-            super::chat_title("New chat", Some("edit like a pro editor")),
+            super::chat_title("New chat", Some("edit like a pro editor"), None),
             "edit like a pro editor"
         );
         assert_eq!(
-            super::chat_title("Rough cut", Some("ignore this")),
+            super::chat_title("Rough cut", Some("ignore this"), Some("later")),
             "Rough cut"
         );
-        let long = "a".repeat(60);
-        let title = super::chat_title("New chat", Some(&long));
-        assert_eq!(title.chars().count(), 49);
-        assert!(title.ends_with('…'));
+        let long = "can you make a cinematic edit using this clips";
+        assert_eq!(
+            super::chat_title("New chat", Some(long), None),
+            "can you make ..... using this clips"
+        );
+        assert_eq!(
+            super::chat_title(
+                "can you make a cinematic edit us…",
+                Some(long),
+                Some("the cut is ready now")
+            ),
+            "can you make ..... is ready now"
+        );
+        assert_eq!(
+            super::chat_title(
+                "can you make ..... using this clips",
+                Some(long),
+                Some("the cut is ready now")
+            ),
+            "can you make ..... is ready now"
+        );
     }
 
     #[test]
