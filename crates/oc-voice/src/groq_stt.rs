@@ -53,7 +53,9 @@ pub async fn transcribe_wav(wav: &Path) -> Result<Transcript, String> {
     let mut form = Form::new()
         .text("model", MODEL)
         .text("response_format", "verbose_json")
-        .text("temperature", "0");
+        .text("temperature", "0")
+        .text("timestamp_granularities[]", "segment")
+        .text("timestamp_granularities[]", "word");
     if let Ok(lang) = std::env::var("OPENCUT_STT_LANG") {
         let lang = lang.trim().to_string();
         if !lang.is_empty() {

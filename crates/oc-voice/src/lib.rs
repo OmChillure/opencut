@@ -1,5 +1,6 @@
 //! Speech. Groq Whisper writes the transcript. ffmpeg extracts the wav.
 
+mod edges;
 mod groq_stt;
 mod parse;
 mod punctuate;

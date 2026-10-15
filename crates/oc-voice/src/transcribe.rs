@@ -39,8 +39,9 @@ pub async fn transcribe_path(input: &Path) -> Result<Transcript, SttError> {
     tracing::info!(ms = t0.elapsed().as_millis(), "stt wav ready");
     let t1 = Instant::now();
     let transcript = match groq_stt::transcribe_wav(&wav).await {
-        Ok(t) => {
+        Ok(mut t) => {
             tracing::info!("stt via groq whisper");
+            crate::edges::snap_file(&mut t.cues, &wav);
             Ok(t)
         }
         Err(err) => Err(SttError::Groq(err)),
