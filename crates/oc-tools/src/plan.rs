@@ -1349,15 +1349,7 @@ mod tests {
         let mut close = window(picture, 38.0, 50.0, "close", false);
         close.subject = "person".into();
         build_plan(&mut timeline, &plan, &[wide, close], &[], &lines, &[]).unwrap();
-        let cues = timeline
-            .tracks
-            .iter()
-            .flat_map(|track| track.clips.iter())
-            .find_map(|clip| match &clip.kind {
-                ClipKind::Caption { cues, .. } => Some(cues.clone()),
-                _ => None,
-            })
-            .expect("captions");
+        let cues = all_cues(&timeline);
         assert_eq!(cues.len(), 2, "{cues:?}");
         assert_eq!(cues[0].place, oc_timeline::CaptionPlace::Lower);
         assert_eq!(cues[0].font, oc_timeline::CaptionFont::Sans);
@@ -1433,6 +1425,20 @@ mod tests {
         assert_eq!(cue.font, oc_timeline::CaptionFont::Sans);
         assert_eq!(cue.effect, oc_timeline::CaptionEffect::Fade);
         assert_eq!(cue.place, oc_timeline::CaptionPlace::Bottom);
+    }
+
+    fn all_cues(timeline: &Timeline) -> Vec<oc_timeline::CaptionCue> {
+        timeline
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Caption)
+            .flat_map(|track| track.clips.iter())
+            .filter_map(|clip| match &clip.kind {
+                ClipKind::Caption { cues, .. } => Some(cues.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
     }
 
     fn first_cue(timeline: &Timeline) -> oc_timeline::CaptionCue {
@@ -1658,15 +1664,7 @@ mod tests {
         let mut later = window(picture, 38.0, 50.0, "bright-wide", false);
         later.subject = "street".into();
         build_plan(&mut timeline, &plan, &[wide, later], &[], &lines, &[]).unwrap();
-        let cues = timeline
-            .tracks
-            .iter()
-            .flat_map(|track| track.clips.iter())
-            .find_map(|clip| match &clip.kind {
-                ClipKind::Caption { cues, .. } => Some(cues.clone()),
-                _ => None,
-            })
-            .expect("captions");
+        let cues = all_cues(&timeline);
         assert_eq!(cues.len(), 2, "{cues:?}");
         assert_eq!(cues[0].place, oc_timeline::CaptionPlace::Top);
         assert_eq!(cues[0].font, oc_timeline::CaptionFont::Display);

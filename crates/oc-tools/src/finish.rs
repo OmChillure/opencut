@@ -23,15 +23,11 @@ pub struct CoverShot {
     pub end: f64,
 }
 
-/// Give every caption the video's one theme.
-/// A clip that already shares that font, effect, and a place from the theme stays.
-/// Lines that were styled one by one, and the old default bottom bar, are dressed again.
+/// Dress caption lines that are still the plain default.
+/// A line someone moved, recolored, or restyled stays as they left it.
 #[must_use]
 pub fn redress_unset_captions(timeline: &mut Timeline) -> bool {
     let recipe = recipe_for_timeline(timeline);
-    let open = oc_timeline::look_for("", 0, &recipe, false);
-    let seated = oc_timeline::look_for("", 0, &recipe, true);
-    let (ink, edge) = oc_timeline::caption_colors(&recipe);
     let mut changed = false;
     for track in &mut timeline.tracks {
         if track.kind != TrackKind::Caption || track.muted || track.hidden {
@@ -44,31 +40,30 @@ pub fn redress_unset_captions(timeline: &mut Timeline) -> bool {
             let ClipKind::Caption { cues, .. } = &mut clip.kind else {
                 continue;
             };
-            if cues.is_empty() || cues_share_theme(cues, open, seated, ink, edge) {
+            if cues.is_empty() || cues.iter().all(|cue| !cue_is_unset(cue)) {
                 continue;
             }
+            let before = cues.clone();
             let faces = vec![true; cues.len()];
             oc_timeline::dress_cues(cues, &recipe, &faces);
+            for (cue, old) in cues.iter_mut().zip(before) {
+                if !cue_is_unset(&old) {
+                    *cue = old;
+                }
+            }
             changed = true;
         }
     }
     changed
 }
 
-fn cues_share_theme(
-    cues: &[CaptionCue],
-    open: (CaptionPlace, CaptionFont, CaptionEffect),
-    seated: (CaptionPlace, CaptionFont, CaptionEffect),
-    ink: oc_timeline::CaptionInk,
-    edge: oc_timeline::CaptionEdge,
-) -> bool {
-    cues.iter().all(|cue| {
-        cue.font == open.1
-            && cue.effect == open.2
-            && (cue.place == open.0 || cue.place == seated.0)
-            && cue.ink == ink
-            && cue.edge == edge
-    })
+/// The stock line: bottom, sans, still, white, dark edge. Anything else was chosen.
+fn cue_is_unset(cue: &CaptionCue) -> bool {
+    cue.place == CaptionPlace::Bottom
+        && cue.font == CaptionFont::Sans
+        && cue.effect == CaptionEffect::None
+        && cue.ink == oc_timeline::CaptionInk::White
+        && cue.edge == oc_timeline::CaptionEdge::Dark
 }
 
 /// The theme saved on this timeline. No named mood stays clean, including a vertical frame.
@@ -334,6 +329,45 @@ mod tests {
         assert_eq!(cues[1].font, cues[0].font);
         assert_eq!(cues[1].effect, cues[0].effect);
         assert!(!redress_unset_captions(&mut timeline));
+    }
+
+    #[test]
+    fn a_hand_styled_line_stays_while_a_plain_line_is_dressed() {
+        let mut timeline = Timeline::new(oc_timeline::FrameRate::FPS_30, 1080, 1920);
+        let track = timeline
+            .first_track(TrackKind::Caption)
+            .expect("captions")
+            .id;
+        let mut custom = plain_cue(0.0, "keep this look");
+        custom.font = CaptionFont::Display;
+        custom.ink = oc_timeline::CaptionInk::Amber;
+        timeline
+            .add_clip(
+                track,
+                Clip {
+                    id: ClipId::new(),
+                    media_id: None,
+                    kind: ClipKind::Caption {
+                        style: CaptionStyle::Stacked,
+                        cues: vec![custom, plain_cue(4.0, "dress this line")],
+                    },
+                    start: Time::ZERO,
+                    duration: Duration::from_seconds(8.0),
+                    source_in: Time::ZERO,
+                    speed: 1.0,
+                    group_id: None,
+                    link_id: None,
+                    disabled: false,
+                    look: ClipLook::default(),
+                },
+            )
+            .unwrap();
+        assert!(redress_unset_captions(&mut timeline));
+        let cues = caption_cues(&timeline);
+        assert_eq!(cues[0].font, CaptionFont::Display);
+        assert_eq!(cues[0].ink, oc_timeline::CaptionInk::Amber);
+        assert_eq!(cues[1].effect, CaptionEffect::Fade);
+        assert_eq!(cues[1].font, CaptionFont::Sans);
     }
 
     #[test]

@@ -1951,6 +1951,7 @@ impl Timeline {
         }
         let new_duration = right.end() - left.start;
         self.tracks[ti].clips[ci].duration = new_duration;
+        cover_caption(&mut self.tracks[ti].clips[ci]);
         self.tracks[ti].clips.remove(ci + 1);
         Ok(clip_id)
     }
@@ -1992,8 +1993,12 @@ impl Timeline {
             clip.speed = left_end.2;
             clip.look.fade_out = Duration::ZERO;
             clip.look.transition = TransitionKind::Cut;
+            cover_caption(clip);
         }
         self.add_clip(track_id, new_clip)?;
+        if let Some(clip) = self.clip_mut(right_id) {
+            cover_caption(clip);
+        }
         let link = self.find_clip(clip_id).and_then(|(_, c)| c.link_id);
         if let Some(link) = link {
             let partners: Vec<ClipId> = self
@@ -2038,6 +2043,7 @@ impl Timeline {
         }
         clip.start = new_start;
         clip.duration = new_duration;
+        cover_caption(clip);
         Ok(())
     }
 
@@ -2117,17 +2123,27 @@ impl Timeline {
         self.tracks.iter().find(|t| t.kind == kind)
     }
 
+    /// One timeline clip per spoken line, so a trim or a restyle hits that line only.
     pub fn replace_caption_cues(
         &mut self,
         style: CaptionStyle,
         cues: Vec<CaptionCue>,
     ) -> Result<ClipId> {
-        let duration = cues
+        let pieces: Vec<Clip> = cues
             .iter()
-            .map(|c| c.end)
-            .max()
-            .map(|end| end - Time::ZERO)
-            .unwrap_or(Duration::ZERO);
+            .filter_map(|cue| {
+                caption_line(
+                    ClipId::new(),
+                    style,
+                    cue,
+                    cue.start.as_ticks(),
+                    cue.end.as_ticks(),
+                )
+            })
+            .collect();
+        if pieces.is_empty() {
+            return Err(TimelineError::Message("no caption lines".into()));
+        }
         let track_id = match self.first_track(TrackKind::Caption) {
             Some(t) => t.id,
             None => self.add_track(TrackKind::Caption, "Captions"),
@@ -2135,19 +2151,229 @@ impl Timeline {
         if let Some(track) = self.track_mut(track_id) {
             track.clips.clear();
         }
-        let clip = Clip {
-            id: ClipId::new(),
-            media_id: None,
-            kind: ClipKind::Caption { style, cues },
-            start: Time::ZERO,
-            duration,
-            source_in: Time::ZERO,
-            speed: 1.0,
-            group_id: None,
-            link_id: None,
-            disabled: false,
-            look: ClipLook::default(),
+        let first = pieces[0].id;
+        for piece in pieces {
+            self.add_clip(track_id, piece)?;
+        }
+        Ok(first)
+    }
+
+    /// Turn a caption block that holds every line into one clip per line.
+    /// A line that is already its own clip stays put. Returns whether anything moved.
+    pub fn explode_caption_cues(&mut self) -> bool {
+        let mut changed = false;
+        for track in &mut self.tracks {
+            if track.kind != TrackKind::Caption {
+                continue;
+            }
+            let mut next = Vec::with_capacity(track.clips.len());
+            for clip in track.clips.drain(..) {
+                let ClipKind::Caption { style, cues } = &clip.kind else {
+                    next.push(clip);
+                    continue;
+                };
+                if cues.len() <= 1 {
+                    let mut clip = clip;
+                    if tighten_caption(&mut clip) {
+                        changed = true;
+                    }
+                    next.push(clip);
+                    continue;
+                }
+                changed = true;
+                let style = *style;
+                let cues = cues.clone();
+                for (i, cue) in cues.iter().enumerate() {
+                    let start = clip.start.as_ticks() + cue.start.as_ticks();
+                    let end = clip.start.as_ticks() + cue.end.as_ticks();
+                    let id = if i == 0 { clip.id } else { ClipId::new() };
+                    if let Some(piece) = caption_line(id, style, cue, start, end) {
+                        next.push(piece);
+                    }
+                }
+            }
+            next.sort_by_key(|clip| clip.start);
+            track.clips = next;
+        }
+        changed
+    }
+}
+
+/// A caption line fills its own clip. Trim and split keep the words on that span.
+fn cover_caption(clip: &mut Clip) {
+    let dur = clip.duration.as_ticks().max(1);
+    let ClipKind::Caption { cues, .. } = &mut clip.kind else {
+        return;
+    };
+    if cues.len() == 1 {
+        cues[0].start = Time::ZERO;
+        cues[0].end = Time::from_ticks(dur);
+    }
+}
+
+/// Pull a single cue's internal offset out onto the clip, so the line and the clip match.
+fn tighten_caption(clip: &mut Clip) -> bool {
+    let ClipKind::Caption { cues, .. } = &clip.kind else {
+        return false;
+    };
+    if cues.len() != 1 {
+        return false;
+    }
+    let cue = &cues[0];
+    let start = clip.start.as_ticks() + cue.start.as_ticks();
+    let end = clip.start.as_ticks() + cue.end.as_ticks();
+    let dur = end - start;
+    if dur <= 0 {
+        return false;
+    }
+    let already = cue.start.as_ticks() == 0
+        && (cue.end.as_ticks() - clip.duration.as_ticks()).abs() <= 1
+        && clip.start.as_ticks() == start;
+    if already {
+        return false;
+    }
+    clip.start = Time::from_ticks(start);
+    clip.duration = Duration::from_ticks(dur);
+    cover_caption(clip);
+    true
+}
+
+fn caption_line(
+    id: ClipId,
+    style: CaptionStyle,
+    cue: &CaptionCue,
+    start: i64,
+    end: i64,
+) -> Option<Clip> {
+    let text = cue.text.trim();
+    let dur = end - start;
+    if text.is_empty() || dur <= 0 {
+        return None;
+    }
+    Some(Clip {
+        id,
+        media_id: None,
+        kind: ClipKind::Caption {
+            style,
+            cues: vec![CaptionCue {
+                start: Time::ZERO,
+                end: Time::from_ticks(dur),
+                text: text.to_string(),
+                speaker: cue.speaker.clone(),
+                place: cue.place,
+                font: cue.font,
+                effect: cue.effect,
+                ink: cue.ink,
+                edge: cue.edge,
+            }],
+        },
+        start: Time::from_ticks(start),
+        duration: Duration::from_ticks(dur),
+        source_in: Time::ZERO,
+        speed: 1.0,
+        group_id: None,
+        link_id: None,
+        disabled: false,
+        look: ClipLook::default(),
+    })
+}
+
+#[cfg(test)]
+mod caption_segment_tests {
+    use super::*;
+
+    fn cue(start: f64, end: f64, text: &str) -> CaptionCue {
+        CaptionCue {
+            start: Time::from_seconds(start),
+            end: Time::from_seconds(end),
+            text: text.into(),
+            speaker: None,
+            place: CaptionPlace::Bottom,
+            font: CaptionFont::Sans,
+            effect: CaptionEffect::None,
+            ink: Default::default(),
+            edge: Default::default(),
+        }
+    }
+
+    #[test]
+    fn each_caption_line_is_its_own_clip() {
+        let mut timeline = Timeline::default();
+        timeline
+            .replace_caption_cues(
+                CaptionStyle::Stacked,
+                vec![cue(0.2, 1.0, "hello there"), cue(1.4, 2.2, "second line")],
+            )
+            .unwrap();
+        let clips: Vec<_> = timeline
+            .first_track(TrackKind::Caption)
+            .unwrap()
+            .clips
+            .iter()
+            .collect();
+        assert_eq!(clips.len(), 2);
+        assert!((clips[0].start.as_seconds() - 0.2).abs() < 1e-6);
+        assert!((clips[0].duration.as_seconds() - 0.8).abs() < 1e-6);
+        assert!((clips[1].start.as_seconds() - 1.4).abs() < 1e-6);
+        let ClipKind::Caption { cues, .. } = &clips[0].kind else {
+            panic!("caption");
         };
-        self.add_clip(track_id, clip)
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "hello there");
+        assert_eq!(cues[0].start, Time::ZERO);
+        assert!(!timeline.explode_caption_cues());
+    }
+
+    #[test]
+    fn a_saved_caption_block_splits_into_lines() {
+        let mut timeline = Timeline::default();
+        let track = timeline.first_track(TrackKind::Caption).unwrap().id;
+        let id = ClipId::new();
+        timeline
+            .add_clip(
+                track,
+                Clip {
+                    id,
+                    media_id: None,
+                    kind: ClipKind::Caption {
+                        style: CaptionStyle::Stacked,
+                        cues: vec![cue(0.2, 1.0, "hello there"), cue(1.4, 2.2, "second line")],
+                    },
+                    start: Time::ZERO,
+                    duration: Duration::from_seconds(2.2),
+                    source_in: Time::ZERO,
+                    speed: 1.0,
+                    group_id: None,
+                    link_id: None,
+                    disabled: false,
+                    look: ClipLook::default(),
+                },
+            )
+            .unwrap();
+        assert!(timeline.explode_caption_cues());
+        let clips = &timeline.first_track(TrackKind::Caption).unwrap().clips;
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].id, id);
+        assert!((clips[1].start.as_seconds() - 1.4).abs() < 1e-6);
+        assert!(!timeline.explode_caption_cues());
+    }
+
+    #[test]
+    fn trimming_a_caption_keeps_the_words_on_the_new_span() {
+        let mut timeline = Timeline::default();
+        let id = timeline
+            .replace_caption_cues(CaptionStyle::Stacked, vec![cue(0.2, 1.4, "hello there")])
+            .unwrap();
+        timeline
+            .trim(id, Time::from_seconds(0.4), Duration::from_seconds(0.5))
+            .unwrap();
+        let clip = timeline.find_clip(id).unwrap().1;
+        assert!((clip.duration.as_seconds() - 0.5).abs() < 0.05);
+        let ClipKind::Caption { cues, .. } = &clip.kind else {
+            panic!("caption");
+        };
+        assert_eq!(cues[0].text, "hello there");
+        assert_eq!(cues[0].start, Time::ZERO);
+        assert!(cues[0].end.as_ticks() - clip.duration.as_ticks() <= 1);
     }
 }

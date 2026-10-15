@@ -1,9 +1,10 @@
 use oc_time::{Duration, FrameRate, Time};
 use oc_timeline::{
-    AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionStyle, Clip, ClipId, ClipKind, ClipLook,
-    Crop, Curves, Ease, FrameCard, Fx, Generator, Grade, Graphic, GraphicKind, MarkerId, MediaId,
-    Mix, PlaceMode, SpeedKey, Timeline, TimelineError, Track, TrackId, TrackKind, Transform,
-    TransitionKind, UndoStack,
+    AlphaShape, AspectRatio, AudioFx, CaptionCue, CaptionEdge, CaptionEffect, CaptionFont,
+    CaptionInk, CaptionPlace, CaptionStyle, Clip, ClipId, ClipKind, ClipLook, Crop, Curves, Ease,
+    FrameCard, Fx, Generator, Grade, Graphic, GraphicKind, MarkerId, MediaId, Mix, PlaceMode,
+    SpeedKey, Timeline, TimelineError, Track, TrackId, TrackKind, Transform, TransitionKind,
+    UndoStack,
 };
 use serde::{Deserialize, Serialize};
 
@@ -459,6 +460,16 @@ pub enum Op {
         index: usize,
         text: String,
     },
+    /// Place, face, motion, ink, and edge for one caption line.
+    SetCaptionLook {
+        clip_id: ClipId,
+        index: usize,
+        place: CaptionPlace,
+        font: CaptionFont,
+        effect: CaptionEffect,
+        ink: CaptionInk,
+        edge: CaptionEdge,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -577,8 +588,9 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             format!("ripple delete {clip_id}")
         }
         Op::AddCaptions { style, cues } => {
+            let n = cues.len();
             let id = timeline.replace_caption_cues(*style, cues.clone())?;
-            format!("added {} caption cues as {id}", cues.len())
+            format!("added {n} caption lines as {id}")
         }
         Op::RemoveSilence { ranges } => {
             let n = cut_ranges(timeline, ranges)?;
@@ -1178,6 +1190,31 @@ pub fn apply(timeline: &mut Timeline, undo: &mut UndoStack, op: Op) -> Result<Ap
             };
             cue.text = text.to_string();
             format!("caption {} on {clip_id}", *index + 1)
+        }
+        Op::SetCaptionLook {
+            clip_id,
+            index,
+            place,
+            font,
+            effect,
+            ink,
+            edge,
+        } => {
+            let clip = timeline
+                .clip_mut(*clip_id)
+                .ok_or(TimelineError::ClipNotFound(*clip_id))?;
+            let ClipKind::Caption { cues, .. } = &mut clip.kind else {
+                return Err(OpError::Message("that clip is not captions".into()));
+            };
+            let Some(cue) = cues.get_mut(*index) else {
+                return Err(OpError::Message("no caption on that line".into()));
+            };
+            cue.place = *place;
+            cue.font = *font;
+            cue.effect = *effect;
+            cue.ink = *ink;
+            cue.edge = *edge;
+            format!("caption look {} on {clip_id}", *index + 1)
         }
     };
     undo.label_last(&note);
@@ -2392,6 +2429,76 @@ mod tests {
             },
         );
         assert!(empty.is_err());
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::AddCaptions {
+                style: CaptionStyle::default(),
+                cues: vec![
+                    CaptionCue {
+                        start: Time::from_seconds(0.0),
+                        end: Time::from_seconds(1.0),
+                        text: "one".into(),
+                        speaker: None,
+                        place: Default::default(),
+                        font: Default::default(),
+                        effect: Default::default(),
+                        ink: Default::default(),
+                        edge: Default::default(),
+                    },
+                    CaptionCue {
+                        start: Time::from_seconds(1.2),
+                        end: Time::from_seconds(2.0),
+                        text: "two".into(),
+                        speaker: None,
+                        place: Default::default(),
+                        font: Default::default(),
+                        effect: Default::default(),
+                        ink: Default::default(),
+                        edge: Default::default(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let lines: Vec<_> = tl
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Caption)
+            .unwrap()
+            .clips
+            .iter()
+            .map(|clip| clip.id)
+            .collect();
+        assert_eq!(lines.len(), 2);
+        let second = lines[1];
+        apply(
+            &mut tl,
+            &mut undo,
+            Op::SetCaptionLook {
+                clip_id: second,
+                index: 0,
+                place: CaptionPlace::Top,
+                font: CaptionFont::Display,
+                effect: CaptionEffect::Pop,
+                ink: CaptionInk::Amber,
+                edge: CaptionEdge::Light,
+            },
+        )
+        .unwrap();
+        match &tl.find_clip(second).unwrap().1.kind {
+            ClipKind::Caption { cues, .. } => {
+                assert_eq!(cues[0].text, "two");
+                assert_eq!(cues[0].place, CaptionPlace::Top);
+                assert_eq!(cues[0].font, CaptionFont::Display);
+                assert_eq!(cues[0].ink, CaptionInk::Amber);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &tl.find_clip(lines[0]).unwrap().1.kind {
+            ClipKind::Caption { cues, .. } => assert_eq!(cues[0].text, "one"),
+            other => panic!("{other:?}"),
+        }
         apply(
             &mut tl,
             &mut undo,
