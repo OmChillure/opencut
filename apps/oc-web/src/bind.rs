@@ -38,6 +38,9 @@ pub fn tracks_from_timeline(timeline: &Timeline) -> Vec<EditorTrack> {
                                 graphic.text.clone()
                             }
                         }
+                        ClipKind::Caption { cues, .. } => {
+                            cues.first().map(|cue| cue.text.clone()).unwrap_or_default()
+                        }
                         _ => clip
                             .look
                             .graphic

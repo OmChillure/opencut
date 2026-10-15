@@ -555,6 +555,47 @@ button.proj-tab-name { cursor: pointer; }
   line-height: 1.35;
 }
 .caption-edit { display: flex; margin-bottom: 8px; }
+.caption-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.caption-panel small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.caption-text,
+.caption-select {
+  width: 100%;
+  background: #141414;
+  color: #f3f3f3;
+  border: 1px solid #242424;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+}
+.caption-text {
+  min-height: 64px;
+  resize: vertical;
+  padding: 8px;
+}
+.caption-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.caption-row span { width: 52px; flex-shrink: 0; }
+.caption-select {
+  height: 28px;
+  min-width: 0;
+}
+.caption-panel .btn { justify-content: center; }
 
 /* ——— preview ——— */
 .preview {
@@ -1436,6 +1477,7 @@ button.proj-tab-name { cursor: pointer; }
 .nle-clip:hover .nle-name,
 .nle-clip.on .nle-name,
 .nle-clip.ghost .nle-name { opacity: 1; }
+.lane-c .nle-name { opacity: 1; }
 .zoom {
   color: var(--muted);
   font-size: 11px;

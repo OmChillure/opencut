@@ -68,7 +68,9 @@ pub fn load_undo(project: &str) -> UndoStack {
         .unwrap_or_else(UndoStack::new)
 }
 
-fn restore(mut save: WorkspaceSave, timeline: oc_core::Timeline, undo: UndoStack) {
+fn restore(mut save: WorkspaceSave, mut timeline: oc_core::Timeline, undo: UndoStack) {
+    // An older undo step can still be one caption block. Put each line back on its own clip.
+    let _ = timeline.explode_caption_cues();
     save.undo.set(undo.clone());
     store_undo(&save.project_id.peek(), &undo);
     save.engine.set(timeline.clone());
@@ -132,13 +134,25 @@ fn pump_persist(mut save: WorkspaceSave) {
     let pid = save.project_id.peek().clone();
     spawn(async move {
         if !pid.is_empty() {
-            if let Ok(next) = api::apply_ops(&pid, ops).await {
-                save.engine.set(next);
+            if let Ok(mut next) = api::apply_ops(&pid, ops).await {
+                if next.explode_caption_cues() {
+                    save.tracks.set(bind::tracks_from_timeline(&next));
+                    let body = next.clone();
+                    save.engine.set(next);
+                    let _ = api::save_timeline(&pid, body).await;
+                } else {
+                    save.engine.set(next);
+                }
             }
         }
         save.persist_busy.set(false);
         pump_persist(save);
     });
+}
+
+/// Store a timeline the editor already applied. Later edits wait behind this write.
+pub fn persist_timeline(save: WorkspaceSave, timeline: oc_core::Timeline) {
+    enqueue_persist(save, vec![Op::SetTimeline { timeline }]);
 }
 
 pub fn split_at(save: WorkspaceSave, track_id: &str, at: f64) -> Result<Vec<String>, String> {
@@ -615,14 +629,49 @@ pub fn set_caption_text(
     index: usize,
     text: String,
 ) -> Result<Vec<String>, String> {
-    run_ops(
+    let notes = run_ops(
         save,
         vec![Op::SetCaptionText {
             clip_id,
             index,
             text,
         }],
-    )
+    )?;
+    // The line op can miss: a later line's id exists only after this client
+    // splits the block, and an older API rejects SetCaptionLook. The timeline
+    // write is the copy that API already stores.
+    persist_caption(save);
+    Ok(notes)
+}
+
+pub fn set_caption_look(
+    save: WorkspaceSave,
+    clip_id: ClipId,
+    index: usize,
+    place: oc_core::CaptionPlace,
+    font: oc_core::CaptionFont,
+    effect: oc_core::CaptionEffect,
+    ink: oc_core::CaptionInk,
+    edge: oc_core::CaptionEdge,
+) -> Result<Vec<String>, String> {
+    let notes = run_ops(
+        save,
+        vec![Op::SetCaptionLook {
+            clip_id,
+            index,
+            place,
+            font,
+            effect,
+            ink,
+            edge,
+        }],
+    )?;
+    persist_caption(save);
+    Ok(notes)
+}
+
+fn persist_caption(save: WorkspaceSave) {
+    persist_timeline(save, save.engine.peek().clone());
 }
 
 pub fn set_frame_rate(

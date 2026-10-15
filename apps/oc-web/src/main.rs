@@ -439,7 +439,65 @@ fn note_loaded_picture(
     }
 }
 
-fn caption_under(timeline: &EngineTimeline, at: f64) -> Option<(oc_core::ClipId, usize, String)> {
+#[derive(Clone)]
+struct CaptionEdit {
+    clip_id: oc_core::ClipId,
+    index: usize,
+    text: String,
+    place: oc_core::CaptionPlace,
+    font: oc_core::CaptionFont,
+    effect: oc_core::CaptionEffect,
+    ink: oc_core::CaptionInk,
+    edge: oc_core::CaptionEdge,
+}
+
+fn caption_from_clip(clip: &oc_core::Clip, at: Option<f64>) -> Option<CaptionEdit> {
+    let oc_core::ClipKind::Caption { cues, .. } = &clip.kind else {
+        return None;
+    };
+    if cues.is_empty() {
+        return None;
+    }
+    let index = at
+        .map(|at| {
+            let local = at - clip.start.as_seconds();
+            cues.iter()
+                .position(|cue| {
+                    local + 1e-4 >= cue.start.as_seconds() && local < cue.end.as_seconds()
+                })
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let cue = cues.get(index).or_else(|| cues.first())?;
+    Some(CaptionEdit {
+        clip_id: clip.id,
+        index,
+        text: cue.text.clone(),
+        place: cue.place,
+        font: cue.font,
+        effect: cue.effect,
+        ink: cue.ink,
+        edge: cue.edge,
+    })
+}
+
+fn caption_by_id(timeline: &EngineTimeline, id: &str) -> Option<CaptionEdit> {
+    timeline
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Caption)
+        .flat_map(|track| track.clips.iter())
+        .find(|clip| clip.id.to_string() == id)
+        .and_then(|clip| caption_from_clip(clip, None))
+}
+
+/// The selected caption, or the line under the playhead.
+fn caption_edit(timeline: &EngineTimeline, selected: Option<&str>, at: f64) -> Option<CaptionEdit> {
+    if let Some(id) = selected.filter(|id| !id.is_empty()) {
+        if let Some(line) = caption_by_id(timeline, id) {
+            return Some(line);
+        }
+    }
     for track in &timeline.tracks {
         if track.hidden || track.kind != TrackKind::Caption {
             continue;
@@ -452,14 +510,8 @@ fn caption_under(timeline: &EngineTimeline, at: f64) -> Option<(oc_core::ClipId,
             if at + 1e-4 < start || at >= start + clip.duration.as_seconds() {
                 continue;
             }
-            let local = at - start;
-            let oc_core::ClipKind::Caption { cues, .. } = &clip.kind else {
-                continue;
-            };
-            for (index, cue) in cues.iter().enumerate() {
-                if local + 1e-4 >= cue.start.as_seconds() && local < cue.end.as_seconds() {
-                    return Some((clip.id, index, cue.text.clone()));
-                }
+            if let Some(line) = caption_from_clip(clip, Some(at)) {
+                return Some(line);
             }
         }
     }
@@ -697,6 +749,31 @@ fn stored_ticket(id: &str) -> Option<u64> {
 
 fn recall(id: &str) -> Option<WorkspaceSnap> {
     WORKSPACES.with(|slot| slot.borrow().get(id).map(|row| row.snap.clone()))
+}
+
+/// Keep a split caption timeline in the tab cache so the next open does not mint new clip ids.
+fn store_timeline(id: &str, timeline: &EngineTimeline, tracks: &[EditorTrack]) {
+    if id.is_empty() {
+        return;
+    }
+    let duration = timeline.duration().as_seconds();
+    WORKSPACES.with(|slot| {
+        let mut map = slot.borrow_mut();
+        let Some(existing) = map.get_mut(id) else {
+            return;
+        };
+        existing.snap.engine = timeline.clone();
+        existing.snap.tracks = tracks.to_vec();
+        existing.snap.duration = duration;
+    });
+}
+
+fn commit_split(save: WorkspaceSave, id: &str, timeline: &EngineTimeline, tracks: &[EditorTrack]) {
+    if id.is_empty() {
+        return;
+    }
+    store_timeline(id, timeline, tracks);
+    tools::persist_timeline(save, timeline.clone());
 }
 
 fn revoke_blob_url(url: &str) {
@@ -1138,17 +1215,31 @@ fn cached_thread<'a>(
 
 fn show_cached(snap: &WorkspaceSnap, id: &str, view: &mut WorkspaceView, keep_live: bool) {
     let mut clock = view.clock;
+    let mut timeline = snap.engine.clone();
+    let split = timeline.explode_caption_cues();
+    let tracks = if split {
+        bind::tracks_from_timeline(&timeline)
+    } else {
+        snap.tracks.clone()
+    };
+    if split {
+        commit_split(view.save, id, &timeline, &tracks);
+    }
     view.name.set(snap.name.clone());
-    view.tracks.set(snap.tracks.clone());
+    view.tracks.set(tracks.clone());
     clock.playing.set(false);
     clock.current.set(snap.playhead);
-    clock.duration.set(snap.duration);
+    clock.duration.set(if split {
+        timeline.duration().as_seconds()
+    } else {
+        snap.duration
+    });
     reset_tick_clock();
     set_playhead(snap.playhead);
     paint_playhead(snap.playhead);
     view.aspect.set(snap.aspect);
     view.target_track.set(snap.target_track.clone());
-    view.engine.set(snap.engine.clone());
+    view.engine.set(timeline.clone());
     view.undo.set(snap.undo.clone());
     let base = snap.library.clone();
     // A project switch must not mix in the previous project's rows. The signal
@@ -1198,7 +1289,7 @@ fn show_cached(snap: &WorkspaceSnap, id: &str, view: &mut WorkspaceView, keep_li
     view.drag.set(None);
     mark_shown(id);
     note_open_tab(view, id, Some(&snap.name));
-    sync_monitor(&snap.engine, &library, &snap.tracks, snap.playhead, false);
+    sync_monitor(&timeline, &library, &tracks, snap.playhead, false);
     schedule_missing_blobs(id, view);
     warm_other_tabs(id, view.open_tabs);
 }
@@ -1435,21 +1526,23 @@ fn publish_project(view: &mut WorkspaceView, pid: &str, ticket: u64, project: &o
     let mut clock = view.clock;
     view.name.set(project.name.clone());
     note_open_tab(view, pid, Some(&project.name));
-    view.tracks
-        .set(bind::tracks_from_timeline(&project.timeline));
-    clock.duration.set(project.timeline.duration().as_seconds());
-    view.aspect.set(Aspect::from_pixels(
-        project.timeline.width,
-        project.timeline.height,
-    ));
-    let target = project
-        .timeline
+    let mut timeline = project.timeline.clone();
+    let split = timeline.explode_caption_cues();
+    let tracks = bind::tracks_from_timeline(&timeline);
+    if split {
+        commit_split(view.save, pid, &timeline, &tracks);
+    }
+    view.tracks.set(tracks);
+    clock.duration.set(timeline.duration().as_seconds());
+    view.aspect
+        .set(Aspect::from_pixels(timeline.width, timeline.height));
+    let target = timeline
         .first_track(TrackKind::Video)
-        .or_else(|| project.timeline.tracks.first())
+        .or_else(|| timeline.tracks.first())
         .map(|track| track.id.to_string())
         .unwrap_or_default();
     view.target_track.set(target);
-    view.engine.set(project.timeline.clone());
+    view.engine.set(timeline);
     view.undo.set(tools::load_undo(pid));
     mark_shown(pid);
 }
@@ -2777,6 +2870,236 @@ fn live_note(save: WorkspaceSave, library: &[MediaItem], result: Result<Vec<Stri
     }
 }
 
+fn push_caption_look(save: WorkspaceSave, library: &[MediaItem], line: &CaptionEdit) {
+    live_note(
+        save,
+        library,
+        tools::set_caption_look(
+            save,
+            line.clip_id,
+            line.index,
+            line.place,
+            line.font,
+            line.effect,
+            line.ink,
+            line.edge,
+        ),
+    );
+}
+
+#[component]
+fn CaptionEditor() -> Element {
+    let save = use_context::<WorkspaceSave>();
+    let clock = use_context::<Clock>();
+    let selected = use_context::<CtxSelected>().0;
+    let library = use_context::<Signal<Vec<MediaItem>>>();
+    let mut draft = use_signal(String::new);
+    let mut draft_key = use_signal(String::new);
+    let line = caption_edit(
+        &save.engine.read(),
+        selected.read().as_deref(),
+        *clock.current.read(),
+    );
+    let synced = use_memo(move || {
+        caption_edit(
+            &save.engine.read(),
+            selected.read().as_deref(),
+            *clock.current.read(),
+        )
+        .map(|line| {
+            (
+                format!("{}:{}:{}", line.clip_id, line.index, line.text),
+                line.text,
+            )
+        })
+    });
+    use_effect(move || {
+        let current = synced.read().clone();
+        let key = current
+            .as_ref()
+            .map(|(key, _)| key.clone())
+            .unwrap_or_default();
+        if *draft_key.peek() == key {
+            return;
+        }
+        let text = current.map(|(_, text)| text).unwrap_or_default();
+        draft_key.set(key);
+        draft.set(text);
+    });
+    let typed = draft.read().clone();
+
+    rsx! {
+        div { class: "drop caption-panel",
+            IconCaptions {}
+            strong { "Captions" }
+            small { "Each line is its own clip. Edit that line, then trim it on the timeline." }
+            if let Some(line) = line.clone() {
+                textarea {
+                    class: "caption-text",
+                    rows: "3",
+                    value: "{typed}",
+                    oninput: move |evt| draft.set(evt.value()),
+                    onblur: move |_| {
+                        let Some(current) = caption_edit(
+                            &save.engine.peek(),
+                            selected.peek().as_deref(),
+                            playhead_now().max(*clock.current.peek()),
+                        ) else {
+                            return;
+                        };
+                        let next = draft.peek().trim().to_string();
+                        if next.is_empty() {
+                            show_toast().error("A caption line cannot be empty");
+                            draft.set(current.text);
+                            return;
+                        }
+                        if next == current.text {
+                            return;
+                        }
+                        live_note(
+                            save,
+                            &library.peek(),
+                            tools::set_caption_text(save, current.clip_id, current.index, next),
+                        );
+                    },
+                }
+                label { class: "caption-row",
+                    span { "Style" }
+                    select {
+                        class: "caption-select",
+                        onchange: move |evt| {
+                            let Some(preset) = oc_core::CaptionPreset::parse(&evt.value()) else {
+                                return;
+                            };
+                            let Some(mut current) = caption_edit(
+                                &save.engine.peek(),
+                                selected.peek().as_deref(),
+                                playhead_now().max(*clock.current.peek()),
+                            ) else {
+                                return;
+                            };
+                            let paint = preset.paint();
+                            current.place = paint.place;
+                            current.font = paint.font;
+                            current.effect = paint.effect;
+                            current.ink = paint.ink;
+                            current.edge = paint.edge;
+                            push_caption_look(save, &library.peek(), &current);
+                        },
+                        option { value: "", "Choose a look" }
+                        for preset in oc_core::CaptionPreset::all() {
+                            option { value: "{preset.as_str()}", "{preset.as_str()}" }
+                        }
+                    }
+                }
+                {caption_choice("Place", line.place.as_str(), &["bottom", "lower", "middle", "top"], move |value| {
+                    let Some(mut current) = fresh_caption(save, selected, clock) else { return };
+                    current.place = oc_core::CaptionPlace::parse(value);
+                    push_caption_look(save, &library.peek(), &current);
+                })}
+                {caption_choice("Font", line.font.as_str(), &["sans", "display", "serif", "mono"], move |value| {
+                    let Some(mut current) = fresh_caption(save, selected, clock) else { return };
+                    current.font = oc_core::CaptionFont::parse(value);
+                    push_caption_look(save, &library.peek(), &current);
+                })}
+                {caption_choice("Effect", line.effect.as_str(), &["none", "pop", "typewriter", "fade"], move |value| {
+                    let Some(mut current) = fresh_caption(save, selected, clock) else { return };
+                    current.effect = oc_core::CaptionEffect::parse(value);
+                    push_caption_look(save, &library.peek(), &current);
+                })}
+                {caption_choice("Ink", line.ink.as_str(), &["white", "cream", "bone", "black", "amber", "cyan", "mint", "rose", "violet"], move |value| {
+                    let Some(mut current) = fresh_caption(save, selected, clock) else { return };
+                    current.ink = parse_ink(value);
+                    push_caption_look(save, &library.peek(), &current);
+                })}
+                {caption_choice("Edge", line.edge.as_str(), &["dark", "light"], move |value| {
+                    let Some(mut current) = fresh_caption(save, selected, clock) else { return };
+                    current.edge = if value == "light" {
+                        oc_core::CaptionEdge::Light
+                    } else {
+                        oc_core::CaptionEdge::Dark
+                    };
+                    push_caption_look(save, &library.peek(), &current);
+                })}
+            } else {
+                p { class: "caption-now", "Select a caption on the timeline" }
+            }
+            button {
+                class: "btn btn-primary",
+                onclick: move |_| {
+                    let pid = save.project_id.peek().clone();
+                    let clock = clock;
+                    spawn(async move {
+                        if let Err(err) = api::ensure_speech(&pid).await {
+                            show_toast().error(format!("Speech was not stored — {err}"));
+                            return;
+                        }
+                        match api::generate_captions(&pid).await {
+                            Ok((timeline, note)) => {
+                                let mut save = save;
+                                show_timeline(&mut save, &clock, timeline);
+                                show_toast().success(note);
+                            }
+                            Err(err) => show_toast().error(err),
+                        }
+                    });
+                },
+                "Generate captions"
+            }
+        }
+    }
+}
+
+fn fresh_caption(
+    save: WorkspaceSave,
+    selected: Signal<Option<String>>,
+    clock: Clock,
+) -> Option<CaptionEdit> {
+    caption_edit(
+        &save.engine.peek(),
+        selected.peek().as_deref(),
+        playhead_now().max(*clock.current.peek()),
+    )
+}
+
+fn parse_ink(value: &str) -> oc_core::CaptionInk {
+    match value {
+        "cream" => oc_core::CaptionInk::Cream,
+        "bone" => oc_core::CaptionInk::Bone,
+        "black" => oc_core::CaptionInk::Black,
+        "amber" => oc_core::CaptionInk::Amber,
+        "cyan" => oc_core::CaptionInk::Cyan,
+        "mint" => oc_core::CaptionInk::Mint,
+        "rose" => oc_core::CaptionInk::Rose,
+        "violet" => oc_core::CaptionInk::Violet,
+        _ => oc_core::CaptionInk::White,
+    }
+}
+
+fn caption_choice<F>(
+    label: &'static str,
+    current: &'static str,
+    options: &'static [&'static str],
+    on_pick: F,
+) -> Element
+where
+    F: Fn(&str) + 'static,
+{
+    rsx! {
+        label { class: "caption-row",
+            span { "{label}" }
+            select {
+                class: "caption-select",
+                value: "{current}",
+                onchange: move |evt| on_pick(&evt.value()),
+                for name in options {
+                    option { value: "{name}", selected: *name == current, "{name}" }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn AssetView(tab: AssetTab) -> Element {
     let save = use_context::<WorkspaceSave>();
@@ -2823,68 +3146,7 @@ fn AssetView(tab: AssetTab) -> Element {
                 }
             }
         },
-        AssetTab::Captions => {
-            let line = caption_under(&save.engine.read(), *clock.current.read());
-            let idle = line.is_none();
-            rsx! {
-                div { class: "drop",
-                    IconCaptions {}
-                    strong { "Captions" }
-                    small { "The line under the playhead. Generate reads speech into a caption track." }
-                    p { class: "caption-now",
-                        if let Some((_, _, text)) = &line {
-                            "{text}"
-                        } else {
-                            "No caption under the playhead"
-                        }
-                    }
-                    button {
-                        class: "btn caption-edit",
-                        disabled: idle,
-                        onclick: move |_| {
-                            let Some((clip_id, index, text)) = caption_under(&save.engine.peek(), playhead_now()) else {
-                                show_toast().error("No caption under the playhead");
-                                return;
-                            };
-                            let Some(next) = web_sys::window().and_then(|window| {
-                                window.prompt_with_message_and_default("Caption", &text).ok().flatten()
-                            }) else {
-                                return;
-                            };
-                            let next = next.trim().to_string();
-                            if next.is_empty() {
-                                show_toast().error("A caption line cannot be empty");
-                                return;
-                            }
-                            live_note(save, &library.peek(), tools::set_caption_text(save, clip_id, index, next));
-                        },
-                        "Edit caption"
-                    }
-                    button {
-                        class: "btn btn-primary",
-                        onclick: move |_| {
-                            let pid = save.project_id.peek().clone();
-                            let clock = clock;
-                            spawn(async move {
-                                if let Err(err) = api::ensure_speech(&pid).await {
-                                    show_toast().error(format!("Speech was not stored — {err}"));
-                                    return;
-                                }
-                                match api::generate_captions(&pid).await {
-                                    Ok((timeline, note)) => {
-                                        let mut save = save;
-                                        show_timeline(&mut save, &clock, timeline);
-                                        show_toast().success(note);
-                                    }
-                                    Err(err) => show_toast().error(err),
-                                }
-                            });
-                        },
-                        "Generate captions"
-                    }
-                }
-            }
-        }
+        AssetTab::Captions => rsx! { CaptionEditor {} },
         AssetTab::Audio => rsx! {
             div { class: "card-list",
                 studio::Mixer {}
@@ -4060,7 +4322,9 @@ fn Timeline() -> Element {
                                                     if mix {
                                                         c.push_str(" mix");
                                                     }
-                                                    if !clip.graphic.is_empty() {
+                                                    if !clip.graphic.is_empty()
+                                                        && track.kind != TrackKindUi::Caption
+                                                    {
                                                         c.push_str(" gfx-clip");
                                                     }
                                                     if clip_uploading {
@@ -4073,6 +4337,7 @@ fn Timeline() -> Element {
                                                 let trim_in_id = clip_id.clone();
                                                 let trim_out_id = clip_id.clone();
                                                 let from_track = lane_id.clone();
+                                                let lane_kind = track.kind;
                                                 let clip_start = clip.start;
                                                 let clip_dur = clip.duration;
                                                 let grab_name = name.clone();
@@ -4087,6 +4352,9 @@ fn Timeline() -> Element {
                                                             name.clone()
                                                         },
                                                         onmousedown: move |evt| {
+                                                            if lane_kind == TrackKindUi::Caption {
+                                                                asset_tab.set(AssetTab::Captions);
+                                                            }
                                                             let edge_x = evt.element_coordinates().x;
                                                             let edge_w = (clip_dur * *pps.peek()).max(24.0);
                                                             if edge_x <= 12.0 || edge_x >= edge_w - 12.0 {
@@ -5903,7 +6171,8 @@ fn install_studio_shortcut(mut ai_open: Signal<bool>) {
     closure.forget();
 }
 
-fn show_timeline(save: &mut WorkspaceSave, clock: &Clock, timeline: EngineTimeline) {
+fn show_timeline(save: &mut WorkspaceSave, clock: &Clock, mut timeline: EngineTimeline) {
+    let split = timeline.explode_caption_cues();
     let previous = save.engine.peek().clone();
     if previous != timeline {
         let mut undo = save.undo.peek().clone();
@@ -5912,8 +6181,13 @@ fn show_timeline(save: &mut WorkspaceSave, clock: &Clock, timeline: EngineTimeli
         tools::store_undo(&save.project_id.peek(), &undo);
     }
     let end = timeline.duration().as_seconds();
+    let tracks = bind::tracks_from_timeline(&timeline);
+    if split {
+        let pid = save.project_id.peek().clone();
+        commit_split(*save, &pid, &timeline, &tracks);
+    }
     save.engine.set(timeline.clone());
-    save.tracks.set(bind::tracks_from_timeline(&timeline));
+    save.tracks.set(tracks);
     if end > 0.0 {
         let mut duration = clock.duration;
         duration.set(end);
