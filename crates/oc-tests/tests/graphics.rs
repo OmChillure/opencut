@@ -257,9 +257,10 @@ fn a_vertical_drawing_sits_in_the_lower_band() {
         .look
         .card
         .expect("lower band");
-    assert!(card.y >= 0.48, "{card:?}");
-    assert!(card.h <= 0.14, "{card:?}");
-    assert!(card.y + card.h <= 0.62, "{card:?}");
+    assert!(card.y >= 0.64, "{card:?}");
+    assert!(card.h <= 0.16 && card.h >= 0.12, "{card:?}");
+    assert!(card.y + card.h <= 0.82, "{card:?}");
+    assert!(card.y + card.h > 0.74, "{card:?}");
     assert!(card.w >= 0.8, "{card:?}");
 }
 
@@ -296,7 +297,7 @@ fn a_vertical_behind_keeps_the_person_full_frame() {
         .look
         .card
         .expect("lower bar");
-    assert!(card.y >= 0.48 && card.y + card.h <= 0.62, "{card:?}");
+    assert!(card.y >= 0.64 && card.y + card.h <= 0.82, "{card:?}");
     let speaker_clip = tl
         .tracks
         .iter()

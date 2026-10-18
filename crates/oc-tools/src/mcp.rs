@@ -886,11 +886,11 @@ pub fn mcp_tools() -> Vec<McpTool> {
                  One call finishes it. A chart, a diagram, a title, a number, a name, a logo, or a place. \
                  Pass design. kind is only a shortcut: kinetic, stat, chart, lower, logo, or map. \
                  design is one of: kinetic-slam, kinetic-typewriter, kinetic-words, kinetic-wave, kinetic-bounce, kinetic-punch, kinetic-blur, kinetic-glitch, kinetic-editorial, kinetic-burst, stat-count, stat-ring, stat-bars, chart-bars, chart-line, chart-pie, chart-race, lower-bar, lower-callout, lower-quote, lower-split, logo-draw, logo-lockup, map-highlight, map-route. \
-                 text is the words or the number, exactly as spoken. The clip already shows those words. \
+                 text is the number and the words around it, or the name, or the quote, exactly as spoken. \
                  prompt is the series, the place, or the mark when the design needs it. \
                  style is bold, editorial, swiss, terminal, spotlight, clean, or neon. \
-                 at is the timeline start. duration is the spoken line, from 2 to 8 seconds. \
-                 layout is cutaway, beside, or behind. \
+                 at is the timeline start. duration is that spoken line. The host keeps it between 1.2 and 8 seconds and does not hold it past the shot. \
+                 Leave layout empty on a talking shot. The person stays full frame and the type sits in the lower band. A full-frame card is only a title with nobody in the shot. \
                  One watch of the spoken line is enough. Call this after the last revise_edit. A camera move is not a reason to call this. Do not write HTML. Do not render a file."
                 .into(),
             input_schema: object(&[
@@ -898,10 +898,10 @@ pub fn mcp_tools() -> Vec<McpTool> {
                 ("kind", str_prop("Shortcut when design is omitted: kinetic, stat, chart, lower, logo, or map"), false),
                 ("text", str_prop("The words or the number, exactly as spoken"), true),
                 ("at", num_prop("Timeline start in seconds"), true),
-                ("duration", num_prop("Length of the spoken line in seconds, from 2 to 8"), false),
-                ("prompt", str_prop("The series, the place, or the mark"), false),
+                ("duration", num_prop("Length of the spoken line in seconds. The host keeps it between 1.2 and 8 and does not hold it past the shot"), false),
+                ("prompt", str_prop("The series, the place, or the mark. On a number, the words around it if they are not in text"), false),
                 ("style", str_prop("bold, editorial, swiss, terminal, spotlight, clean, or neon"), false),
-                ("layout", str_prop("cutaway, beside, or behind"), false),
+                ("layout", str_prop("Leave empty on a talking shot. cutaway is only a title with nobody in the shot"), false),
             ]),
         },
         McpTool {

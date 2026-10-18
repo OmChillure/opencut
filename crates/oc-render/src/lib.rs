@@ -134,6 +134,10 @@ pub fn render(req: &RenderRequest) -> Result<RenderResult, RenderError> {
                 .arg("-framerate")
                 .arg(format!("{:.3}", compiled.fps));
         }
+        // Applies only to the next input. The output encoder is set after every -i.
+        if let Some(decoder) = graph::vpx_alpha_decoder(input) {
+            cmd.arg("-c:v").arg(decoder);
+        }
         cmd.arg("-i").arg(input);
     }
     cmd.arg("-filter_complex")

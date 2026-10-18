@@ -53,15 +53,15 @@ const DESIGNS: &[Design] = &[
     },
     Design {
         id: "stat-count",
-        behind: false,
+        behind: true,
     },
     Design {
         id: "stat-ring",
-        behind: false,
+        behind: true,
     },
     Design {
         id: "stat-bars",
-        behind: false,
+        behind: true,
     },
     Design {
         id: "chart-bars",
@@ -162,13 +162,14 @@ pub fn frame_size(aspect: &str) -> (u32, u32) {
     }
 }
 
-/// A tall beside or behind graphic is the lower bar, not a full-frame plate.
+/// A tall beside or behind graphic is the lower band, not a full-frame plate.
+/// Width and height match `place_design`'s portrait card: 84% by 14%.
 pub fn render_size(width: u32, height: u32, band: bool) -> (u32, u32) {
     if !band {
         return (width.max(2), height.max(2));
     }
     let w = even_px(width as f32 * 0.84);
-    let h = even_px(height as f32 * 0.10);
+    let h = even_px(height as f32 * 0.14);
     (w.max(64), h.max(64))
 }
 
@@ -185,9 +186,17 @@ pub struct RenderJob<'a> {
     pub duration: f64,
     pub width: u32,
     pub height: u32,
+    /// A lower band is a transparent webm. A full-frame title stays an opaque mp4.
+    pub alpha: bool,
 }
 
-pub async fn render_mp4(job: &RenderJob<'_>) -> Result<Vec<u8>, String> {
+pub struct RenderedClip {
+    pub bytes: Vec<u8>,
+    pub content_type: &'static str,
+    pub extension: &'static str,
+}
+
+pub async fn render_clip(job: &RenderJob<'_>) -> Result<RenderedClip, String> {
     let dir = std::env::temp_dir().join(format!(
         "oc-motion-{}",
         std::time::SystemTime::now()
@@ -198,7 +207,8 @@ pub async fn render_mp4(job: &RenderJob<'_>) -> Result<Vec<u8>, String> {
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;
-    let out = dir.join("design.mp4");
+    let extension = if job.alpha { "webm" } else { "mp4" };
+    let out = dir.join(format!("design.{extension}"));
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("motion/render.mjs");
     let result = tokio::process::Command::new(node_bin())
         .arg(&script)
@@ -222,6 +232,8 @@ pub async fn render_mp4(job: &RenderJob<'_>) -> Result<Vec<u8>, String> {
         .arg(job.width.to_string())
         .arg("--h")
         .arg(job.height.to_string())
+        .arg("--alpha")
+        .arg(if job.alpha { "1" } else { "0" })
         .kill_on_drop(true)
         .output()
         .await;
@@ -245,7 +257,11 @@ pub async fn render_mp4(job: &RenderJob<'_>) -> Result<Vec<u8>, String> {
     if bytes.len() < 32 {
         return Err("motion render was empty".into());
     }
-    Ok(bytes)
+    Ok(RenderedClip {
+        bytes,
+        content_type: if job.alpha { "video/webm" } else { "video/mp4" },
+        extension,
+    })
 }
 
 fn node_bin() -> String {
@@ -278,6 +294,10 @@ mod tests {
     #[test]
     fn a_kind_picks_a_design_and_an_unknown_design_is_refused() {
         assert_eq!(resolve("", "stat").unwrap().id, "stat-count");
+        assert!(resolve("", "number").unwrap().behind);
+        assert!(resolve("stat-ring", "").unwrap().behind);
+        assert!(!resolve("kinetic-slam", "").unwrap().behind);
+        assert!(!resolve("", "map").unwrap().behind);
         assert_eq!(resolve("kinetic-glitch", "").unwrap().id, "kinetic-glitch");
         assert_eq!(resolve("logo-reveal", "").unwrap().id, "logo-draw");
         let err = resolve("webpage", "").unwrap_err();
@@ -288,7 +308,7 @@ mod tests {
     fn a_vertical_bar_renders_at_the_bar() {
         let (width, height) = render_size(720, 1280, true);
         assert_eq!(width, 604);
-        assert_eq!(height, 128);
+        assert_eq!(height, 178);
         assert_eq!(render_size(1280, 720, false), (1280, 720));
         assert_eq!(render_size(720, 1280, false), (720, 1280));
     }

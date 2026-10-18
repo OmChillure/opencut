@@ -1364,12 +1364,14 @@ fn place_design(
             });
         }
         DesignLayout::Beside | DesignLayout::Behind => {
-            // The person stays full frame. The bar sits under the face and above the captions.
+            // The person stays full frame. The type sits in the lower third,
+            // under a lower caption and above a bottom caption.
+            // Keep 0.84 by 0.14 in step with motion::render_size.
             picture.look.card = Some(FrameCard {
                 x: 0.08,
-                y: 0.50,
+                y: 0.66,
                 w: 0.84,
-                h: 0.10,
+                h: 0.14,
             });
         }
     }
@@ -1377,9 +1379,9 @@ fn place_design(
     let words = text.trim();
     if !words.is_empty() {
         let (x, y) = match layout {
-            DesignLayout::Behind if portrait => (Some(0.50), Some(0.55)),
+            DesignLayout::Behind if portrait => (Some(0.50), Some(0.73)),
             DesignLayout::Behind => (Some(0.28), Some(0.42)),
-            DesignLayout::Beside if portrait => (Some(0.50), Some(0.55)),
+            DesignLayout::Beside if portrait => (Some(0.50), Some(0.73)),
             DesignLayout::Beside => (Some(0.74), Some(0.86)),
             DesignLayout::Cutaway => (None, None),
         };

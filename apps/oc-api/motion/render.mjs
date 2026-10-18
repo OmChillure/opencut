@@ -2,13 +2,46 @@
 // Render one catalog design to an mp4. Chrome seeks the page; ffmpeg encodes the frames.
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const FPS = 24;
+
+// A comma is part of the number. "10,000 prize pool" is 10000 plus its label.
+export function readFigure(text) {
+  const m = String(text || "").match(/-?\$?\d[\d,]*(?:\.\d+)?%?/);
+  if (!m) return null;
+  const raw = m[0];
+  const n = Number(raw.replace(/[$,%]/g, "").replace(/,/g, ""));
+  if (!Number.isFinite(n)) return null;
+  const frac = raw.split(".")[1] || "";
+  return {
+    n,
+    raw,
+    prefix: raw.includes("$") ? "$" : "",
+    suffix: raw.includes("%") ? "%" : "",
+    decimals: frac.replace(/\D/g, "").length,
+  };
+}
+
+function stripFigure(text, raw) {
+  if (!text || !raw) return "";
+  return String(text).split(raw).join(" ").replace(/[$%]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+export function bandCopy(text, prompt) {
+  const figure = readFigure(text) || readFigure(prompt);
+  if (!figure) {
+    const line = String(text || "").trim() || String(prompt || "").trim();
+    return { figure: null, label: "", line };
+  }
+  const label = stripFigure(text, figure.raw) || stripFigure(prompt, figure.raw);
+  return { figure, label, line: "" };
+}
 
 const STYLES = {
   bold: { bg: "#111111", fg: "#f4f1ea", accent: "#ff4d2e", muted: "#8d867c", serif: false },
@@ -27,20 +60,38 @@ function arg(name, fallback = "") {
 
 function page(spec) {
   const style = STYLES[spec.style] || STYLES.bold;
-  const font = style.serif
+  const band = spec.h < spec.w * 0.5;
+  const copy = bandCopy(spec.text, spec.prompt);
+  const view = {
+    ...spec,
+    figure: copy.figure ? copy.figure.n : null,
+    prefix: copy.figure ? copy.figure.prefix : "",
+    suffix: copy.figure ? copy.figure.suffix : "",
+    decimals: copy.figure ? copy.figure.decimals : 0,
+    label: copy.label,
+    line: copy.line,
+  };
+  const font = !band && style.serif
     ? '"Liberation Serif", "Times New Roman", serif'
     : '"Liberation Sans", "DejaVu Sans", sans-serif';
-  const data = JSON.stringify(spec).replace(/</g, "\\u003c");
+  const ground = band ? "transparent" : style.bg;
+  const data = JSON.stringify(view).replace(/</g, "\\u003c");
   return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  html, body { margin:0; width:${spec.w}px; height:${spec.h}px; overflow:hidden; background:${style.bg}; color:${style.fg}; font-family:${font}; }
-  #root { position:relative; width:100%; height:100%; }
+  html, body { margin:0; width:${spec.w}px; height:${spec.h}px; overflow:hidden; background:${ground}; color:${style.fg}; font-family:${font}; }
+  #root { position:relative; width:100%; height:100%; background:transparent; }
   .hero { position:absolute; inset:8%; display:flex; align-items:center; justify-content:center; text-align:center; font-weight:760; letter-spacing:-0.04em; line-height:0.92; font-size:${Math.round(spec.w * 0.11)}px; }
   .kicker { position:absolute; left:8%; top:10%; font-size:${Math.round(spec.w * 0.028)}px; letter-spacing:0.16em; text-transform:uppercase; color:${style.muted}; }
   .bar, .call, .quote, .panel, .lock, .map, .chart, .stat { position:absolute; }
+  .lockup { position:absolute; inset:0; display:flex; align-items:center; gap:3.5%; padding:0 4% 0 5%; box-sizing:border-box; background:transparent; }
+  .rule { width:3px; align-self:stretch; margin:14% 0; background:${style.accent}; border-radius:2px; transform-origin:center center; flex:none; }
+  .copy { display:flex; flex-direction:column; justify-content:center; gap:2px; min-width:0; }
+  .figure { font-weight:700; letter-spacing:-0.045em; line-height:0.9; font-variant-numeric:tabular-nums; white-space:nowrap; text-shadow:0 1px 2px rgba(0,0,0,.5); }
+  .name { font-weight:560; letter-spacing:0.07em; text-transform:uppercase; line-height:1.05; white-space:nowrap; overflow:hidden; text-shadow:0 1px 2px rgba(0,0,0,.55); }
+  .line { font-weight:650; letter-spacing:-0.03em; line-height:1.02; text-shadow:0 1px 2px rgba(0,0,0,.55); }
   svg { overflow:visible; }
 </style>
 </head>
@@ -78,18 +129,77 @@ function labels() {
   return parts.length >= 2 ? parts.slice(0, 5) : [];
 }
 const band = spec.h < spec.w * 0.5;
-if (band) {
-  document.body.style.background = "#111111";
-  document.body.style.color = "#f7f4ee";
-}
 const design = spec.design;
-if (design.startsWith("kinetic")) buildKinetic();
+if (band) buildBand();
+else if (design.startsWith("kinetic")) buildKinetic();
 else if (design.startsWith("stat")) buildStat();
 else if (design.startsWith("chart")) buildChart();
 else if (design.startsWith("lower")) buildLower();
 else if (design.startsWith("logo")) buildLogo();
 else if (design.startsWith("map")) buildMap();
 else buildKinetic();
+
+function buildBand() {
+  const ink = "#f4f1ea";
+  document.documentElement.style.background = "transparent";
+  document.body.style.background = "transparent";
+  const lock = document.createElement("div");
+  lock.className = "lockup";
+  const rule = document.createElement("div");
+  rule.className = "rule";
+  const copy = document.createElement("div");
+  copy.className = "copy";
+  lock.appendChild(rule);
+  lock.appendChild(copy);
+  root.appendChild(lock);
+  let numEl = null;
+  const figure = spec.figure;
+  const decimals = spec.decimals || 0;
+  if (figure != null && isFinite(figure)) {
+    numEl = document.createElement("div");
+    numEl.className = "figure";
+    numEl.style.fontSize = Math.round(fitPx(shownFigure(figure, decimals), spec.h * 0.46, spec.w * 0.76)) + "px";
+    numEl.style.color = accent;
+    copy.appendChild(numEl);
+    if (spec.label) {
+      const lab = document.createElement("div");
+      lab.className = "name";
+      lab.textContent = spec.label;
+      lab.style.fontSize = Math.round(fitPx(spec.label, spec.h * 0.22, spec.w * 0.76)) + "px";
+      lab.style.color = ink;
+      copy.appendChild(lab);
+    }
+  } else {
+    const line = document.createElement("div");
+    line.className = "line";
+    line.textContent = spec.line || spec.text || "";
+    const words = line.textContent;
+    line.style.fontSize = Math.round(fitPx(words, spec.h * 0.38, spec.w * 0.72)) + "px";
+    line.style.color = ink;
+    line.style.whiteSpace = words.length > 28 ? "normal" : "nowrap";
+    copy.appendChild(line);
+  }
+  window.seek = (t) => {
+    const p = move(t);
+    if (numEl) numEl.textContent = shownFigure(figure * p, decimals);
+    const rise = (1 - p) * Math.min(10, spec.h * 0.06);
+    copy.style.opacity = String(Math.min(1, p * 1.35));
+    copy.style.transform = "translateY(" + rise + "px)";
+    rule.style.transform = "scaleY(" + Math.max(0.05, p) + ")";
+    rule.style.opacity = String(Math.min(1, p * 1.5));
+  };
+}
+function shownFigure(n, decimals) {
+  const body = decimals > 0
+    ? Number(n).toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
+    : Math.round(n).toLocaleString("en-US");
+  return (spec.prefix || "") + body + (spec.suffix || "");
+}
+function fitPx(text, maxPx, maxW) {
+  const chars = Math.max(1, String(text || "").length);
+  const byWidth = maxW / (chars * 0.56);
+  return Math.max(14, Math.min(maxPx, byWidth));
+}
 
 function buildKinetic() {
   const hero = document.createElement("div");
@@ -586,23 +696,94 @@ function ffmpegBin() {
   return pickBin("FFMPEG_PATH", ["/usr/bin/ffmpeg"], "ffmpeg");
 }
 
+// A finished graphic must not fail because Chrome's helpers were still writing
+// Default/ when the profile directory was removed.
+export function chromeLaunchFailed(err) {
+  const code = err && err.code ? String(err.code) : "";
+  const text = `${code} ${err && err.message ? err.message : err}`;
+  return /ENOTEMPTY|EBUSY|EPERM|Directory not empty|chrome exited before debugging|did not open a debugging port|chrome socket failed|ECONNREFUSED|ECONNRESET|fetch failed/.test(
+    text,
+  );
+}
+
+function descendantPids(pid) {
+  let kids = [];
+  try {
+    kids = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8").trim().split(/\s+/).filter(Boolean);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const kid of kids) {
+    const n = Number(kid);
+    if (!n) continue;
+    out.push(n, ...descendantPids(n));
+  }
+  return out;
+}
+
+function stopChrome(child) {
+  if (!child || !child.pid) return;
+  const tree = descendantPids(child.pid);
+  for (const pid of tree.reverse()) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    /* already gone */
+  }
+}
+
+function chromeGone(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 500);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+async function removeTree(dir) {
+  try {
+    await rm(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 40 });
+  } catch {
+    // Leftover /tmp files are not the graphic.
+  }
+}
+
 function listen(child) {
   return new Promise((resolve, reject) => {
     let buf = "";
-    const timer = setTimeout(() => reject(new Error("chrome did not open a debugging port")), 15000);
-    const on = (chunk) => {
-      buf += chunk.toString();
-      const m = buf.match(/DevTools listening on ws:\/\/(?:127\.0\.0\.1|\[::1\]):(\d+)/);
-      if (m) {
-        clearTimeout(timer);
-        resolve(m[1]);
-      }
-    };
-    child.stderr.on("data", on);
-    child.on("exit", (code) => {
+    let settled = false;
+    let timer;
+    const finish = (fn) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      reject(new Error("chrome exited before debugging: " + code));
-    });
+      child.stderr.off("data", onData);
+      child.off("exit", onExit);
+      fn();
+    };
+    const onData = (chunk) => {
+      buf += chunk.toString();
+      if (buf.length > 8000) buf = buf.slice(-4000);
+      const found = buf.match(/DevTools listening on ws:\/\/(?:127\.0\.0\.1|\[::1\]):(\d+)/);
+      if (found) finish(() => resolve(found[1]));
+    };
+    const onExit = (code) => {
+      const tail = buf.trim().split("\n").slice(-4).join(" ").slice(0, 500);
+      finish(() => reject(new Error(`chrome exited before debugging: ${code}${tail ? ` ${tail}` : ""}`)));
+    };
+    timer = setTimeout(() => finish(() => reject(new Error("chrome did not open a debugging port"))), 15000);
+    child.stderr.on("data", onData);
+    child.on("exit", onExit);
   });
 }
 
@@ -628,7 +809,21 @@ function cdp(ws) {
     });
 }
 
-async function shoot(html, dir, frames, w, h) {
+async function shoot(html, dir, frames, w, h, alpha) {
+  let last;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await shootOnce(html, dir, frames, w, h, alpha);
+      return;
+    } catch (err) {
+      last = err;
+      if (attempt === 1 || !chromeLaunchFailed(err)) throw err;
+    }
+  }
+  throw last;
+}
+
+async function shootOnce(html, dir, frames, w, h, alpha) {
   const server = createServer((req, res) => {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(html);
@@ -637,25 +832,29 @@ async function shoot(html, dir, frames, w, h) {
   const port = server.address().port;
   const url = `http://127.0.0.1:${port}/`;
   const userDir = await mkdtemp(path.join(tmpdir(), "oc-chrome-"));
-  const chrome = spawn(
-    chromeBin(),
-    [
-      "--headless=new",
-      "--disable-gpu",
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--hide-scrollbars",
-      "--remote-debugging-port=0",
-      `--user-data-dir=${userDir}`,
-      "--no-first-run",
-      "about:blank",
-    ],
-    { stdio: ["ignore", "ignore", "pipe"] },
-  );
+  let chrome;
+  let ws;
   try {
+    chrome = spawn(
+      chromeBin(),
+      [
+        "--headless=new",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--hide-scrollbars",
+        "--disable-breakpad",
+        "--disable-crash-reporter",
+        "--remote-debugging-port=0",
+        `--user-data-dir=${userDir}`,
+        "--no-first-run",
+        "about:blank",
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
     const dbg = await listen(chrome);
     const version = await fetch(`http://127.0.0.1:${dbg}/json/version`).then((r) => r.json());
-    const ws = new WebSocket(version.webSocketDebuggerUrl);
+    ws = new WebSocket(version.webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {
       ws.addEventListener("open", resolve);
       ws.addEventListener("error", () => reject(new Error("chrome socket failed")));
@@ -670,8 +869,16 @@ async function shoot(html, dir, frames, w, h) {
       { width: w, height: h, deviceScaleFactor: 1, mobile: false },
       sessionId,
     );
+    if (alpha) {
+      await send(
+        "Emulation.setDefaultBackgroundColorOverride",
+        { color: { r: 0, g: 0, b: 0, a: 0 } },
+        sessionId,
+      );
+    }
     await send("Page.navigate", { url }, sessionId);
     await new Promise((r) => setTimeout(r, 250));
+    const ext = alpha ? "png" : "jpg";
     for (let i = 0; i < frames; i++) {
       const t = frames === 1 ? 0 : (i / (frames - 1)) * Number(arg("--dur", "4"));
       await send(
@@ -679,18 +886,36 @@ async function shoot(html, dir, frames, w, h) {
         { expression: `window.seek(${t})`, returnByValue: true },
         sessionId,
       );
-      const shot = await send("Page.captureScreenshot", { format: "jpeg", quality: 82 }, sessionId);
-      await writeFile(path.join(dir, `f${String(i).padStart(4, "0")}.jpg`), Buffer.from(shot.data, "base64"));
+      const shot = await send(
+        "Page.captureScreenshot",
+        alpha
+          ? { format: "png", omitBackground: true, clip: { x: 0, y: 0, width: w, height: h, scale: 1 } }
+          : { format: "jpeg", quality: 82 },
+        sessionId,
+      );
+      await writeFile(path.join(dir, `f${String(i).padStart(4, "0")}.${ext}`), Buffer.from(shot.data, "base64"));
     }
     ws.close();
   } finally {
-    chrome.kill("SIGKILL");
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    stopChrome(chrome);
     server.close();
-    await rm(userDir, { recursive: true, force: true });
+    await chromeGone(chrome);
+    await removeTree(userDir);
   }
 }
 
-function encode(dir, out, frames) {
+function encode(dir, out, frames, alpha) {
+  const input = path.join(dir, alpha ? "f%04d.png" : "f%04d.jpg");
+  const codec = alpha
+    ? ["-vf", "format=yuva420p", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", "-lag-in-frames", "0", "-b:v", "0", "-crf", "28", "-an", "-metadata:s:v:0", "alpha_mode=1"]
+    : ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"];
   return new Promise((resolve, reject) => {
     const ff = spawn(ffmpegBin(), [
       "-y",
@@ -700,15 +925,10 @@ function encode(dir, out, frames) {
       "-framerate",
       String(FPS),
       "-i",
-      path.join(dir, "f%04d.jpg"),
+      input,
       "-frames:v",
       String(frames),
-      "-c:v",
-      "libx264",
-      "-pix_fmt",
-      "yuv420p",
-      "-movflags",
-      "+faststart",
+      ...codec,
       out,
     ]);
     let err = "";
@@ -722,32 +942,39 @@ function encode(dir, out, frames) {
   });
 }
 
-const out = arg("--out");
-const design = arg("--design");
-const dur = Math.max(0.4, Number(arg("--dur", "4")) || 4);
-const w = Number(arg("--w", "1280"));
-const h = Number(arg("--h", "720"));
-if (!out || !design) {
-  console.error("render.mjs needs --out and --design");
-  process.exit(1);
+async function main() {
+  const out = arg("--out");
+  const design = arg("--design");
+  const dur = Math.max(0.4, Number(arg("--dur", "4")) || 4);
+  const w = Number(arg("--w", "1280"));
+  const h = Number(arg("--h", "720"));
+  if (!out || !design) {
+    console.error("render.mjs needs --out and --design");
+    process.exit(1);
+  }
+  const alpha = h < w * 0.5;
+  const spec = {
+    design,
+    text: arg("--text", " "),
+    prompt: arg("--prompt", ""),
+    style: arg("--style", "bold"),
+    dur,
+    w,
+    h,
+  };
+  const frames = Math.max(4, Math.round(dur * FPS));
+  const dir = await mkdtemp(path.join(tmpdir(), "oc-motion-"));
+  try {
+    await shoot(page(spec), dir, frames, w, h, alpha);
+    await encode(dir, out, frames, alpha);
+  } catch (err) {
+    console.error(String(err && err.stack ? err.stack : err));
+    process.exit(1);
+  } finally {
+    await removeTree(dir);
+  }
 }
-const spec = {
-  design,
-  text: arg("--text", " "),
-  prompt: arg("--prompt", ""),
-  style: arg("--style", "bold"),
-  dur,
-  w,
-  h,
-};
-const frames = Math.max(4, Math.round(dur * FPS));
-const dir = await mkdtemp(path.join(tmpdir(), "oc-motion-"));
-try {
-  await shoot(page(spec), dir, frames, w, h);
-  await encode(dir, out, frames);
-} catch (err) {
-  console.error(String(err && err.stack ? err.stack : err));
-  process.exit(1);
-} finally {
-  await rm(dir, { recursive: true, force: true });
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
 }

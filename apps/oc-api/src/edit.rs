@@ -2,8 +2,8 @@
 
 use oc_core::time::TICKS_PER_SECOND;
 use oc_core::{
-    AssembleItem, ExportPreset, Inspect, McpCall, MediaId, Op, Time, Timeline, TrackKind,
-    UndoStack, apply, inspect_from_mcp, op_from_mcp, pick_reel_excerpts,
+    AssembleItem, ClipKind, DesignLayout, ExportPreset, Inspect, McpCall, MediaId, Op, Time,
+    Timeline, TrackKind, UndoStack, apply, inspect_from_mcp, op_from_mcp, pick_reel_excerpts,
 };
 use oc_db::Db;
 use serde_json::Value;
@@ -204,12 +204,55 @@ async fn generate_broll(
     ))
 }
 
-fn design_layout(raw: Option<&str>) -> oc_core::DesignLayout {
+fn design_layout(raw: Option<&str>) -> DesignLayout {
     match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "behind" | "back" | "text_behind" | "under" => oc_core::DesignLayout::Behind,
-        "beside" | "side" | "split" => oc_core::DesignLayout::Beside,
-        _ => oc_core::DesignLayout::Cutaway,
+        "behind" | "back" | "text_behind" | "under" => DesignLayout::Behind,
+        "beside" | "side" | "split" => DesignLayout::Beside,
+        _ => DesignLayout::Cutaway,
     }
+}
+
+/// A person on a tall frame keeps the frame. The type goes in the lower band.
+fn motion_layout(layout: DesignLayout, portrait: bool, talking: bool) -> DesignLayout {
+    if portrait && talking && layout == DesignLayout::Cutaway {
+        DesignLayout::Behind
+    } else {
+        layout
+    }
+}
+
+/// The graphic stays up for the spoken line, and not past the shot under it.
+fn motion_seconds(requested: Option<f64>, at: f64, speaker_end: Option<f64>) -> f64 {
+    let remain = speaker_end
+        .map(|end| (end - at).max(0.0))
+        .filter(|left| *left > 0.05);
+    let seconds = match (requested, remain) {
+        (Some(asked), Some(left)) => asked.min(left),
+        (Some(asked), None) => asked,
+        (None, Some(left)) => left,
+        (None, None) => 4.0,
+    };
+    seconds.clamp(1.2, 8.0)
+}
+
+fn talking_end(timeline: &Timeline, at: f64) -> Option<f64> {
+    let t = Time::from_seconds(at.max(0.0));
+    timeline.tracks.iter().find_map(|track| {
+        if track.kind != TrackKind::Video
+            || matches!(track.name.as_str(), "Design" | "Front" | "GFX")
+        {
+            return None;
+        }
+        track.clips.iter().find_map(|clip| {
+            if clip.disabled || clip.media_id.is_none() || !clip.contains(t) {
+                return None;
+            }
+            if !matches!(clip.kind, ClipKind::Video { .. }) {
+                return None;
+            }
+            Some(clip.end().as_seconds())
+        })
+    })
 }
 
 /// One motion graphic. The host renders the design and places the clip.
@@ -222,26 +265,34 @@ async fn add_motion(
     let ask = motion_ask(arguments)?;
     let aspect = broll_aspect(timeline, None);
     let (frame_w, frame_h) = crate::motion::frame_size(&aspect);
-    let band = frame_h + 32 > frame_w
-        && matches!(
-            ask.layout,
-            oc_core::DesignLayout::Behind | oc_core::DesignLayout::Beside
-        );
+    let portrait = frame_h + 32 > frame_w;
+    let speaker_end = talking_end(timeline, ask.at);
+    let layout = motion_layout(ask.layout, portrait, speaker_end.is_some());
+    let band = portrait && matches!(layout, DesignLayout::Behind | DesignLayout::Beside);
     let (width, height) = crate::motion::render_size(frame_w, frame_h, band);
-    let bytes = crate::motion::render_mp4(&crate::motion::RenderJob {
+    let seconds = motion_seconds(ask.duration, ask.at, speaker_end);
+    let rendered = crate::motion::render_clip(&crate::motion::RenderJob {
         design: &ask.design,
         text: &ask.text,
         prompt: &ask.prompt,
         style: &ask.style,
-        duration: ask.duration as f64,
+        duration: seconds,
         width,
         height,
+        alpha: band,
     })
     .await?;
     let media_id = Uuid::now_v7();
-    let filename = format!("motion-{media_id}.mp4");
-    store_r2_media(db, project_id, media_id, &filename, "video/mp4", bytes).await?;
-    let seconds = ask.duration as f64;
+    let filename = format!("motion-{media_id}.{}", rendered.extension);
+    store_r2_media(
+        db,
+        project_id,
+        media_id,
+        &filename,
+        rendered.content_type,
+        rendered.bytes,
+    )
+    .await?;
     let ticks = (seconds * TICKS_PER_SECOND as f64).round() as i64;
     oc_db::set_media_duration(db, media_id, ticks.max(1))
         .await
@@ -257,7 +308,7 @@ async fn add_motion(
             media_id: MediaId::from_uuid(media_id),
             at: Time::from_seconds(ask.at),
             duration: oc_core::Duration::from_seconds(seconds),
-            layout: ask.layout,
+            layout,
             text: String::new(),
             label: oc_core::GraphicKind::Title,
         },
@@ -268,7 +319,7 @@ async fn add_motion(
         .map_err(|e| e.to_string())?;
     Ok(format!(
         "placed {} media {media_id} ({:?}, {seconds:.1}s, {aspect}). The clip is on the timeline. {}. Do not write HTML. Do not render a file.",
-        ask.design, ask.layout, applied.note
+        ask.design, layout, applied.note
     ))
 }
 
@@ -277,8 +328,8 @@ struct MotionAsk {
     design: String,
     text: String,
     at: f64,
-    duration: u32,
-    layout: oc_core::DesignLayout,
+    duration: Option<f64>,
+    layout: DesignLayout,
     prompt: String,
     style: String,
 }
@@ -306,9 +357,7 @@ fn motion_ask(arguments: &Value) -> Result<MotionAsk, String> {
     let duration = arguments
         .get("duration")
         .and_then(Value::as_f64)
-        .unwrap_or(4.0)
-        .clamp(2.0, 8.0)
-        .round() as u32;
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
     let layout_raw = arguments
         .get("layout")
         .and_then(Value::as_str)
@@ -317,9 +366,9 @@ fn motion_ask(arguments: &Value) -> Result<MotionAsk, String> {
     let layout = if layout_raw.is_some() {
         design_layout(layout_raw)
     } else if spec.behind {
-        oc_core::DesignLayout::Behind
+        DesignLayout::Behind
     } else {
-        oc_core::DesignLayout::Cutaway
+        DesignLayout::Cutaway
     };
     let prompt = arguments
         .get("prompt")
@@ -523,8 +572,51 @@ mod design_prompt_tests {
         .unwrap();
         assert_eq!(ask.design, "stat-ring");
         assert_eq!(ask.text, "47%");
-        assert_eq!(ask.duration, 6);
+        assert_eq!(ask.duration, Some(6.0));
+        assert_eq!(ask.layout, oc_core::DesignLayout::Behind);
         assert!(ask.prompt.is_empty());
+    }
+
+    #[test]
+    fn a_number_sits_behind_unless_a_layout_is_named() {
+        let ask = motion_ask(&json!({"kind": "number", "text": "10,000 prize pool", "at": 12.0}))
+            .unwrap();
+        assert_eq!(ask.design, "stat-count");
+        assert_eq!(ask.layout, oc_core::DesignLayout::Behind);
+        assert!(ask.duration.is_none());
+        let named = motion_ask(&json!({
+            "design": "stat-count",
+            "text": "10,000",
+            "at": 1.0,
+            "layout": "cutaway"
+        }))
+        .unwrap();
+        assert_eq!(named.layout, oc_core::DesignLayout::Cutaway);
+    }
+
+    #[test]
+    fn a_graphic_stays_on_the_spoken_line() {
+        assert!((super::motion_seconds(Some(6.0), 10.0, Some(12.4)) - 2.4).abs() < 1e-6);
+        assert!((super::motion_seconds(None, 10.0, Some(13.0)) - 3.0).abs() < 1e-6);
+        assert!((super::motion_seconds(Some(1.0), 0.0, None) - 1.2).abs() < 1e-6);
+        assert!((super::motion_seconds(None, 0.0, None) - 4.0).abs() < 1e-6);
+        assert!((super::motion_seconds(Some(12.0), 0.0, Some(30.0)) - 8.0).abs() < 1e-6);
+        assert_eq!(
+            super::motion_layout(oc_core::DesignLayout::Cutaway, true, true),
+            oc_core::DesignLayout::Behind
+        );
+        assert_eq!(
+            super::motion_layout(oc_core::DesignLayout::Cutaway, true, false),
+            oc_core::DesignLayout::Cutaway
+        );
+        assert_eq!(
+            super::motion_layout(oc_core::DesignLayout::Cutaway, false, true),
+            oc_core::DesignLayout::Cutaway
+        );
+        assert_eq!(
+            super::motion_layout(oc_core::DesignLayout::Beside, true, true),
+            oc_core::DesignLayout::Beside
+        );
     }
 
     #[test]

@@ -160,7 +160,6 @@ pub fn compile(
         timeline.duration().as_seconds().max(0.1),
     );
 
-    // drop trailing ;
     if fc.ends_with(';') {
         fc.pop();
     }
@@ -388,19 +387,21 @@ fn picture_branch(
     matte: bool,
 ) -> Result<String, RenderError> {
     let dur = clip.duration.as_seconds().max(0.04);
+    let mut alpha = false;
     let mut chain = if let Some(generated) = &clip.look.generator {
         generator_video(generated, width, height, fps, dur)
     } else {
         let id = clip.media_id.ok_or(RenderError::Empty)?;
-        let _src = media.get(&id).ok_or(RenderError::UnknownMedia(id))?;
+        let src = media.get(&id).ok_or(RenderError::UnknownMedia(id))?;
+        alpha = source_has_alpha(&src.path);
         let idx = *index_of.get(&id).ok_or(RenderError::UnknownMedia(id))?;
         let sin = clip.source_in.as_seconds();
         let src_dur = source_span(clip, dur);
-        let src = video_pads
+        let pad = video_pads
             .get_mut(&idx)
             .and_then(|pads| pads.pop())
             .unwrap_or_else(|| format!("{idx}:v"));
-        format!("[{src}]trim=start={sin:.4}:duration={src_dur:.4},setpts=PTS-STARTPTS")
+        format!("[{pad}]trim=start={sin:.4}:duration={src_dur:.4},setpts=PTS-STARTPTS")
     };
     chain.push_str(&speed_filter(clip, dur));
     if clip.look.stabilize {
@@ -429,14 +430,25 @@ fn picture_branch(
                 return None;
             }
             let prefix = hdr_prefix(&src.path, out_w.max(out_h));
-            if prefix.is_empty() { None } else { Some(prefix) }
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix)
+            }
         }) {
             chain.push(',');
             chain.push_str(&prefix);
         }
     }
     chain.push(',');
-    chain.push_str(&fit_chain(out_w, out_h, fps, clip.look.card.is_some(), matte));
+    chain.push_str(&fit_chain(
+        out_w,
+        out_h,
+        fps,
+        clip.look.card.is_some(),
+        matte && !alpha,
+        alpha,
+    ));
     if let ClipKind::Video { transform } = &clip.kind {
         if let Some(end) = clip.look.move_to {
             let frames = (dur * fps).max(1.0);
@@ -507,17 +519,23 @@ fn picture_branch(
     Ok(lab)
 }
 
-/// A design card is contained, then the plate is keyed out. A cover card is cropped.
+/// A design card is contained, then an opaque plate is keyed out. A cover card is cropped.
 fn design_matte(timeline: &Timeline, clip: &Clip) -> bool {
     clip.look.card.is_some()
-        && timeline.tracks.iter().any(|track| {
-            track.name == "Design" && track.clips.iter().any(|row| row.id == clip.id)
-        })
+        && timeline
+            .tracks
+            .iter()
+            .any(|track| track.name == "Design" && track.clips.iter().any(|row| row.id == clip.id))
 }
 
-fn fit_chain(out_w: u32, out_h: u32, fps: f64, card: bool, matte: bool) -> String {
-    if matte {
-        // Plates from motion/render.mjs. The number stays; the slab does not.
+fn fit_chain(out_w: u32, out_h: u32, fps: f64, card: bool, matte: bool, alpha: bool) -> String {
+    if alpha {
+        // The band is already transparent. Do not key a color out of the type.
+        format!(
+            "format=yuva420p,scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black@0,fps={fps},format=yuva420p"
+        )
+    } else if matte {
+        // Older plates from motion/render.mjs. The number stays; the slab does not.
         format!(
             "scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=0x111111,fps={fps},format=yuv420p,colorkey=0x111111:0.08:0.04,colorkey=0x1a1814:0.08:0.04,colorkey=0x0e0e0e:0.08:0.04,colorkey=0x0c1210:0.08:0.04,colorkey=0x120c18:0.08:0.04,colorkey=0x07070c:0.08:0.04,colorkey=0xf4f7fb:0.02:0.0,format=yuva420p"
         )
@@ -548,10 +566,129 @@ fn tonemap_prefix(transfer: &str, limit: u32) -> String {
 
 fn hdr_chain(transfer: &str) -> &'static str {
     match transfer.trim() {
-        "smpte2084" => "zscale=tin=smpte2084:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p",
-        "arib-std-b67" => "zscale=tin=arib-std-b67:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p",
+        "smpte2084" => {
+            "zscale=tin=smpte2084:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+        }
+        "arib-std-b67" => {
+            "zscale=tin=arib-std-b67:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+        }
         _ => "",
     }
+}
+
+/// A lower-band webm keeps its alpha in a side plane. ffprobe's built-in vp9
+/// decoder still prints `pix_fmt=yuv420p`. The `alpha_mode=1` tag is the signal,
+/// and that input has to be decoded with libvpx or the plane is thrown away.
+#[derive(Clone, Debug, Default)]
+struct StreamInfo {
+    pix_fmt: String,
+    codec: String,
+    alpha_mode: bool,
+}
+
+fn source_has_alpha(path: &Path) -> bool {
+    stream_has_alpha(&read_stream(path))
+}
+
+/// Decoder for a webm whose alpha lives in the container tag. Still images with
+/// a real alpha pixel format keep the default decoder.
+pub(crate) fn vpx_alpha_decoder(path: &Path) -> Option<&'static str> {
+    decoder_for_stream(&read_stream(path))
+}
+
+fn stream_has_alpha(info: &StreamInfo) -> bool {
+    info.alpha_mode || pix_fmt_has_alpha(&info.pix_fmt)
+}
+
+fn decoder_for_stream(info: &StreamInfo) -> Option<&'static str> {
+    if !info.alpha_mode {
+        return None;
+    }
+    match info.codec.as_str() {
+        "vp8" => Some("libvpx"),
+        _ => Some("libvpx-vp9"),
+    }
+}
+
+fn pix_fmt_has_alpha(fmt: &str) -> bool {
+    let fmt = fmt.trim().to_ascii_lowercase();
+    fmt.contains("yuva")
+        || fmt.contains("rgba")
+        || fmt.contains("argb")
+        || fmt.contains("bgra")
+        || fmt.contains("abgr")
+        || fmt.contains("gbra")
+}
+
+fn read_stream(path: &Path) -> StreamInfo {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, StreamInfo>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = path.to_path_buf();
+    if let Ok(guard) = cache.lock() {
+        if let Some(found) = guard.get(&key) {
+            return found.clone();
+        }
+    }
+    let found = probe_stream(path);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, found.clone());
+    }
+    found
+}
+
+fn probe_stream(path: &Path) -> StreamInfo {
+    let Ok(out) = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt:stream_tags=alpha_mode",
+            "-of",
+            "default=nw=1",
+        ])
+        .arg(path)
+        .output()
+    else {
+        return StreamInfo::default();
+    };
+    if !out.status.success() {
+        return StreamInfo::default();
+    }
+    parse_stream_probe(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_stream_probe(text: &str) -> StreamInfo {
+    let mut info = StreamInfo::default();
+    for raw in text.lines() {
+        let line = raw.trim();
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("pix_fmt=") {
+            info.pix_fmt = value.trim().to_string();
+        } else if let Some(value) = lower.strip_prefix("codec_name=") {
+            info.codec = value.trim().to_string();
+        } else if alpha_mode_is_one(&lower) {
+            info.alpha_mode = true;
+        }
+    }
+    if info.pix_fmt.is_empty() && !text.contains('=') {
+        info.pix_fmt = text.trim().to_ascii_lowercase();
+    }
+    info
+}
+
+fn alpha_mode_is_one(lower: &str) -> bool {
+    let Some(rest) = lower.split("alpha_mode=").nth(1) else {
+        return false;
+    };
+    let digits: String = rest
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits == "1"
 }
 
 fn color_transfer(path: &Path) -> String {
@@ -1942,7 +2079,29 @@ mod tests {
         if !ready {
             return;
         }
-        let chain = super::fit_chain(320, 180, 30.0, true, true);
+        let chain = super::fit_chain(320, 180, 30.0, true, true, false);
+        assert!(chain.contains("colorkey=0x111111"), "{chain}");
+        let clear = super::fit_chain(320, 180, 30.0, true, true, true);
+        assert!(clear.contains("black@0"), "{clear}");
+        assert!(!clear.contains("colorkey"), "{clear}");
+        assert!(super::pix_fmt_has_alpha("yuva420p"));
+        assert!(super::pix_fmt_has_alpha("rgba"));
+        assert!(!super::pix_fmt_has_alpha("yuv420p"));
+        assert!(!super::pix_fmt_has_alpha(""));
+        let tagged = super::parse_stream_probe("pix_fmt=yuv420p\nTAG:ALPHA_MODE=1\n");
+        assert!(tagged.alpha_mode, "{tagged:?}");
+        assert!(super::stream_has_alpha(&tagged));
+        assert_eq!(super::decoder_for_stream(&tagged), Some("libvpx-vp9"));
+        let plain = super::parse_stream_probe("pix_fmt=yuv420p\n");
+        assert!(!super::stream_has_alpha(&plain));
+        assert_eq!(super::decoder_for_stream(&plain), None);
+        let vp8 = super::parse_stream_probe("codec_name=vp8\npix_fmt=yuv420p\nTAG:alpha_mode=1\n");
+        assert_eq!(super::decoder_for_stream(&vp8), Some("libvpx"));
+        let still = super::parse_stream_probe("codec_name=png\npix_fmt=rgba\n");
+        assert!(super::stream_has_alpha(&still));
+        assert_eq!(super::decoder_for_stream(&still), None);
+        let off = super::parse_stream_probe("pix_fmt=yuv420p\nTAG:alpha_mode=0\n");
+        assert!(!off.alpha_mode);
         let out = std::process::Command::new("ffmpeg")
             .args([
                 "-y",
@@ -1968,6 +2127,150 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        let cleared = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=640x360:d=0.1:r=30",
+                "-vf",
+                &clear,
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .expect("ffmpeg");
+        assert!(
+            cleared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cleared.stderr)
+        );
+    }
+
+    #[test]
+    fn an_alpha_webm_is_alpha_even_when_pix_fmt_is_plain() {
+        let ready = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !ready {
+            return;
+        }
+        let dir = std::env::temp_dir().join("oc-alpha-tag-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("band.webm");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black@0.0:s=64x64:d=0.2:r=10,format=yuva420p",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=orange:s=16x16:d=0.2:r=10,format=yuv420p",
+                "-filter_complex",
+                "[0:v][1:v]overlay=8:8:format=auto,format=yuva420p",
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                "yuva420p",
+                "-auto-alt-ref",
+                "0",
+                "-lag-in-frames",
+                "0",
+                "-an",
+                "-metadata:s:v:0",
+                "alpha_mode=1",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg");
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        assert!(
+            super::source_has_alpha(&path),
+            "alpha_mode tag was not read"
+        );
+        assert_eq!(super::vpx_alpha_decoder(&path), Some("libvpx-vp9"));
+        let junk = dir.join("not-a-video.mp4");
+        std::fs::write(&junk, b"x").unwrap();
+        assert!(!super::source_has_alpha(&junk));
+        assert_eq!(super::vpx_alpha_decoder(&junk), None);
+
+        use oc_timeline::{FrameCard, TrackKind};
+        use std::collections::HashMap;
+        let mut timeline = oc_timeline::Timeline::default();
+        timeline.width = 720;
+        timeline.height = 1280;
+        let base_id = timeline.first_track(TrackKind::Video).unwrap().id;
+        let speaker = oc_timeline::MediaId::new();
+        let graphic = oc_timeline::MediaId::new();
+        timeline.add_clip(base_id, clip_with(speaker, 0.0)).unwrap();
+        let design_track = timeline.add_track(TrackKind::Video, "Design");
+        let mut design = clip_with(graphic, 0.2);
+        design.look.overlay = true;
+        design.look.fade_in = oc_timeline::Duration::from_seconds(0.35);
+        design.look.fade_out = oc_timeline::Duration::from_seconds(0.35);
+        design.look.card = Some(FrameCard {
+            x: 0.08,
+            y: 0.66,
+            w: 0.84,
+            h: 0.14,
+        });
+        timeline.add_clip(design_track, design).unwrap();
+        let mut media = HashMap::new();
+        media.insert(
+            speaker,
+            crate::MediaSource {
+                id: speaker,
+                path: junk,
+                has_video: true,
+                has_audio: false,
+            },
+        );
+        media.insert(
+            graphic,
+            crate::MediaSource {
+                id: graphic,
+                path: path.clone(),
+                has_video: true,
+                has_audio: false,
+            },
+        );
+        let compiled = super::compile(
+            &timeline,
+            &media,
+            oc_tools::ExportPreset::Vertical1080,
+            &dir,
+        )
+        .expect("compile");
+        assert!(
+            compiled.filter.contains("color=black@0"),
+            "{}",
+            compiled.filter
+        );
+        assert!(
+            !compiled.filter.contains("colorkey="),
+            "{}",
+            compiled.filter
+        );
+        assert!(compiled.filter.contains("alpha=1"), "{}", compiled.filter);
     }
 
     fn clip_with(media_id: oc_timeline::MediaId, start: f64) -> oc_timeline::Clip {

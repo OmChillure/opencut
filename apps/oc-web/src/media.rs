@@ -2304,7 +2304,7 @@ fn paint_design(
     };
     let style = if let Some(card) = clip.look.card {
         format!(
-            "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;right:auto;bottom:auto;object-fit:cover;opacity:{faded:.3};{motion}",
+            "left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%;right:auto;bottom:auto;object-fit:contain;background:transparent;opacity:{faded:.3};{motion}",
             card.x * 100.0,
             card.y * 100.0,
             card.w * 100.0,
