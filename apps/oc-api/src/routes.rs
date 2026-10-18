@@ -459,6 +459,101 @@ async fn forward_events(
     }
 }
 
+const HOST_TURNS: u32 = 32;
+const PROVIDER_RESUMES: u32 = 2;
+
+const RESUME_STATUS: &str = "The edit stopped. Continuing from the timeline.";
+const RESUME_FOLLOW: &str = "The previous session stopped before it finished. Continue the same piece from the timeline above. Do not start over. Do not repeat a step that is already on the timeline. Finish the open work, then reply in 2–4 sentences.";
+const UNFINISHED_EDIT: &str = "The edit is on the timeline and was not finished, so nothing was exported. Send continue to keep going.";
+const OPEN_FIXES_HOLD: &str =
+    "Open fixes are still on the cut, so nothing was exported. Send continue to keep going.";
+
+fn provider_stopped(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("cannot edit without")
+        || lower.contains("auth login")
+        || lower.contains("unknown provider")
+        || lower.contains("adapter missing")
+    {
+        return false;
+    }
+    lower.contains("acp cli closed")
+        || lower.contains("acp prompt:")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("unexpected eof")
+        || lower.contains("unexpected end of file")
+        || lower.contains("early eof")
+}
+
+fn next_unchanged_repeats(
+    changed: bool,
+    batch: &str,
+    last_batch: Option<&str>,
+    repeats: u32,
+) -> u32 {
+    if changed || last_batch.is_none_or(|prev| prev != batch) {
+        0
+    } else {
+        repeats.saturating_add(1)
+    }
+}
+
+fn hold_open_fixes(reply: &str) -> String {
+    format!("{}\n\n{}", reply.trim_end(), OPEN_FIXES_HOLD)
+}
+
+fn unfinished_with_notes(notes: &[String]) -> String {
+    let mut text = UNFINISHED_EDIT.to_string();
+    if !notes.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&notes.join(" · "));
+    }
+    text
+}
+
+async fn close_chat_events(ev_tx: mpsc::Sender<ChatEvent>, pump: tokio::task::JoinHandle<()>) {
+    drop(ev_tx);
+    let _ = pump.await;
+}
+
+async fn reopen_director(
+    state: &AppState,
+    id: Uuid,
+    provider: &str,
+    model: &str,
+    mcp_servers: &[serde_json::Value],
+    events: &mpsc::Sender<ChatEvent>,
+    project: &mut Project,
+    media: &mut Vec<oc_db::MediaRow>,
+    speech: &std::collections::HashMap<Uuid, crate::edit::Speech>,
+    looks: &std::collections::HashMap<Uuid, oc_db::AnalysisRow>,
+    turns: &mut Vec<ChatTurn>,
+    system: &mut String,
+) -> Result<oc_providers::DirectorSession, String> {
+    *project = oc_db::get_project(&state.db, id)
+        .await
+        .map_err(|err| err.to_string())?;
+    match oc_db::list_media(&state.db, id).await {
+        Ok(rows) => *media = rows,
+        Err(err) => tracing::warn!(project = %id, "resume kept the earlier bin: {err}"),
+    }
+    *system = format!("Project '{}'.\n\n", project.name);
+    system.push_str(&edit::opening_inventory(
+        &project.timeline,
+        media,
+        speech,
+        looks,
+    ));
+    turns.push(ChatTurn {
+        role: "user".into(),
+        content: RESUME_FOLLOW.into(),
+    });
+    oc_providers::DirectorSession::open(provider, model, mcp_servers, Some(events.clone()))
+        .await
+        .map_err(|err| err.to_string())
+}
+
 async fn run_chat(
     state: AppState,
     id: Uuid,
@@ -468,7 +563,7 @@ async fn run_chat(
     let mut project = oc_db::get_project(&state.db, id)
         .await
         .map_err(|e| e.to_string())?;
-    let media = oc_db::list_media(&state.db, id)
+    let mut media = oc_db::list_media(&state.db, id)
         .await
         .map_err(|e| e.to_string())?;
     let transcripts = oc_db::list_transcripts_for_project(&state.db, id)
@@ -626,67 +721,101 @@ async fn run_chat(
     let mut message =
         oc_providers::opening_prompt(&system, &turns, &tools, !mcp_servers.is_empty());
     let mut seen: Vec<oc_providers::PromptImage> = Vec::new();
-    for turn_i in 0..8 {
+    let mut turn_i: u32 = 0;
+    let mut resumes = 0u32;
+    let mut last_batch: Option<String> = None;
+    let mut unchanged_repeats = 0u32;
+    let mut answered = false;
+    while turn_i < HOST_TURNS {
         if tx.is_closed() {
-            drop(ev_tx);
-            let _ = pump.await;
+            close_chat_events(ev_tx, pump).await;
             return Ok(());
         }
         let reply = tokio::select! {
             _ = tx.closed() => {
-                drop(ev_tx);
-                let _ = pump.await;
+                close_chat_events(ev_tx, pump).await;
                 return Ok(());
             }
-            reply = async {
-                let show = seen.as_slice();
-                if session.remembers() {
-                    session.turn(&message, show, Some(&ev_tx)).await
-                } else {
-                    oc_providers::complete_stream(
-                        &body.provider,
-                        &body.model,
-                        &system,
-                        &turns,
-                        &tools,
-                        Some(ev_tx.clone()),
-                        &mcp_servers,
-                        show,
-                    )
-                    .await
-                }
-            } => reply,
+            reply = session.turn(&message, &seen, Some(&ev_tx)) => reply,
         };
         seen.clear();
         let reply = match reply {
             Ok(reply) => reply,
             Err(err) => {
+                let err = err.to_string();
                 tracing::error!(project = %id, "provider failed: {err}");
-                drop(ev_tx);
-                let _ = pump.await;
-                return Err(err.to_string());
+                if tx.is_closed() {
+                    close_chat_events(ev_tx, pump).await;
+                    return Ok(());
+                }
+                if !provider_stopped(&err) || resumes >= PROVIDER_RESUMES {
+                    close_chat_events(ev_tx, pump).await;
+                    return Err(err);
+                }
+                resumes += 1;
+                push(
+                    &tx,
+                    serde_json::json!({
+                        "type": "status",
+                        "text": RESUME_STATUS
+                    }),
+                )
+                .await;
+                session = match reopen_director(
+                    &state,
+                    id,
+                    &body.provider,
+                    &body.model,
+                    &mcp_servers,
+                    &ev_tx,
+                    &mut project,
+                    &mut media,
+                    &speech,
+                    &looks,
+                    &mut turns,
+                    &mut system,
+                )
+                .await
+                {
+                    Ok(session) => session,
+                    Err(err) => {
+                        close_chat_events(ev_tx, pump).await;
+                        return Err(err);
+                    }
+                };
+                message =
+                    oc_providers::opening_prompt(&system, &turns, &tools, !mcp_servers.is_empty());
+                tracing::info!(project = %id, resumes, "provider resumed from the timeline");
+                continue;
             }
         };
+        turn_i += 1;
         match reply {
             LlmReply::Text(t) => {
                 let review = fresh_review(&state, id, &last_user).await;
-                let director = is_director_request(&last_user);
-                if review.issues && turn_i + 1 < 8 {
-                    tracing::info!(project = %id, "cut review rejected a finished reply");
-                    let follow = follow_after_text(&review.text, director);
-                    turns.push(ChatTurn {
-                        role: "assistant".into(),
-                        content: t,
-                    });
-                    turns.push(ChatTurn {
-                        role: "user".into(),
-                        content: follow.clone(),
-                    });
-                    message = oc_providers::followup_prompt(&follow);
-                    continue;
+                if review.issues {
+                    if turn_i < HOST_TURNS {
+                        tracing::info!(project = %id, "cut review rejected a finished reply");
+                        let follow = follow_after_text(&review.text, piece);
+                        turns.push(ChatTurn {
+                            role: "assistant".into(),
+                            content: t,
+                        });
+                        turns.push(ChatTurn {
+                            role: "user".into(),
+                            content: follow.clone(),
+                        });
+                        message = oc_providers::followup_prompt(&follow);
+                        continue;
+                    }
+                    tracing::info!(project = %id, "open fixes remain, export held");
+                    answered = true;
+                    text = hold_open_fixes(&t);
+                    break;
                 }
+                answered = true;
                 text = t;
-                if director && !review.issues {
+                if piece {
                     if let Ok(fresh) = oc_db::get_project(&state.db, id).await {
                         let preset = export_preset(&fresh.timeline);
                         let rows = oc_db::list_media(&state.db, id).await.unwrap_or_default();
@@ -783,6 +912,17 @@ async fn run_chat(
                     )
                     .await;
                 }
+                unchanged_repeats = next_unchanged_repeats(
+                    changed,
+                    &batch,
+                    last_batch.as_deref(),
+                    unchanged_repeats,
+                );
+                last_batch = Some(batch.clone());
+                if unchanged_repeats >= 2 {
+                    tracing::info!(project = %id, "same tool batch left the timeline unchanged");
+                    break;
+                }
                 let logged = format!("tools\n{batch}");
                 turns.push(ChatTurn {
                     role: "assistant".into(),
@@ -802,14 +942,14 @@ async fn run_chat(
             }
         }
     }
-    drop(ev_tx);
-    let _ = pump.await;
+    close_chat_events(ev_tx, pump).await;
     // MCP + call_tool already persist. Reload so we don't clobber those edits.
     if let Ok(fresh) = oc_db::get_project(&state.db, id).await {
         project = fresh;
     }
-    if text.is_empty() && !notes.is_empty() {
-        text = notes.join(" · ");
+    if !answered {
+        tracing::info!(project = %id, turns = turn_i, "host stopped before the piece finished");
+        text = unfinished_with_notes(&notes);
     }
     tracing::info!(
         project = %id,
@@ -2163,5 +2303,59 @@ mod tests {
             ExportChoice::Wait
         );
         assert_eq!(choose_export(Some(old), None), ExportChoice::Remote);
+    }
+
+    #[test]
+    fn a_dead_provider_resumes_and_a_login_failure_does_not() {
+        assert!(HOST_TURNS > 8);
+        assert!(PROVIDER_RESUMES >= 1);
+        assert!(provider_stopped("ACP CLI closed"));
+        assert!(provider_stopped("ACP prompt: process exited"));
+        assert!(provider_stopped("Broken pipe (os error 32)"));
+        assert!(provider_stopped("Connection reset by peer (os error 104)"));
+        assert!(provider_stopped("unexpected end of file"));
+        assert!(provider_stopped("early eof"));
+        assert!(!provider_stopped(
+            "ACP CLI closed\nClaude cannot edit without claude-agent-acp"
+        ));
+        assert!(!provider_stopped(
+            "Codex cannot edit without codex-acp. Install codex-acp."
+        ));
+        assert!(!provider_stopped(
+            "Run `claude auth login` so we can use the local Claude store."
+        ));
+        assert!(!provider_stopped("unknown provider potato"));
+        assert!(!provider_stopped("ACP adapter missing."));
+        assert!(!provider_stopped("tool error: media not found"));
+        let held = hold_open_fixes("The grade still jumps.\n");
+        assert!(held.contains("The grade still jumps."));
+        assert!(held.contains(OPEN_FIXES_HOLD));
+        assert!(!held.contains("export queued"));
+    }
+
+    #[test]
+    fn an_unchanged_tool_batch_stops_on_the_second_repeat() {
+        let batch = "see: frame";
+        let mut last: Option<String> = None;
+        let mut repeats = 0;
+        repeats = next_unchanged_repeats(false, batch, last.as_deref(), repeats);
+        last = Some(batch.into());
+        assert_eq!(repeats, 0);
+        repeats = next_unchanged_repeats(false, batch, last.as_deref(), repeats);
+        assert_eq!(repeats, 1);
+        repeats = next_unchanged_repeats(false, batch, last.as_deref(), repeats);
+        assert_eq!(repeats, 2);
+        assert_eq!(
+            next_unchanged_repeats(true, batch, last.as_deref(), repeats),
+            0
+        );
+        assert_eq!(
+            next_unchanged_repeats(false, "watch: line", last.as_deref(), repeats),
+            0
+        );
+        let text = unfinished_with_notes(&["see: frame".into()]);
+        assert!(text.starts_with(UNFINISHED_EDIT));
+        assert!(text.contains("see: frame"));
+        assert!(!text.contains("export queued"));
     }
 }
