@@ -159,6 +159,7 @@ fn overlaps_any(start: f64, end: f64, used: &[(f64, f64)]) -> bool {
 }
 
 pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
+    let prepared = picture_lines(lines);
     let mut cues = Vec::new();
     for clip in clips {
         let Some(media) = clip.media_id else { continue };
@@ -169,7 +170,7 @@ pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
         };
         let src_in = clip.source_in.as_seconds();
         let src_out = src_in + clip.duration.as_seconds() * speed;
-        for line in lines.iter().filter(|l| l.media == media) {
+        for line in prepared.iter().filter(|l| l.media == media) {
             if is_filler(&line.text) {
                 continue;
             }
@@ -195,6 +196,171 @@ pub fn mapped_cues(clips: &[&Clip], lines: &[SpokenLine]) -> Vec<CaptionCue> {
     }
     cues.sort_by(|a, b| a.start.cmp(&b.start));
     cues
+}
+
+/// A breath. A pause this long still splits a file into two slots. A shorter one
+/// between two copies of the same sentence is a retake, not a new line.
+const RETAKE_GAP_SECS: f64 = 0.70;
+const RETAKE_WORDS: usize = 4;
+/// A false start may run a few words longer on the take that replaces it.
+const RETAKE_EXTRA: usize = 6;
+
+/// Speech the picture should keep. A second copy of the same sentence, with no
+/// real gap, is a retake: the later take stays. A different sentence stays.
+/// Applying this twice leaves the same lines.
+pub(crate) fn picture_lines(lines: &[SpokenLine]) -> Vec<SpokenLine> {
+    let mut rows: Vec<SpokenLine> = lines.iter().map(trim_inline_repeat).collect();
+    rows.sort_by(|a, b| {
+        a.media.as_uuid().cmp(&b.media.as_uuid()).then_with(|| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    let mut out = Vec::with_capacity(rows.len());
+    let mut index = 0;
+    while index < rows.len() {
+        if index + 1 < rows.len() && rows[index].media == rows[index + 1].media {
+            if retake_follows(
+                rows[index].end,
+                rows[index + 1].start,
+                &rows[index].text,
+                &rows[index + 1].text,
+            ) {
+                index += 1;
+                continue;
+            }
+            if backs_onto(rows[index].end, rows[index + 1].start)
+                && earlier_is_complete(&rows[index].text, &rows[index + 1].text)
+            {
+                out.push(rows[index].clone());
+                index += 2;
+                continue;
+            }
+        }
+        out.push(rows[index].clone());
+        index += 1;
+    }
+    out
+}
+
+/// True when `later` is the same sentence said again, close enough that the
+/// earlier copy is the retake.
+pub(crate) fn retake_follows(
+    earlier_end: f64,
+    later_start: f64,
+    earlier: &str,
+    later: &str,
+) -> bool {
+    backs_onto(earlier_end, later_start) && later_replaces(earlier, later)
+}
+
+fn backs_onto(earlier_end: f64, later_start: f64) -> bool {
+    let gap = later_start - earlier_end;
+    (-0.20..RETAKE_GAP_SECS).contains(&gap)
+}
+
+fn later_replaces(earlier: &str, later: &str) -> bool {
+    let a = norm_words(earlier);
+    let b = norm_words(later);
+    if a.len() >= RETAKE_WORDS && a == b {
+        return true;
+    }
+    a.len() >= RETAKE_WORDS
+        && b.len() > a.len()
+        && b.len() - a.len() <= RETAKE_EXTRA
+        && has_prefix(&b, &a)
+}
+
+fn earlier_is_complete(earlier: &str, later: &str) -> bool {
+    let a = norm_words(earlier);
+    let b = norm_words(later);
+    b.len() >= RETAKE_WORDS
+        && a.len() > b.len()
+        && a.len() - b.len() <= RETAKE_EXTRA
+        && has_prefix(&a, &b)
+}
+
+fn has_prefix(words: &[String], prefix: &[String]) -> bool {
+    words.len() >= prefix.len() && words[..prefix.len()] == prefix[..]
+}
+
+fn norm_words(text: &str) -> Vec<String> {
+    text.split_whitespace().map(norm_token).collect()
+}
+
+fn norm_token(word: &str) -> String {
+    word.trim()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase()
+}
+
+/// The sentence twice in one cue becomes the later take. Speech and then the
+/// same sentence again loses the second copy.
+fn trim_inline_repeat(line: &SpokenLine) -> SpokenLine {
+    let mut current = line.clone();
+    for _ in 0..4 {
+        let Some(next) = trim_inline_once(&current) else {
+            return current;
+        };
+        current = next;
+    }
+    current
+}
+
+fn trim_inline_once(line: &SpokenLine) -> Option<SpokenLine> {
+    let raw: Vec<&str> = line.text.split_whitespace().collect();
+    let norm: Vec<String> = raw.iter().copied().map(norm_token).collect();
+    if norm.iter().any(|word| word.is_empty()) {
+        return None;
+    }
+    let cut = adjacent_repeat_cut(&norm)?;
+    let len = norm.len() - cut;
+    if cut < len {
+        return None;
+    }
+    let span = line.end - line.start;
+    if span < 0.8 {
+        return None;
+    }
+    let at = |index: usize| line.start + span * (index as f64 / norm.len() as f64);
+    if cut == len {
+        let start = at(cut);
+        if line.end - start < 0.35 {
+            return None;
+        }
+        return Some(SpokenLine {
+            start,
+            text: raw[cut..].join(" "),
+            ..line.clone()
+        });
+    }
+    let end = at(cut);
+    if end - line.start < 0.35 || line.end - end < 0.35 {
+        return None;
+    }
+    Some(SpokenLine {
+        end,
+        text: raw[..cut].join(" "),
+        ..line.clone()
+    })
+}
+
+/// Start index of a repeated block sitting against the same block before it.
+fn adjacent_repeat_cut(tokens: &[String]) -> Option<usize> {
+    let count = tokens.len();
+    let max_len = count / 2;
+    if max_len < RETAKE_WORDS {
+        return None;
+    }
+    for len in (RETAKE_WORDS..=max_len).rev() {
+        let cut = count - len;
+        let prev = cut - len;
+        if tokens[cut..] == tokens[prev..cut] {
+            return Some(cut);
+        }
+    }
+    None
 }
 
 pub(crate) fn is_filler(text: &str) -> bool {

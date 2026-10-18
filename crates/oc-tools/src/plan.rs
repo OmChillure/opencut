@@ -97,7 +97,8 @@ pub fn build_plan(
     covers: &[CoverShot],
 ) -> Result<Vec<String>, String> {
     check_slots(&plan.slots, windows)?;
-    let slots = seated_slots(&plan.slots, windows, lines);
+    let spoken = finish::picture_lines(lines);
+    let slots = seated_slots(&plan.slots, windows, &spoken);
     let (kept_clips, kept_looks) = snapshot_layers(timeline);
     let mut undo = UndoStack::new();
     let mut notes = Vec::new();
@@ -178,7 +179,7 @@ pub fn build_plan(
         }
     }
     notes.extend(finish_picture(
-        timeline, &mut undo, plan, &ids, windows, lines, covers,
+        timeline, &mut undo, plan, &ids, windows, &spoken, covers,
     )?);
     restore_layers(timeline, kept_clips, &kept_looks);
     timeline.edit_plan = Some(plan.clone());
@@ -761,8 +762,9 @@ fn seated_slots(
     seated
 }
 
-/// One file laid down whole still loses the um, the retake gap, and the dead air.
-/// A breath under 0.7s stays. A silent picture stays where the model put it.
+/// One file laid down whole still loses the um, the retake, and the dead air.
+/// A breath under 0.7s stays. The same sentence said again inside that breath
+/// keeps the later take. A silent picture stays where the model put it.
 fn split_throwaways(slot: &EditSlot, lines: &[SpokenLine], file_end: f64) -> Vec<EditSlot> {
     let speed = slot_speed(slot);
     let src_in = slot.source_in.max(0.0);
@@ -1898,6 +1900,220 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_sentence_with_no_gap_keeps_the_later_take() {
+        let media = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 12.0;
+        whole.fade_in = Some(0.4);
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: true,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole],
+        };
+        let repeated = "welcome to hacktoberfest at the campus";
+        let lines = vec![
+            line(media, 1.0, 3.2, repeated),
+            line(media, 3.4, 5.6, repeated),
+            line(media, 5.8, 8.0, "registration closes on october eighth"),
+        ];
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[window(media, 0.0, 12.0, "close", false)],
+            &[],
+            &lines,
+            &[],
+        )
+        .unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 1, "{pictures:?}");
+        assert!(
+            pictures[0].source_in.as_seconds() > 3.2,
+            "the first take stays out {:?}",
+            pictures[0].source_in.as_seconds()
+        );
+        assert!(pictures[0].source_in.as_seconds() < 3.5);
+        assert!(pictures[0].source_out().as_seconds() > 8.0);
+        assert!(pictures[0].look.fade_in.as_seconds() > 0.0);
+        let caption = caption_text(&timeline);
+        assert_eq!(caption.matches(repeated).count(), 1, "{caption}");
+        assert!(caption.contains("registration closes"));
+    }
+
+    #[test]
+    fn a_repeated_sentence_inside_one_cue_keeps_the_later_take() {
+        let media = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 12.0;
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole],
+        };
+        let lines = vec![line(
+            media,
+            1.0,
+            6.0,
+            "welcome to hacktoberfest at the campus welcome to hacktoberfest at the campus",
+        )];
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[window(media, 0.0, 12.0, "close", false)],
+            &[],
+            &lines,
+            &[],
+        )
+        .unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 1, "{pictures:?}");
+        assert!(
+            pictures[0].source_in.as_seconds() > 3.2,
+            "{:?}",
+            pictures[0].source_in.as_seconds()
+        );
+        assert!(pictures[0].source_in.as_seconds() < 3.7);
+        assert!(pictures[0].source_out().as_seconds() > 5.9);
+        assert!(pictures[0].source_out().as_seconds() < 6.4);
+    }
+
+    #[test]
+    fn a_pause_between_two_copies_still_leaves_both() {
+        let media = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 12.0;
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole],
+        };
+        let lines = vec![
+            line(media, 1.0, 3.0, "welcome to hacktoberfest tonight"),
+            line(media, 4.0, 6.0, "welcome to hacktoberfest tonight"),
+        ];
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[window(media, 0.0, 12.0, "close", false)],
+            &[],
+            &lines,
+            &[],
+        )
+        .unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 2, "{pictures:?}");
+        assert!(pictures[0].source_in.as_seconds() < 1.05);
+        assert!(pictures[1].source_in.as_seconds() > 3.8);
+    }
+
+    #[test]
+    fn a_false_start_keeps_the_finished_line() {
+        let media = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 8.0;
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole],
+        };
+        let lines = vec![
+            line(media, 1.0, 2.6, "welcome to hacktoberfest at"),
+            line(media, 2.8, 5.4, "welcome to hacktoberfest at the campus"),
+        ];
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[window(media, 0.0, 8.0, "close", false)],
+            &[],
+            &lines,
+            &[],
+        )
+        .unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 1, "{pictures:?}");
+        assert!(
+            pictures[0].source_in.as_seconds() > 2.5,
+            "{:?}",
+            pictures[0].source_in.as_seconds()
+        );
+        assert!(pictures[0].source_out().as_seconds() > 5.3);
+    }
+
+    #[test]
+    fn a_short_repeated_thanks_stays() {
+        let media = MediaId::new();
+        let mut whole = slot(media, 0.0);
+        whole.duration = 6.0;
+        let plan = EditPlan {
+            style: String::new(),
+            aspect: String::new(),
+            letterbox: false,
+            music_id: None,
+            music_volume: None,
+            captions: false,
+            caption_mood: None,
+            caption_preset: None,
+            caption_look: None,
+            grade: Grade::default(),
+            slots: vec![whole],
+        };
+        let lines = vec![
+            line(media, 1.0, 1.6, "thank you"),
+            line(media, 1.8, 2.4, "thank you"),
+        ];
+        let mut timeline = Timeline::default();
+        build_plan(
+            &mut timeline,
+            &plan,
+            &[window(media, 0.0, 6.0, "close", false)],
+            &[],
+            &lines,
+            &[],
+        )
+        .unwrap();
+        let pictures = program_pictures(&timeline);
+        assert_eq!(pictures.len(), 1, "{pictures:?}");
+        assert!(pictures[0].source_in.as_seconds() < 1.05);
+        assert!(pictures[0].source_out().as_seconds() > 2.3);
+    }
+
+    #[test]
     fn a_filler_only_slot_is_dropped() {
         let media = MediaId::new();
         let mut whole = slot(media, 0.0);
@@ -1987,6 +2203,23 @@ mod tests {
             end,
             text: text.into(),
         }
+    }
+
+    fn caption_text(timeline: &Timeline) -> String {
+        timeline
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Caption)
+            .flat_map(|track| track.clips.iter())
+            .filter_map(|clip| match &clip.kind {
+                ClipKind::Caption { cues, .. } => {
+                    Some(cues.iter().map(|cue| cue.text.as_str()).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn program_pictures(timeline: &Timeline) -> Vec<&Clip> {

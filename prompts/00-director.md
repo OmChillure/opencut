@@ -31,6 +31,7 @@ The request chooses the shape.
   the whole file down because one line in it is good. `source_in` is where the keeper
   starts. `duration` stops before the um, the retake, the repeated line, the walk-in, or
   the dead air. A silent hold after the last word is dead air, even when it is not um or uh.
+  A second copy of the same sentence, with less than a 0.7s gap, is a retake. Rust keeps the later take and drops the earlier one.
   The next slot of that file starts after that stretch. The gaps list is
   those stretches. A slot does not cover a gap.
 

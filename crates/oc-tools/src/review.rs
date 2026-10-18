@@ -538,7 +538,7 @@ fn uncovered_source(
     let mut speech_total = 0.0;
     let mut speech_kept = 0.0;
     for line in speech {
-        if line_is_filler(&line.text) {
+        if line_is_filler(&line.text) || earlier_retake(line, speech) {
             continue;
         }
         let dur = (line.end - line.start).max(0.0);
@@ -580,6 +580,14 @@ fn uncovered_source(
         }
     }
     Vec::new()
+}
+
+/// The earlier copy of a sentence said again with no real gap. The later take is the one that counts.
+fn earlier_retake(line: &Spoken, speech: &[Spoken]) -> bool {
+    speech.iter().any(|other| {
+        other.media == line.media
+            && crate::finish::retake_follows(line.end, other.start, &line.text, &other.text)
+    })
 }
 
 fn speech_line_kept(clips: &[&Clip], line: &Spoken) -> bool {
@@ -1083,6 +1091,31 @@ mod tests {
         let review = review_cut(&tl, &long_speech(media), "edit this video");
         assert!(review.issues, "{}", review.text);
         assert!(review.text.contains("source speech"), "{}", review.text);
+    }
+
+    #[test]
+    fn a_back_to_back_retake_does_not_count_as_missing_speech() {
+        let media = MediaId::new();
+        let sentence = "welcome to hacktoberfest at our campus";
+        let mut speech = Vec::new();
+        for i in 0..6 {
+            let start = i as f64 * 4.2;
+            speech.push(Spoken {
+                media,
+                start,
+                end: start + 4.0,
+                text: sentence.into(),
+            });
+        }
+        speech.push(Spoken {
+            media,
+            start: 25.2,
+            end: 29.2,
+            text: "the clubs meet after the opening talk".into(),
+        });
+        let tl = tl_with(vec![video_clip(media, 0.0, 8.2, 21.0)]);
+        let review = review_cut(&tl, &speech, "edit this video");
+        assert!(!review.text.contains("source speech"), "{}", review.text);
     }
 
     #[test]

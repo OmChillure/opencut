@@ -25,7 +25,7 @@ Decide the shape from the ask. You choose the in-points. Do not walk the transcr
 - **Reel / short / tiktok / highlight / a named duration** — a short, as the mission says. Vertical if they said reel or tiktok.
 - **Edit this video / the whole import / cover the source** — keep the piece. Not a highlight reel.
 - **One long source and they asked for a reel or a short** — several excerpts, not one short bite and not the whole file.
-- **Inside one file** — keep the line, cut the rest of that file. Two slots, same `media_id`, when a throwaway sits between two keepers. Do not hand `submit_edit` the whole duration because the file also has a good line.
+- **Inside one file** — keep the line, cut the rest of that file. Two slots, same `media_id`, when a throwaway sits between two keepers. Do not hand `submit_edit` the whole duration because the file also has a good line. A repeated sentence with no gap is one take. Rust keeps the later copy.
 - **Joins** — `fade_in` on the first slot, `fade_out` on the last. `transition` `dissolve` on a slot that starts a new beat, place, or time. A matched action stays a cut. One `wipe_left` or `slide_up` only for one designed turn.
 - **Animation** — `end_scale` above 1 and `ease` `out` on one still hold that opens or reveals. Leave it off a shot that already moves. After the last `revise_edit`, call `add_motion` once when a spoken line is a name, a number, a place, a quote, or a punch line.
 - **Trim / split / delete / recut** — touch only what they named.
