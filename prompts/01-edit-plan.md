@@ -4,9 +4,8 @@ Think, then act. Match the tools to **this** request — do not run a stock vlog
 
 ## 1. Inventory
 
-The opening message already has the bin, the timeline, the shot list, and the gaps.
-Do not call `list_bin`, `list_timeline`, `get_media`, `list_cues`, or `list_gaps` to read them again.
-Call one only when a line you need was cut off.
+The opening message already has the bin, the timeline, the shot list, the cues, and the gaps.
+Do not call `list_bin`, `list_timeline`, `get_media`, `list_cues`, or `list_gaps`.
 A row without a scale is the one to `watch`.
 
 From that list (not filenames):

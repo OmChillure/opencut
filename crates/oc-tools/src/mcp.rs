@@ -919,13 +919,8 @@ pub fn mcp_tools() -> Vec<McpTool> {
 }
 
 const PIECE_TOOLS: &[&str] = &[
-    "list_bin",
-    "list_timeline",
     "see",
     "watch",
-    "list_gaps",
-    "get_media",
-    "list_cues",
     "edit_skill",
     "submit_edit",
     "revise_edit",
@@ -933,7 +928,9 @@ const PIECE_TOOLS: &[&str] = &[
     "fit_frame",
 ];
 
-/// Tools advertised on this turn. A piece sees the plan. A named trim sees the full catalog.
+/// Tools advertised on this turn. A piece sees the plan, not the inventory.
+/// The opening message already has the bin, the timeline, the cues, and the gaps.
+/// A named trim sees the full catalog.
 #[must_use]
 pub fn tools_for_request(request: &str) -> Vec<McpTool> {
     let all = mcp_tools();
@@ -2044,13 +2041,8 @@ mod parse_tests {
         };
         let piece = names("make a vlog");
         for need in [
-            "list_bin",
-            "list_timeline",
             "see",
             "watch",
-            "list_gaps",
-            "get_media",
-            "list_cues",
             "edit_skill",
             "submit_edit",
             "revise_edit",
@@ -2063,6 +2055,11 @@ mod parse_tests {
             );
         }
         for hidden in [
+            "list_bin",
+            "list_timeline",
+            "list_gaps",
+            "get_media",
+            "list_cues",
             "set_mask",
             "add_title",
             "assemble",
@@ -2077,7 +2074,7 @@ mod parse_tests {
                 "{hidden} leaked into {piece:?}"
             );
         }
-        assert_eq!(piece.len(), 12, "{piece:?}");
+        assert_eq!(piece.len(), 7, "{piece:?}");
         let captions = names("make a vlog and edit the captions");
         assert!(
             captions.iter().any(|name| name == "set_caption_text"),

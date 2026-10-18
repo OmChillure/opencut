@@ -1231,8 +1231,8 @@ async fn clear_frame_temps(temps: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// Bin, timeline, shot list, and gaps for the opening message.
-/// The model calls get_media, list_cues, or list_gaps only when a line is missing.
+/// Bin, timeline, shot list, cues, and gaps for the opening message.
+/// A piece does not get the inventory tools. This text is the whole list.
 pub(crate) fn opening_inventory(
     timeline: &Timeline,
     media: &[oc_db::MediaRow],
@@ -1240,9 +1240,10 @@ pub(crate) fn opening_inventory(
     looks: &HashMap<Uuid, oc_db::AnalysisRow>,
 ) -> String {
     let mut out = String::from(
-        "The bin, the timeline, the shot list, and the gaps are already loaded. \
-         Call get_media, list_cues, or list_gaps only when a line you need is missing. \
-         Call list_bin or list_timeline only after a tool changes them.\n\n",
+        "The bin, the timeline, the shot list, the cues, and the gaps are already loaded. \
+         Do not call list_bin, list_timeline, get_media, list_cues, or list_gaps. \
+         Call watch only when a row is still the coarse look or the frame has no grade. \
+         Call see for one moment you already know.\n\n",
     );
     out.push_str(&run_inspect(
         Inspect::ListBin,
@@ -1270,6 +1271,14 @@ pub(crate) fn opening_inventory(
             looks,
         ));
         if speech.get(&row.id).is_some_and(|s| !s.cues.is_empty()) {
+            out.push('\n');
+            out.push_str(&run_inspect(
+                Inspect::ListCues { media_id: id },
+                timeline,
+                media,
+                speech,
+                looks,
+            ));
             out.push('\n');
             out.push_str(&run_inspect(
                 Inspect::ListGaps {
