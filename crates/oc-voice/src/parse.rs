@@ -45,7 +45,11 @@ pub(crate) fn parse_openai_whisper(raw: &str) -> Option<Transcript> {
     let parsed: OpenAiJson = serde_json::from_str(raw).ok()?;
     let mut words = parsed.words.clone();
     if words.is_empty() {
-        words = parsed.segments.iter().flat_map(|seg| seg.words.clone()).collect();
+        words = parsed
+            .segments
+            .iter()
+            .flat_map(|seg| seg.words.clone())
+            .collect();
     }
     let from_words = cues_from_words(&words);
     let cues = if from_words.is_empty() {
@@ -99,9 +103,52 @@ fn cues_from_words(words: &[OpenAiWord]) -> Vec<Cue> {
             }
         }
         group.push(word);
+        split_completed_retake(&mut cues, &mut group);
     }
     push_word_cue(&mut cues, &group);
     cues
+}
+
+/// The same sentence said again, with no 0.7s pause, becomes its own cue.
+/// A block shorter than four words stays, so "thank you thank you" is one line.
+/// Keep the block length in step with `oc-tools` picture lines.
+fn split_completed_retake(cues: &mut Vec<Cue>, group: &mut Vec<&OpenAiWord>) {
+    const REPEAT_WORDS: usize = 4;
+    let tokens: Vec<String> = group.iter().map(|word| norm_token(&word.word)).collect();
+    if tokens.iter().any(|token| token.is_empty()) || tokens.len() < REPEAT_WORDS * 2 {
+        return;
+    }
+    let Some(cut) = adjacent_repeat_cut(&tokens, REPEAT_WORDS) else {
+        return;
+    };
+    if cut != tokens.len() - cut {
+        return;
+    }
+    let tail = group.split_off(cut);
+    push_word_cue(cues, group);
+    *group = tail;
+}
+
+fn adjacent_repeat_cut(tokens: &[String], repeat_words: usize) -> Option<usize> {
+    let count = tokens.len();
+    let max_len = count / 2;
+    if max_len < repeat_words {
+        return None;
+    }
+    for len in (repeat_words..=max_len).rev() {
+        let cut = count - len;
+        let prev = cut - len;
+        if tokens[cut..] == tokens[prev..cut] {
+            return Some(cut);
+        }
+    }
+    None
+}
+
+fn norm_token(word: &str) -> String {
+    word.trim()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase()
 }
 
 fn push_word_cue(cues: &mut Vec<Cue>, group: &[&OpenAiWord]) {
@@ -169,7 +216,11 @@ mod tests {
         }"#;
         let t = parse_openai_whisper(raw).unwrap();
         assert_eq!(t.cues.len(), 1);
-        assert!((t.cues[0].end.as_seconds() - 15.60).abs() < 0.02, "{:?}", t.cues[0].end);
+        assert!(
+            (t.cues[0].end.as_seconds() - 15.60).abs() < 0.02,
+            "{:?}",
+            t.cues[0].end
+        );
         assert!(t.cues[0].end.as_seconds() < 16.0);
         assert!(t.cues[0].text.contains("house"));
     }
@@ -191,6 +242,47 @@ mod tests {
         assert!((t.cues[0].end.as_seconds() - 1.70).abs() < 0.02);
         assert!((t.cues[1].start.as_seconds() - 2.60).abs() < 0.02);
         assert_eq!(t.cues[1].text, "see you");
+    }
+
+    #[test]
+    fn a_repeated_sentence_with_no_pause_is_its_own_line() {
+        let raw = r#"{
+            "text": "welcome to the fest welcome to the fest",
+            "segments": [],
+            "words": [
+                {"word": " welcome", "start": 0.10, "end": 0.40},
+                {"word": " to", "start": 0.42, "end": 0.55},
+                {"word": " the", "start": 0.57, "end": 0.70},
+                {"word": " fest", "start": 0.72, "end": 1.10},
+                {"word": " welcome", "start": 1.40, "end": 1.70},
+                {"word": " to", "start": 1.72, "end": 1.85},
+                {"word": " the", "start": 1.87, "end": 2.00},
+                {"word": " fest.", "start": 2.02, "end": 2.40}
+            ]
+        }"#;
+        let t = parse_openai_whisper(raw).unwrap();
+        assert_eq!(t.cues.len(), 2, "{:?}", t.cues);
+        assert!((t.cues[0].end.as_seconds() - 1.10).abs() < 0.02);
+        assert!((t.cues[1].start.as_seconds() - 1.40).abs() < 0.02);
+        assert_eq!(t.cues[1].text, "welcome to the fest.");
+    }
+
+    #[test]
+    fn a_short_thanks_stays_one_line() {
+        let raw = r#"{
+            "text": "thank you all thank you all",
+            "segments": [],
+            "words": [
+                {"word": " thank", "start": 0.10, "end": 0.30},
+                {"word": " you", "start": 0.32, "end": 0.45},
+                {"word": " all", "start": 0.47, "end": 0.70},
+                {"word": " thank", "start": 0.90, "end": 1.10},
+                {"word": " you", "start": 1.12, "end": 1.25},
+                {"word": " all", "start": 1.27, "end": 1.50}
+            ]
+        }"#;
+        let t = parse_openai_whisper(raw).unwrap();
+        assert_eq!(t.cues.len(), 1, "{:?}", t.cues);
     }
 
     #[test]

@@ -59,8 +59,7 @@ pub(crate) fn snap_cue_ends(cues: &mut [Cue], samples: &[i16], sample_rate: u32)
         if end - start < 0.35 {
             continue;
         }
-        let Some(speech_end) =
-            trailing_speech_end(start, end, &levels, WINDOW_SECS, threshold)
+        let Some(speech_end) = trailing_speech_end(start, end, &levels, WINDOW_SECS, threshold)
         else {
             continue;
         };
@@ -139,8 +138,12 @@ fn pcm16(bytes: &[u8]) -> Option<(u32, Vec<i16>)> {
         }
         if id == b"fmt " && size >= 16 {
             let format = u16::from_le_bytes(bytes[body..body + 2].try_into().ok()?);
-            channels = Some(u16::from_le_bytes(bytes[body + 2..body + 4].try_into().ok()?));
-            rate = Some(u32::from_le_bytes(bytes[body + 4..body + 8].try_into().ok()?));
+            channels = Some(u16::from_le_bytes(
+                bytes[body + 2..body + 4].try_into().ok()?,
+            ));
+            rate = Some(u32::from_le_bytes(
+                bytes[body + 4..body + 8].try_into().ok()?,
+            ));
             bits = Some(u16::from_le_bytes(
                 bytes[body + 14..body + 16].try_into().ok()?,
             ));

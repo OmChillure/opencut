@@ -105,9 +105,7 @@ fn groq_client(base: &str) -> reqwest::Client {
     if let Some((host, addr)) = ipv4_for_base(base) {
         builder = builder.resolve(&host, addr);
     }
-    builder
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn ipv4_for_base(base: &str) -> Option<(String, SocketAddr)> {
