@@ -372,11 +372,6 @@ pub fn spool_root() -> std::path::PathBuf {
     }
 }
 
-#[must_use]
-pub fn render_spool_dir(project_id: Uuid) -> std::path::PathBuf {
-    spool_root().join(project_id.to_string())
-}
-
 /// `{root}/{project}/{media}/{file}`. The file name cannot leave that directory.
 #[must_use]
 pub fn render_spool_file(project_id: Uuid, media_id: Uuid, filename: &str) -> std::path::PathBuf {
@@ -806,7 +801,6 @@ struct EmailRow {
 }
 
 /// First sign-in claims the email. A later sign-in must match that password.
-/// Returns `(email, token)`.
 pub async fn open_session(
     pool: &Db,
     email: &str,

@@ -13,7 +13,7 @@ pub use catalog::{ModelInfo, ProviderId, ProviderStatus, catalog};
 pub use imagine::imagine_clip;
 pub use llm::{ChatEvent, ChatTurn, EventSink, LlmError, LlmReply};
 pub use orchestrate::{
-    DirectorSession, PromptImage, ask_with_stills, complete, complete_stream, followup_prompt,
-    opening_prompt, subscription_ready,
+    DirectorSession, PromptImage, ask_with_stills, followup_prompt, opening_prompt,
+    subscription_ready,
 };
 pub use prompts::{shared_prompts, with_shared_prompts};

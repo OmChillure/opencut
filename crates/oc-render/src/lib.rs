@@ -6,7 +6,7 @@
 mod captions;
 mod graph;
 
-pub use captions::{BurnedCue, captions_for_cut, to_srt};
+pub use captions::{BurnedCue, captions_for_cut};
 pub use graph::{Compiled, compile};
 
 use oc_timeline::{MediaId, Timeline};

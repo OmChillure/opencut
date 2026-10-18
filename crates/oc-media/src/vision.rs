@@ -83,48 +83,6 @@ impl Default for VisualDigest {
     }
 }
 
-impl VisualDigest {
-    #[must_use]
-    pub fn brief(&self) -> String {
-        if !self.has_video {
-            return "audio-only".into();
-        }
-        format!(
-            "{}  motion={:.2}  scenes={}  {}",
-            self.look,
-            self.motion,
-            self.scenes,
-            if self.colorful { "colorful" } else { "flat" }
-        )
-    }
-}
-
-pub async fn analyze_local(
-    bytes: &[u8],
-    filename: &str,
-) -> Result<VisualDigest, crate::MediaError> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("oc-look-in-{stamp}"));
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| crate::MediaError::Ffmpeg(e.to_string()))?;
-    let ext = Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()))
-        .unwrap_or("bin");
-    let input = dir.join(format!("in.{ext}"));
-    tokio::fs::write(&input, bytes)
-        .await
-        .map_err(|e| crate::MediaError::Ffmpeg(e.to_string()))?;
-    let digest = analyze_path(&input).await;
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    digest
-}
-
 /// Scene cuts plus one look per kept range. Reads `input` in place.
 pub async fn analyze_path(input: &Path) -> Result<VisualDigest, crate::MediaError> {
     let stamp = std::time::SystemTime::now()

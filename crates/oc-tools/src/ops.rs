@@ -1819,27 +1819,6 @@ fn cut_ranges(timeline: &mut Timeline, ranges: &[TimeRange]) -> Result<usize> {
     Ok(count)
 }
 
-/// Pick keep-takes from timestamped speech so one long source can become a short.
-#[must_use]
-/// Excerpts for a timed short. A quoted line in the request becomes the open.
-pub fn excerpts_for_request(
-    cues: &[(Time, Time, &str)],
-    request: &str,
-    target_s: f64,
-) -> Vec<Excerpt> {
-    let quote = quoted_line(request);
-    if let Some(q) = quote {
-        let needle = q.to_ascii_lowercase();
-        if let Some(i) = cues
-            .iter()
-            .position(|(_, _, text)| text.to_ascii_lowercase().contains(needle.trim()))
-        {
-            return excerpts_from(cues, i, target_s);
-        }
-    }
-    pick_reel_excerpts(cues, target_s)
-}
-
 fn quoted_line(request: &str) -> Option<&str> {
     let bytes = request.as_bytes();
     for (open, close) in [(b'"', b'"'), (b'\'', b'\'')] {
@@ -1853,30 +1832,6 @@ fn quoted_line(request: &str) -> Option<&str> {
         }
     }
     None
-}
-
-fn excerpts_from(cues: &[(Time, Time, &str)], start_idx: usize, target_s: f64) -> Vec<Excerpt> {
-    let target = target_s.clamp(20.0, 75.0);
-    let mut used = 0.0;
-    let mut out = Vec::new();
-    for (start, end, text) in cues.iter().skip(start_idx) {
-        if end <= start || is_filler(text) {
-            continue;
-        }
-        let dur = (*end - *start).as_seconds();
-        if dur < 0.4 {
-            continue;
-        }
-        out.push(Excerpt {
-            source_in: *start,
-            duration: *end - *start,
-        });
-        used += dur;
-        if used >= target {
-            break;
-        }
-    }
-    out
 }
 
 pub fn pick_reel_excerpts(cues: &[(Time, Time, &str)], target_s: f64) -> Vec<Excerpt> {

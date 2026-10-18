@@ -1,5 +1,4 @@
 //! Load every `*.md` in the repo `prompts/` folder.
-//! `complete()` prepends this for Grok, Claude, Codex, and any future provider.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

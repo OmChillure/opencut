@@ -101,32 +101,6 @@ pub fn brief_shots(picture: &[ShotLook], cues: &[(f64, f64, &str)]) -> Vec<ShotB
     out
 }
 
-pub fn format_shot_list(shots: &[ShotBrief], limit: usize) -> String {
-    if shots.is_empty() {
-        return String::new();
-    }
-    let shown = shots.len().min(limit);
-    let mut out = format!("shots {}\n", shots.len());
-    for shot in shots.iter().take(shown) {
-        out.push_str(&format!("{:.1}-{:.1}  {}", shot.start, shot.end, shot.look));
-        if !shot.subject.is_empty() {
-            out.push(' ');
-            out.push_str(&shot.subject);
-        }
-        out.push(' ');
-        out.push_str(shot.role.as_str());
-        if !shot.text.is_empty() && shot.role != ShotRole::Silence {
-            out.push_str("  ");
-            out.push_str(&shot.text);
-        }
-        out.push('\n');
-    }
-    if shots.len() > shown {
-        out.push_str(&format!("… {} more shots\n", shots.len() - shown));
-    }
-    out
-}
-
 fn push_silence(out: &mut Vec<ShotBrief>, start: f64, end: f64, look: &str, subject: &str) {
     if end - start < GAP {
         return;

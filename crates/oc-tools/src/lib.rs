@@ -24,7 +24,7 @@ pub use oc_timeline::PlaceMode;
 pub use ops::{
     AppliedOp, AssembleItem, AssembleStyle, DesignLayout, Excerpt, ExportPreset, Op, OpError,
     PiecePick, SourceBeat, TimeRange, TimelineEditMode, apply, asks_for_judgment, choose_piece,
-    excerpts_for_request, pick_reel_excerpts, revises_existing_cut,
+    pick_reel_excerpts, revises_existing_cut,
 };
 pub use plan::{SourceWindow, build_plan, cue_faces, plan_from_value, revise_plan};
 pub use registry::{actions, modes, tool, tools, track_actions};

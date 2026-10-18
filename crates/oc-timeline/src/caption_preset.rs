@@ -36,22 +36,6 @@ impl CaptionInk {
         }
     }
 
-    /// CSS color.
-    #[must_use]
-    pub fn hex(self) -> &'static str {
-        match self {
-            Self::White => "#FFFFFF",
-            Self::Cream => "#F4E4C8",
-            Self::Bone => "#E6E0D4",
-            Self::Black => "#141414",
-            Self::Amber => "#FFC14A",
-            Self::Cyan => "#7EF0FF",
-            Self::Mint => "#B6F25C",
-            Self::Rose => "#FF8AD4",
-            Self::Violet => "#C9A6FF",
-        }
-    }
-
     /// ASS primary colour, `&H00BBGGRR`.
     #[must_use]
     pub fn ass(self) -> &'static str {

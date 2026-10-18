@@ -4,7 +4,6 @@ use crate::llm::{ChatEvent, ChatTurn, EventSink, LlmError, LlmReply};
 use oc_tools::McpTool;
 use serde_json::Value;
 
-/// Run one turn on the local vendor CLI (same as cbot). No API keys.
 /// One still the selected director model should see.
 #[derive(Clone, Debug)]
 pub struct PromptImage {
@@ -63,95 +62,6 @@ async fn grok_stills(prompt: &str, frames: &[PromptImage]) -> Result<String, Llm
     let bin = env_or("OPENCUT_GROK_ACP", "grok");
     let args = grok_agent_args(&model);
     spawn_acp(&bin, &args, &model, prompt, &[], frames, None).await
-}
-
-pub async fn complete(
-    provider: &str,
-    model: &str,
-    system: &str,
-    turns: &[ChatTurn],
-    tools: &[McpTool],
-) -> Result<LlmReply, LlmError> {
-    complete_stream(provider, model, system, turns, tools, None, &[], &[]).await
-}
-
-pub async fn complete_stream(
-    provider: &str,
-    model: &str,
-    system: &str,
-    turns: &[ChatTurn],
-    tools: &[McpTool],
-    events: Option<EventSink>,
-    mcp_servers: &[Value],
-    frames: &[PromptImage],
-) -> Result<LlmReply, LlmError> {
-    let id = ProviderId::parse(provider)
-        .ok_or_else(|| LlmError::Message(format!("unknown provider {provider}")))?;
-    if !id.connected() {
-        let hint = id.login_hint();
-        tracing::error!(provider, "provider not logged in: {hint}");
-        return Err(LlmError::Message(hint.into()));
-    }
-    let prompt = build_prompt(system, turns, tools, !mcp_servers.is_empty());
-    tracing::info!(
-        provider,
-        model,
-        turns = turns.len(),
-        tools = tools.len(),
-        mcp = mcp_servers.len(),
-        prompt_chars = prompt.len(),
-        "chat turn"
-    );
-    emit(
-        events.as_ref(),
-        ChatEvent::status(format!("ACP {} · {model}", id.name())),
-    )
-    .await;
-    let text = run_provider(id, model, &prompt, mcp_servers, frames, events.as_ref())
-        .await
-        .inspect_err(|e| tracing::error!(provider, model, "provider failed: {e}"))?;
-    let reply = parse_tool_reply(text);
-    match &reply {
-        LlmReply::Text(t) => tracing::info!(chars = t.len(), "provider text"),
-        LlmReply::Tools(calls) => {
-            tracing::info!(n = calls.len(), "provider TOOL lines (MCP fallback)");
-            for c in calls {
-                tracing::info!(tool = %c.name, "fallback tool");
-            }
-        }
-    }
-    Ok(reply)
-}
-
-async fn run_provider(
-    id: ProviderId,
-    model: &str,
-    prompt: &str,
-    mcp_servers: &[Value],
-    frames: &[PromptImage],
-    events: Option<&EventSink>,
-) -> Result<String, LlmError> {
-    let (bin, args) = acp_launch(id, model);
-    let acp_missing = matches!(id, ProviderId::Claude | ProviderId::Openai)
-        && bin != "npx"
-        && !std::path::Path::new(&bin).is_file()
-        && !which(&bin);
-    if acp_missing {
-        let err = refuse_untoolable(id, None);
-        tracing::warn!(bin = %bin, "{err}");
-        emit(events, ChatEvent::status(err.to_string())).await;
-        return Err(err);
-    }
-    tracing::info!(bin = %bin, args = %args.join(" "), "acp launch");
-    match spawn_acp(&bin, &args, model, prompt, mcp_servers, frames, events).await {
-        Ok(text) => Ok(text),
-        Err(err) => {
-            let err = edit_failure(id, err);
-            tracing::warn!("{err}");
-            emit(events, ChatEvent::status(err.to_string())).await;
-            Err(err)
-        }
-    }
 }
 
 fn edit_failure(id: ProviderId, err: LlmError) -> LlmError {
@@ -362,7 +272,6 @@ async fn emit(events: Option<&EventSink>, ev: ChatEvent) {
 pub struct DirectorSession {
     client: AcpClient,
     session_id: String,
-    chars: usize,
 }
 
 impl DirectorSession {
@@ -404,11 +313,7 @@ impl DirectorSession {
             .open_session(&cwd, Some(model), mcp_servers, events.as_ref())
             .await
         {
-            Ok(session_id) => Ok(Self {
-                client,
-                session_id,
-                chars: 0,
-            }),
+            Ok(session_id) => Ok(Self { client, session_id }),
             Err(err) => {
                 let err = edit_failure(id, err);
                 tracing::warn!("{err}");
@@ -418,24 +323,12 @@ impl DirectorSession {
         }
     }
 
-    /// An open session can call tools. A missing adapter is an error from [`open`].
-    #[must_use]
-    pub fn remembers(&self) -> bool {
-        true
-    }
-
-    #[must_use]
-    pub fn prompt_chars(&self) -> usize {
-        self.chars
-    }
-
     pub async fn turn(
         &mut self,
         message: &str,
         frames: &[PromptImage],
         events: Option<&EventSink>,
     ) -> Result<LlmReply, LlmError> {
-        self.chars += message.len();
         let text = self
             .client
             .continue_prompt(&self.session_id, message, frames, events)

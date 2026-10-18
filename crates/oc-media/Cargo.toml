@@ -6,7 +6,6 @@ license.workspace = true
 description = "Media probe, local look, and R2 object keys"
 
 [dependencies]
-oc-time.workspace = true
 oc-timeline.workspace = true
 serde.workspace = true
 serde_json.workspace = true

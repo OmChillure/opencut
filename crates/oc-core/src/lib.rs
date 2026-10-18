@@ -19,9 +19,8 @@ pub use oc_tools::{
     ExportPreset, GapKind, Inspect, Intent, McpCall, McpTool, Op, PiecePick, ReviewFacts,
     SILENCE_GAP_SECS, ShotNote, SourceBeat, SourceGap, SourceSpan, SourceWindow, Spoken,
     SpokenLine, TimelineEditMode, apply, asks_for_judgment, build_plan, call_changes_timeline,
-    caption_recipe_for, choose_piece, cue_faces, excerpts_for_request, follow_after_text,
-    follow_after_tools, gaps_overlapping, inspect_from_mcp, is_director_request, mapped_cues,
-    mcp_tools, op_from_mcp, parse_intent, pick_reel_excerpts, plan_from_value, program_clips,
-    review_cut, review_with, revise_plan, revises_existing_cut, source_gaps, tools_for_request,
-    watch_times,
+    caption_recipe_for, choose_piece, cue_faces, follow_after_text, follow_after_tools,
+    gaps_overlapping, inspect_from_mcp, is_director_request, mapped_cues, mcp_tools, op_from_mcp,
+    parse_intent, pick_reel_excerpts, plan_from_value, program_clips, review_cut, review_with,
+    revise_plan, revises_existing_cut, source_gaps, tools_for_request, watch_times,
 };

@@ -2,7 +2,6 @@ use oc_timeline::{
     CaptionEdge, CaptionEffect, CaptionFont, CaptionInk, CaptionPlace, ClipKind, Timeline,
 };
 use std::fmt::Write;
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct BurnedCue {
     pub start: f64,
@@ -158,22 +157,6 @@ fn shorten_cues(cues: Vec<BurnedCue>) -> Vec<BurnedCue> {
     out
 }
 
-#[must_use]
-pub fn to_srt(cues: &[BurnedCue]) -> String {
-    let mut out = String::new();
-    for (i, cue) in cues.iter().enumerate() {
-        let _ = write!(
-            out,
-            "{}\n{} --> {}\n{}\n\n",
-            i + 1,
-            srt_time(cue.start),
-            srt_time(cue.end),
-            cue.text.trim()
-        );
-    }
-    out
-}
-
 /// ASS with PlayRes equal to the frame, so Fontsize is in real pixels.
 /// An SRT burned through libass uses a 288-line script and blows the type up.
 /// Each line carries its own anchor, face, and effect.
@@ -315,15 +298,6 @@ fn ass_time(secs: f64) -> String {
     let s = (cs / 100) % 60;
     let c = cs % 100;
     format!("{h}:{m:02}:{s:02}.{c:02}")
-}
-
-fn srt_time(secs: f64) -> String {
-    let ms_total = (secs.max(0.0) * 1000.0).round() as u64;
-    let h = ms_total / 3_600_000;
-    let m = (ms_total / 60_000) % 60;
-    let s = (ms_total / 1000) % 60;
-    let ms = ms_total % 1000;
-    format!("{h:02}:{m:02}:{s:02},{ms:03}")
 }
 
 #[cfg(test)]
